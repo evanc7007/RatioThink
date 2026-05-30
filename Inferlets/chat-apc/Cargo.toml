@@ -1,0 +1,20 @@
+[package]
+name = "chat-apc"
+version = "0.1.0"
+edition = "2024"
+description = "Chat-API + control-plane inferlet (HTTP): /healthz, /v1/models, /v1/chat/completions, /v1/inferlet, /v1/models/load"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wstd = "0.5.6"
+# Path dep on the pie sdk vendored as a git submodule under Vendor/pie.
+# Inferlet has to be built against the same WIT version pie loads, so we
+# pin to the submodule's checked-out commit rather than crates.io.
+inferlet = { path = "../../Vendor/pie/sdk/rust/inferlet" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+lto = true

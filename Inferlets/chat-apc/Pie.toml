@@ -1,0 +1,12 @@
+[package]
+name = "chat-apc"
+version = "0.1.0"
+description = "Chat-API + control-plane inferlet (HTTP): /healthz, /v1/models, /v1/chat/completions, /v1/inferlet, /v1/models/load"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+
+# No daemon input expected; model list is queried via the
+# `pie:core/runtime.models` WIT import at request time.
+[parameters]

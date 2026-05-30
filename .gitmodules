@@ -1,0 +1,4 @@
+[submodule "Vendor/pie"]
+	path = Vendor/pie
+	url = https://github.com/pie-project/pie.git
+	branch = pie.app/v1-base-shmem

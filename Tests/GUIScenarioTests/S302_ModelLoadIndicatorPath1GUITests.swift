@@ -1,0 +1,278 @@
+import XCTest
+
+/// toolbar model-load indicator via the REAL production
+/// path-1 (explicit load), plus mid-load cancel.
+///
+/// Where S297 drives the indicator through the chat-send meta-frame path
+/// (`applyChatMetaEvent`, which only fires on engine `model_loading`
+/// frames pie-control v1 never emits), this exercises the path a real
+/// user actually hits:
+///
+///   model menu → confirm gate (ProfileSwapPopover "Switch")
+///     → ProfileSwapCoordinator.confirm → startLoad
+///       → ModelLoadCenter.load(modelID:streamFactory:)
+///         → HTTPEngineClient.loadModel → POST /v1/models/load
+///
+/// `center.load` sets state=.loading LOCALLY (ModelLoadCenter.swift:124)
+/// the instant the load begins — independent of any engine frame. The
+/// harness (Scripts/loadviz-harness.py) holds the load SSE
+/// (no `model_loading` frame, exactly v1's shape) then emits
+/// `model_ready`, so the toolbar "Loading <id>" label is observable
+/// before it clears to the "Model loaded: <id>" ready ring.
+///
+///  relocated the indicator from the window `NSToolbar` into the
+/// content-area `ContentToolbar`: an `NSToolbar`-hosted SwiftUI popover
+/// could not be driven reliably under XCUITest (intermittent button
+/// action + transient-popover dismissal). Content-hosted, it behaves
+/// like the sibling ProfileSwap/params/system popovers.
+///
+/// Popover container `.accessibilityIdentifier`s mask inner control ids,
+/// so inner buttons are queried by visible label ("Switch", "Cancel").
+///
+/// Uses narrow type queries only — `descendants(matching: .any)` can
+/// SIGBUS on a degraded session (GUI-test convention).
+final class S302_ModelLoadIndicatorPath1GUITests: XCTestCase {
+  /// Seeded curated default surfaced in the chat model menu ( / S260).
+  private static let menuModelLeaf = "Qwen3-0.6B-Q8_0.gguf"
+
+  override func setUp() async throws { try guardSeatedGUI() }
+
+  // MARK: - path-1: explicit load lights the indicator, then clears to ready
+
+  @MainActor
+  func test_path1_explicit_load_shows_loading_then_ready() throws {
+    let app = try launchedApp()
+    defer { app.terminate() }
+
+    try triggerExplicitLoad(in: app)
+
+    let indicator = app.buttons["toolbar.modelLoadIndicator"].firstMatch
+
+    // Wiring assertion (review F4): if the indicator element does not
+    // exist, the failure is `ContentToolbar` wiring (no center wired,
+    // not rendered) rather than a state-machine regression. Splitting
+    // this out makes the diagnostic unambiguous — `waitForLabel` below
+    // tolerates `!element.exists` and would otherwise conflate the two.
+    XCTAssertTrue(
+      indicator.waitForExistence(timeout: 10),
+      "toolbar.modelLoadIndicator was never instantiated — ContentToolbar wiring regression "
+        + "(`modelLoadCenter` not passed)? app: \(app.debugDescription)")
+
+    // During the harness hold: the locally-set .loading must surface as
+    // a "Loading model …" label (ModelLoadCenter.swift:124 → indicator).
+    XCTAssertTrue(
+      waitForLabel(indicator, beginsWith: "Loading model", timeout: 15),
+      "toolbar.modelLoadIndicator exists but never showed 'Loading model' — state-machine "
+        + "regression (confirm-gate did not start the load OR `center.load` did not transition "
+        + "synchronously to `.loading`)? label=\(indicator.label); app: \(app.debugDescription)")
+
+    // After model_ready: the Loading label clears and the ready ring
+    // takes over ("Model loaded: <id>", label prefix nil for .ready).
+    XCTAssertTrue(
+      waitForLabel(indicator, beginsWith: "Model loaded:", timeout: 20),
+      "toolbar.modelLoadIndicator did not clear to the 'Model loaded:' ready ring; "
+        + "label=\(indicator.label); app: \(app.debugDescription)")
+  }
+
+  // MARK: - mid-load cancel: synchronous .loading → .cancelled clears the ring
+
+  @MainActor
+  func test_path1_midload_cancel_clears_indicator() throws {
+    let app = try launchedApp()
+    defer { app.terminate() }
+
+    try triggerExplicitLoad(in: app)
+
+    let indicator = app.buttons["toolbar.modelLoadIndicator"].firstMatch
+    // Wiring assertion (review F4): split element-existence from
+    // label-state so a wiring regression doesn't masquerade as a
+    // state-machine regression in the diagnostic.
+    XCTAssertTrue(
+      indicator.waitForExistence(timeout: 10),
+      "toolbar.modelLoadIndicator was never instantiated — ContentToolbar wiring regression "
+        + "(`modelLoadCenter` not passed)? app: \(app.debugDescription)")
+    XCTAssertTrue(
+      waitForLabel(indicator, beginsWith: "Loading model", timeout: 15),
+      "toolbar.modelLoadIndicator exists but never showed 'Loading model' before cancel — "
+        + "state-machine regression? label=\(indicator.label); app: \(app.debugDescription)")
+
+    // Open the indicator popover and hit Cancel — center.cancel() makes
+    // a synchronous .loading → .cancelled transition
+    // (ModelLoadCenter.swift:207).
+    XCTAssertTrue(openIndicatorPopover(indicator, in: app),
+                  "indicator popover did not open; app: \(app.debugDescription)")
+    let cancelButton = app.popovers.buttons
+      .matching(NSPredicate(format: "label == %@", "Cancel")).firstMatch
+    XCTAssertTrue(cancelButton.waitForExistence(timeout: 5),
+                  "loading popover did not render a Cancel button; app: \(app.debugDescription)")
+    cancelButton.click()
+
+    // The synchronous cancel clears .loading and the indicator goes idle
+    // (opacity 0 / no label) — the "Loading model" label must clear …
+    XCTAssertTrue(
+      waitUntilLabelClears(indicator, prefix: "Loading model", timeout: 10),
+      "toolbar.modelLoadIndicator stayed in 'Loading model' after Cancel; "
+        + "label=\(indicator.label); app: \(app.debugDescription)")
+    // … and the cancelled load must NOT complete to ready — for the
+    // FULL hold + slack (review F3). The old 8 s window was decoupled
+    // from `PIE_TEST_LOAD_HOLD_SECONDS`, so a regression where
+    // `center.cancel()` no longer cancelled the underlying URLSession
+    // task would let the harness wake at t ≈ hold, write `model_ready`,
+    // and pass `XCTAssertFalse(false)` after the window had already
+    // returned. Deriving from the hold catches that.
+    let hold = try Self.holdSeconds()
+    XCTAssertFalse(
+      waitForLabel(indicator, beginsWith: "Model loaded:", timeout: hold + 5),
+      "cancelled load still completed to 'Model loaded:' within hold+slack (hold=\(hold)s); "
+        + "the cancel did not stop the load; app: \(app.debugDescription)")
+  }
+
+  // MARK: - steps
+
+  /// Launch the app pointed at the harness engine.
+  @MainActor
+  private func launchedApp() throws -> XCUIApplication {
+    let config = try Self.loadConfig()
+    let baseURL = try XCTUnwrap(config["PIE_TEST_ENGINE_BASE_URL"],
+                                "\(Self.configPath) must define PIE_TEST_ENGINE_BASE_URL")
+    let pieHome = try XCTUnwrap(config["PIE_TEST_GUI_HOME"],
+                                "\(Self.configPath) must define PIE_TEST_GUI_HOME")
+
+    let app = XCUIApplication(bundleIdentifier: "com.ratiothink.app")
+    app.launchArguments.append(contentsOf: [
+      "-NSQuitAlwaysKeepsWindows", "NO",
+      "-ApplePersistenceIgnoreState", "YES",
+    ])
+    app.launchEnvironment["PIE_HOME"] = pieHome
+    app.launchEnvironment["PIE_TEST_ENGINE_BASE_URL"] = baseURL
+    configureCompletedFirstLaunch(app, suiteName: stablePreferenceSuiteName(pieHome))
+    app.launch()
+    XCTAssert(app.wait(for: .runningForeground, timeout: 10),
+              "RatioThink.app did not reach runningForeground")
+    app.activate()
+    return app
+  }
+
+  /// Create a chat, pick a non-resident model from the toolbar menu, and
+  /// confirm the swap — the real UI sequence into ModelLoadCenter.load.
+  @MainActor
+  private func triggerExplicitLoad(in app: XCUIApplication) throws {
+    let newChat = app.buttons["chats.newButton"]
+    XCTAssertTrue(newChat.waitForExistence(timeout: 10),
+                  "New Chat button missing; app: \(app.debugDescription)")
+    newChat.click()
+
+    let modelMenu = app.menuButtons["toolbar.model"]
+    XCTAssertTrue(modelMenu.waitForExistence(timeout: 10),
+                  "model menu missing after creating chat; app: \(app.debugDescription)")
+    modelMenu.click()
+
+    let modelItem = app.menuItems[Self.menuModelLeaf]
+    XCTAssertTrue(modelItem.waitForExistence(timeout: 5),
+                  "seeded model '\(Self.menuModelLeaf)' missing from menu; app: \(app.debugDescription)")
+    modelItem.click()
+
+    // Picking a model that differs from the (nil) resident raises the
+    // confirm gate; "Switch" commits the load (ContentToolbar.swift:106
+    // → ProfileSwapCoordinator.confirm → startLoad). The popover's
+    // container `.accessibilityIdentifier("profileSwap.popover")` masks
+    // the inner `profileSwap.switch` id, so query by the visible label.
+    let switchButton = app.buttons.matching(NSPredicate(format: "label == %@", "Switch")).firstMatch
+    XCTAssertTrue(switchButton.waitForExistence(timeout: 5),
+                  "profileSwap confirm popover did not present a Switch button; app: \(app.debugDescription)")
+    switchButton.click()
+  }
+
+  /// Open the indicator's popover. First wait out the confirm-gate
+  /// popover's dismissal so it cannot eat the click; then click the
+  /// indicator only while no popover is open (never toggling an open one
+  /// shut), polling for it to appear. Returns true once a popover is open.
+  @MainActor
+  private func openIndicatorPopover(_ indicator: XCUIElement, in app: XCUIApplication) -> Bool {
+    _ = waitForNoPopover(app, timeout: 5)
+    var attempts = 0
+    while app.popovers.count == 0 && attempts < 5 {
+      attempts += 1
+      indicator.click()
+      let deadline = Date().addingTimeInterval(2.0)
+      while Date() < deadline {
+        if app.popovers.count > 0 { return true }
+        RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.1))
+      }
+    }
+    return app.popovers.count > 0
+  }
+
+  // MARK: - polling helpers (narrow queries only)
+
+  /// Poll an element's accessibility label for a prefix. Returns true as
+  /// soon as it matches; false if the timeout elapses. Tolerates the
+  /// element being transiently absent (the indicator is `opacity(0)`
+  /// while idle).
+  private func waitForLabel(_ element: XCUIElement,
+                            beginsWith prefix: String,
+                            timeout: TimeInterval) -> Bool {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+      if element.exists, element.label.hasPrefix(prefix) { return true }
+      RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.1))
+    }
+    return false
+  }
+
+  /// Poll until an element's label no longer has `prefix` (or the element
+  /// is gone). Returns true once cleared; false on timeout.
+  private func waitUntilLabelClears(_ element: XCUIElement,
+                                    prefix: String,
+                                    timeout: TimeInterval) -> Bool {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+      if !element.exists || !element.label.hasPrefix(prefix) { return true }
+      RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.1))
+    }
+    return false
+  }
+
+  /// Poll until no popover is on screen. Returns true once clear.
+  private func waitForNoPopover(_ app: XCUIApplication, timeout: TimeInterval) -> Bool {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+      if app.popovers.count == 0 { return true }
+      RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.1))
+    }
+    return false
+  }
+
+  // MARK: - config
+
+  private static let configPath = "/tmp/pie-gui-load-indicator-e2e.env"
+
+  /// Runner-injected harness hold (`--hold-seconds`). Used to derive the
+  /// negative-assert window in the cancel test so a late `.ready`
+  /// can't slip past a hard-coded shorter window (review F3).
+  private static func holdSeconds() throws -> TimeInterval {
+    let config = try loadConfig()
+    let raw = try XCTUnwrap(config["PIE_TEST_LOAD_HOLD_SECONDS"],
+                            "\(configPath) must define PIE_TEST_LOAD_HOLD_SECONDS")
+    let value = try XCTUnwrap(TimeInterval(raw),
+                              "PIE_TEST_LOAD_HOLD_SECONDS must parse as a number; got \(raw)")
+    return value
+  }
+
+  private static func loadConfig() throws -> [String: String] {
+    let url = URL(fileURLWithPath: configPath)
+    guard FileManager.default.fileExists(atPath: url.path) else {
+      throw XCTSkip(" GUI load-indicator config missing at \(configPath); run Scripts/run-gui-load-indicator-e2e.sh")
+    }
+    let text = try String(contentsOf: url, encoding: .utf8)
+    return text
+      .split(separator: "\n")
+      .reduce(into: [:]) { result, line in
+        let parts = line.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+        guard parts.count == 2 else { return }
+        let key = String(parts[0])
+        let value = String(parts[1])
+        if !key.isEmpty { result[key] = value }
+      }
+  }
+}

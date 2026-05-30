@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+      LaunchAgent registered via SMAppService.agent(plistName:).
+      Replaces SMAppService.loginItem, which registered only an at-login
+      app launch and never declared a MachService for `com.ratiothink.helper`
+      (HelperConfig.defaultXPCService) — so on Helper death launchd had
+      no on-demand job to republish it and the App's bootstrap_look_up
+      failed with NSCocoaErrorDomain 4099 until logout/login.
+
+      MachServices makes `com.ratiothink.helper` an on-demand launchd service:
+      when the App connects, launchd (re)launches the Helper and the
+      Helper's NSXPCListener.startMachService checks the name in.
+    -->
+    <key>Label</key>
+    <string>com.ratiothink.app.helper</string>
+
+    <!-- Path to the embedded Helper executable, relative to RatioThink.app. -->
+    <key>BundleProgram</key>
+    <string>Contents/Library/LoginItems/RatioThinkHelper.app/Contents/MacOS/RatioThinkHelper</string>
+
+    <!-- On-demand publication of the XPC mach service the App connects to. -->
+    <key>MachServices</key>
+    <dict>
+        <key>com.ratiothink.helper</key>
+        <true/>
+    </dict>
+
+    <!-- Ties the agent to the host app for the Login Items UI + LWCR. -->
+    <key>AssociatedBundleIdentifiers</key>
+    <array>
+        <string>com.ratiothink.app</string>
+    </array>
+
+    <!-- Menu-bar Helper is present from login. -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!--
+      Relaunch after an unclean exit (crash / OOM / force-quit / SIGKILL)
+      — the recovery the loginItem path could not provide. A clean exit
+      (user quit) leaves it down; the App can still re-trigger an
+      on-demand launch via the MachService.
+    -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+</dict>
+</plist>

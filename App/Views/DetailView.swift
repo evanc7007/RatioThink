@@ -1,0 +1,30 @@
+import SwiftUI
+
+/// Col 3 — content for the selected item. v1 mounts the chat scaffold
+/// (toolbar + transcript + composer) when a chat is selected and the
+/// endpoint detail view when an endpoint is selected. With no selection
+/// we fall back to the `EmptyStateView` CTAs.
+struct DetailView: View {
+  let section: SidebarSection?
+  let selectedItemID: UUID?
+
+  var body: some View {
+    switch (section, selectedItemID) {
+    case (.chats, let id?):
+      // `.id(id)` rebuilds the scaffold (and its `@StateObject`
+      // view-model) when switching between chat rows so each chat has
+      // its own toolbar state. The scaffold itself loads the chat
+      // row via `@Query` keyed on `id`.
+      ChatScaffoldView(chatID: id)
+        .id(id)
+    case (.apiEndpoints, let id?):
+      EndpointDetailView(endpointID: id)
+    case (_, nil):
+      EmptyStateView()
+    default:
+      Text("Content placeholder")
+        .foregroundStyle(.secondary)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+  }
+}

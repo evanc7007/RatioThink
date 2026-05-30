@@ -1,0 +1,1038 @@
+"""End-to-end smoke test for chat-apc inferlet.
+
+Boots `pie serve --config /tmp/pie-test-dummy.toml` as a subprocess, parses
+its stdout for the bound WS URL + internal token, installs the prebuilt
+chat-apc.wasm via WS, launches it as a daemon on a free port, and
+hits `/healthz` + `/v1/models`.
+
+Before any of that runs we verify `prebuilt/chat-apc.wasm.stamp`
+matches the current `Vendor/pie` submodule SHA, the inferlet `src/` +
+manifests' content hash, and the wasm file hash. A mismatch fails fast
+with a "rebuild required" diagnostic rather than silently shipping a
+stale binary (review F4 / F5).
+
+Requires:
+  * pre-built pie binary at `Vendor/pie/target/release/pie`
+  * pre-built `Inferlets/chat-apc/prebuilt/chat-apc.wasm`
+  * `Inferlets/chat-apc/prebuilt/chat-apc.wasm.stamp` matching the
+    current submodule SHA + `src/` hash + wasm hash
+  * Qwen/Qwen3-0.6B in `~/.cache/huggingface/hub` (or another HF model
+    that the dummy driver can resolve config for)
+
+Usage::
+
+    uv run python Inferlets/chat-apc/e2e_test.py
+"""
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import ctypes
+import ctypes.util
+import errno
+import os
+import re
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+import httpx
+from pie_client import PieClient
+
+# Stamp helpers (parser, hashers, verify) live in _stamp.py so both this
+# harness and Scripts/stamp-chat-apc.sh share one implementation —
+#  item 4.
+_HERE = Path(__file__).resolve().parent
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
+import _stamp  # noqa: E402
+
+# pie-mac layout: this script lives at Inferlets/chat-apc/e2e_test.py
+# pie binary built into the Vendor/pie submodule target dir.
+ROOT = _stamp.ROOT
+PIE_BIN = ROOT / "Vendor" / "pie" / "target" / "release" / "pie"
+INFERLET_DIR = _stamp.INFERLET_DIR
+WASM_PATH = _stamp.WASM_PATH
+STAMP_PATH = _stamp.STAMP_PATH
+MANIFEST_PATH = INFERLET_DIR / "Pie.toml"
+CONFIG_TOML = """
+[server]
+host = "127.0.0.1"
+port = 0
+
+[auth]
+enabled = false
+
+[telemetry]
+enabled = false
+
+[runtime]
+allow_fs = false
+allow_network = true
+
+[[model]]
+name = "default"
+hf_repo = "Qwen/Qwen3-0.6B"
+
+[model.scheduler]
+batch_policy = "adaptive"
+request_timeout_secs = 60
+default_endowment_pages = 4
+admission_oversubscription_factor = 8.0
+restore_pause_at_utilization = 0.85
+
+[model.driver]
+type = "dummy"
+device = ["cpu"]
+
+[model.driver.options]
+vocab_size = 32000
+arch_name = "test"
+"""
+
+# Files contributing to the inferlet "source hash" re-exported for
+# legacy callers; authoritative copy lives in `_stamp.SRC_HASH_PATHS`.
+SRC_HASH_PATHS = _stamp.SRC_HASH_PATHS
+
+
+# ---------------------------------------------------------------------------
+# Stamp verification (review F4 / F5)
+# ---------------------------------------------------------------------------
+
+# Shared with `Scripts/stamp-chat-apc.sh verify` — see _stamp.py.
+verify_stamp = _stamp.verify
+
+
+# ---------------------------------------------------------------------------
+# Shmem-region cleanup (review F6)
+# ---------------------------------------------------------------------------
+
+def _shm_unlink_quiet(name: str) -> None:
+    """Best-effort `shm_unlink` so stale POSIX regions don't leak.
+
+    Used in `finally` after the engine subprocess is reaped — covers
+    SIGKILL / engine-crash paths where the engine's Drop never runs.
+    POSIX shmem is host-global, so a leaked region persists across runs
+    and a later run that recycles the same PID would attach to stale
+    geometry.
+
+    The function is "quiet" in that it doesn't raise — but it always
+    *announces itself* on stdout so CI can distinguish "cleanup ran and
+    succeeded", "cleanup ran and found nothing (ENOENT)", "cleanup
+    skipped because libc unavailable", and "cleanup failed with errno
+    N". The previous silent no-op when `find_library('c')` returned
+    None (stripped containers, sandboxes) made the F6 cleanup invisible
+    to CI (review F3).
+    """
+    libc_name = ctypes.util.find_library("c")
+    if libc_name is None:
+        print(
+            f"[harness] shm_unlink({name!r}) SKIPPED: libc not resolvable via "
+            f"ctypes.util.find_library('c'); the region may leak into POSIX's "
+            f"host-global namespace and a later run that recycles this pid "
+            f"can attach to stale geometry",
+            flush=True,
+        )
+        return
+    libc = ctypes.CDLL(libc_name, use_errno=True)
+    libc.shm_unlink.argtypes = [ctypes.c_char_p]
+    libc.shm_unlink.restype = ctypes.c_int
+    rc = libc.shm_unlink(name.encode("utf-8"))
+    if rc == 0:
+        print(f"[harness] shm_unlink({name!r}) OK", flush=True)
+        return
+    err = ctypes.get_errno()
+    if err == errno.ENOENT:
+        print(f"[harness] shm_unlink({name!r}) ENOENT (already gone)", flush=True)
+        return
+    print(
+        f"[harness] shm_unlink({name!r}) FAILED: errno={err} "
+        f"({errno.errorcode.get(err, 'unknown')})",
+        flush=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Subprocess helpers
+# ---------------------------------------------------------------------------
+
+def _free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+async def _parse_handshake(proc: subprocess.Popen, timeout: float) -> tuple[str, str]:
+    """Read pie stdout until we have `pie-server serving on <host>:<port>` + `internal token: <tok>`."""
+    url_re = re.compile(r"pie-server serving on ([^\s]+:[0-9]+)")
+    tok_re = re.compile(r"internal token: ([^\s]+)")
+    url: str | None = None
+    token: str | None = None
+    deadline = time.monotonic() + timeout
+    loop = asyncio.get_event_loop()
+    while time.monotonic() < deadline and (url is None or token is None):
+        if proc.poll() is not None:
+            raise RuntimeError(f"pie exited early (code={proc.returncode})")
+        line = await loop.run_in_executor(None, proc.stdout.readline)
+        if not line:
+            await asyncio.sleep(0.05)
+            continue
+        sys.stdout.write(f"[pie] {line}")
+        sys.stdout.flush()
+        if url is None:
+            m = url_re.search(line)
+            if m:
+                url = m.group(1)
+        if token is None:
+            m = tok_re.search(line)
+            if m:
+                token = m.group(1)
+    if url is None or token is None:
+        raise RuntimeError(f"timeout parsing pie handshake (url={url!r} token={token!r})")
+    return url, token
+
+
+async def _drain_stdout(proc: subprocess.Popen) -> None:
+    """Keep reading pie's stdout in background so the pipe buffer doesn't fill."""
+    loop = asyncio.get_event_loop()
+    while proc.poll() is None:
+        line = await loop.run_in_executor(None, proc.stdout.readline)
+        if not line:
+            await asyncio.sleep(0.05)
+            continue
+        sys.stdout.write(f"[pie] {line}")
+        sys.stdout.flush()
+
+
+def _send_signal_safe(
+    proc: subprocess.Popen,
+    sig: signal.Signals,
+    label: str,
+    sig_name: str,
+) -> bool:
+    """Best-effort `proc.send_signal(sig)`; returns False on any OSError.
+
+    `ProcessLookupError` (ESRCH) means the child already exited — log
+    + return False so the caller skips waiting on it. Any other OSError
+    (EPERM on a restricted CI worker, EINVAL on a bad signal number)
+    also logs + returns False so downstream cleanup (stdout close,
+    drain cancel, shm_unlink) still runs.
+    """
+    try:
+        if sig is signal.SIGKILL:
+            proc.kill()
+        else:
+            proc.send_signal(sig)
+        return True
+    except ProcessLookupError:
+        print(
+            f"[harness] terminate({label}): {sig_name} raced "
+            f"ProcessLookupError (ESRCH); subprocess already exited",
+            flush=True,
+        )
+        return False
+    except OSError as e:
+        print(
+            f"[harness] terminate({label}): {sig_name} failed with OSError "
+            f"errno={e.errno} ({errno.errorcode.get(e.errno or 0, 'unknown')}) "
+            f"msg={e.strerror!r}; skipping wait — downstream cleanup will "
+            f"still run",
+            flush=True,
+        )
+        return False
+
+
+def _wait_safe(
+    proc: subprocess.Popen,
+    timeout: float,
+    label: str,
+    stage: str,
+) -> tuple[bool, bool]:
+    """Best-effort `proc.wait(timeout)`; returns `(reaped, timed_out)`.
+
+    Review  carry-over 6e — mirrors `_send_signal_safe`'s OSError
+    widening for the wait side. `ECHILD` means another thread or
+    signal handler already reaped the child; treat as reaped. `EPERM`
+    / `EINVAL` from a restricted CI worker get logged + skipped so
+    downstream cleanup still runs. `subprocess.TimeoutExpired` is
+    surfaced separately so the caller can choose to escalate
+    (SIGINT → SIGKILL).
+    """
+    try:
+        proc.wait(timeout=timeout)
+        return True, False
+    except subprocess.TimeoutExpired:
+        return False, True
+    except ChildProcessError:
+        print(
+            f"[harness] terminate({label}): wait raced "
+            f"ChildProcessError (ECHILD) at {stage}; child already "
+            f"reaped elsewhere — treating as reaped",
+            flush=True,
+        )
+        return True, False
+    except OSError as e:
+        print(
+            f"[harness] terminate({label}): wait failed at {stage} "
+            f"with OSError errno={e.errno} "
+            f"({errno.errorcode.get(e.errno or 0, 'unknown')}) "
+            f"msg={e.strerror!r}; skipping further wait — downstream "
+            f"cleanup will still run",
+            flush=True,
+        )
+        return False, False
+
+
+def _terminate_subprocess(proc: subprocess.Popen, label: str) -> None:
+    """Idempotent SIGINT → SIGKILL teardown.
+
+    Guards every state-changing call so a raced exit or a sandbox-
+    restricted signal call never aborts the rest of cleanup. The v3
+    version only caught `ProcessLookupError` (`ESRCH`); the v4 review
+    widened the signal-side net to any `OSError` because `EPERM` /
+    `EINVAL` from a restricted CI worker would still skip downstream
+    steps. Review  carry-over 6e widens the wait-side net the same
+    way via `_wait_safe`. Each suppressed branch logs explicitly.
+    `label` ("inner"/"outer") lets CI attribute the message.
+    """
+    if proc.poll() is not None:
+        return
+    if not _send_signal_safe(proc, signal.SIGINT, label, "SIGINT"):
+        return
+    reaped, timed_out = _wait_safe(proc, timeout=10, label=label, stage="post-SIGINT")
+    if reaped:
+        return
+    if timed_out:
+        print(
+            f"[harness] terminate({label}): SIGINT timed out after 10s; "
+            f"escalating to SIGKILL",
+            flush=True,
+        )
+    else:
+        # `_wait_safe` already logged an OSError; skip the SIGKILL
+        # escalation because the underlying wait failure (EPERM /
+        # restricted syscall) would just repeat on the post-SIGKILL
+        # wait.
+        return
+    if not _send_signal_safe(proc, signal.SIGKILL, label, "SIGKILL"):
+        return
+    reaped, timed_out = _wait_safe(proc, timeout=5, label=label, stage="post-SIGKILL")
+    if reaped:
+        return
+    if timed_out:
+        # The OS hasn't reaped within 5s of SIGKILL — the subprocess is
+        # stuck in an uninterruptible syscall (D state on Linux, hung
+        # Mach IPC on macOS). We're out of moves; log and continue so
+        # the rest of cleanup still runs.
+        print(
+            f"[harness] terminate({label}): SIGKILL+wait timed out after 5s "
+            f"(uninterruptible syscall?); leaking subprocess to process exit",
+            flush=True,
+        )
+
+
+def _wait_for_port(port: int, timeout: float = 15) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=1):
+                return True
+        except OSError:
+            time.sleep(0.2)
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+async def main() -> int:
+    assert PIE_BIN.exists(), f"missing pie binary at {PIE_BIN}"
+    assert WASM_PATH.exists(), f"missing wasm at {WASM_PATH}"
+    assert MANIFEST_PATH.exists(), f"missing manifest at {MANIFEST_PATH}"
+    verify_stamp()
+
+    shmem_base = f"/pie_e2e_{os.getpid()}"
+    with tempfile.TemporaryDirectory(prefix="chat-apc-e2e-") as tmp:
+        tmp = Path(tmp)
+        cfg = tmp / "config.toml"
+        cfg.write_text(CONFIG_TOML)
+        pie_home = tmp / "home"
+        pie_home.mkdir()
+
+        env = {
+            **os.environ,
+            "PIE_HOME": str(pie_home),
+            "PIE_SHMEM_NAME": shmem_base,
+        }
+        proc = subprocess.Popen(
+            [str(PIE_BIN), "serve", "--config", str(cfg), "--no-auth", "--debug"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            env=env,
+            bufsize=1,
+        )
+        try:
+            ws_addr, token = await _parse_handshake(proc, timeout=30)
+            ws_url = f"ws://{ws_addr}"
+            print(f"[harness] engine ws={ws_url} token={token[:8]}…")
+
+            drain_task = asyncio.create_task(_drain_stdout(proc))
+            try:
+                client = PieClient(ws_url)
+                await client.connect()
+                await client.auth_by_token(token)
+
+                await client.install_program(WASM_PATH, MANIFEST_PATH, force_overwrite=True)
+                print("[harness] installed chat-apc@0.1.0")
+
+                http_port = _free_port()
+                base = f"http://127.0.0.1:{http_port}"
+                await client.launch_daemon("chat-apc@0.1.0", http_port)
+                print(f"[harness] launched daemon on {base}")
+
+                if not _wait_for_port(http_port, timeout=15):
+                    raise RuntimeError(f"daemon never bound port {http_port}")
+
+                failures: list[str] = []
+                # `skipped` tracks contracts the harness was unable
+                # to exercise against the dummy driver but that
+                # remain enforced by other coverage (live-driver
+                # integration suite, code review). Surfaced in the
+                # final report so a reviewer can see what wasn't
+                # actually checked here — distinct from `failures`
+                # which means a contract was checked AND violated.
+                # Mirrors pytest's skipped-vs-failed distinction.
+                skipped: list[str] = []
+                async with httpx.AsyncClient(timeout=15) as http:
+                    # /healthz
+                    r = await http.get(f"{base}/healthz")
+                    print(f"[harness] GET /healthz -> {r.status_code} {r.text!r}")
+                    if r.status_code != 200:
+                        failures.append(f"/healthz status {r.status_code}")
+                    try:
+                        body = r.json()
+                    except Exception as e:
+                        failures.append(f"/healthz not json: {e}")
+                        body = None
+                    if body != {"status": "ok"}:
+                        failures.append(f"/healthz body {body!r}")
+
+                    # /v1/models
+                    r = await http.get(f"{base}/v1/models")
+                    print(f"[harness] GET /v1/models -> {r.status_code} {r.text!r}")
+                    if r.status_code != 200:
+                        failures.append(f"/v1/models status {r.status_code}")
+                    try:
+                        body = r.json()
+                    except Exception as e:
+                        failures.append(f"/v1/models not json: {e}")
+                        body = None
+                    if not body or body.get("object") != "list":
+                        failures.append(f"/v1/models object {body!r}")
+                    data = (body or {}).get("data") or []
+                    if not data:
+                        failures.append(f"/v1/models data empty: {body!r}")
+                    else:
+                        first = data[0]
+                        if first.get("object") != "model":
+                            failures.append(f"/v1/models[0].object {first!r}")
+                        if first.get("owned_by") != "pie":
+                            failures.append(f"/v1/models[0].owned_by {first!r}")
+                        if not isinstance(first.get("id"), str) or not first.get("id"):
+                            failures.append(f"/v1/models[0].id {first!r}")
+
+                    # 404
+                    r = await http.get(f"{base}/nonexistent")
+                    print(f"[harness] GET /nonexistent -> {r.status_code}")
+                    if r.status_code != 404:
+                        failures.append(f"/nonexistent status {r.status_code}")
+
+                    # Phase 5.5–5.8 routes. The dummy driver registers
+                    # a model under name "default" but has no real
+                    # forward-pass capability — we exercise the
+                    # validation + meta-frame paths only, not the
+                    # generation loop. Real chat-completion + dispatch
+                    # smoke (with a live forward pass) lives in the
+                    # GUI integration suite, not this engine-side
+                    # harness.
+                    model_id = first.get("id") if data else "default"
+
+                    # POST /v1/models/load — pre-warm OK path.
+                    r = await http.post(
+                        f"{base}/v1/models/load",
+                        json={"model": model_id},
+                    )
+                    print(f"[harness] POST /v1/models/load(model={model_id!r}) -> {r.status_code}")
+                    if r.status_code != 200:
+                        failures.append(f"/v1/models/load status {r.status_code}")
+                    if r.headers.get("content-type", "").split(";", 1)[0] != "text/event-stream":
+                        failures.append(
+                            f"/v1/models/load content-type {r.headers.get('content-type')!r}"
+                        )
+                    # Body should contain one model_ready meta-frame +
+                    # the [DONE] sentinel. We assert exact ordering so
+                    # GUI consumers can rely on it.
+                    text = r.text
+                    if 'data: {"event":"model_ready"}' not in text:
+                        failures.append(f"/v1/models/load missing model_ready frame: {text!r}")
+                    if "data: [DONE]" not in text:
+                        failures.append(f"/v1/models/load missing [DONE] sentinel: {text!r}")
+
+                    # POST /v1/models/load — unknown model → 404.
+                    r = await http.post(
+                        f"{base}/v1/models/load",
+                        json={"model": "does-not-exist"},
+                    )
+                    print(f"[harness] POST /v1/models/load(model='does-not-exist') -> {r.status_code}")
+                    if r.status_code != 404:
+                        failures.append(f"/v1/models/load unknown status {r.status_code}")
+
+                    # DELETE /v1/models/load — 204 no-op.
+                    r = await http.delete(f"{base}/v1/models/load")
+                    print(f"[harness] DELETE /v1/models/load -> {r.status_code}")
+                    if r.status_code != 204:
+                        failures.append(f"/v1/models/load DELETE status {r.status_code}")
+
+                    # POST /v1/chat/completions — unknown model → 404
+                    # (validation path, no forward pass triggered).
+                    r = await http.post(
+                        f"{base}/v1/chat/completions",
+                        json={
+                            "model": "does-not-exist",
+                            "messages": [{"role": "user", "content": "hi"}],
+                            "stream": False,
+                        },
+                    )
+                    print(f"[harness] POST /v1/chat/completions(bad model) -> {r.status_code}")
+                    if r.status_code != 404:
+                        failures.append(f"/v1/chat/completions unknown model status {r.status_code}")
+
+                    # POST /v1/chat/completions — empty messages → 400.
+                    r = await http.post(
+                        f"{base}/v1/chat/completions",
+                        json={"model": model_id, "messages": [], "stream": False},
+                    )
+                    print(f"[harness] POST /v1/chat/completions(empty messages) -> {r.status_code}")
+                    if r.status_code != 400:
+                        failures.append(
+                            f"/v1/chat/completions empty messages status {r.status_code}"
+                        )
+
+                    # POST /v1/inferlet — unknown name → 404.
+                    r = await http.post(
+                        f"{base}/v1/inferlet",
+                        json={"inferlet": "no-such", "input": {}, "stream": False},
+                    )
+                    print(f"[harness] POST /v1/inferlet(unknown name) -> {r.status_code}")
+                    if r.status_code != 404:
+                        failures.append(f"/v1/inferlet unknown status {r.status_code}")
+
+                    # POST /v1/inferlet — chat-apc with unknown model
+                    # in `input` → 404 from the chat layer.
+                    r = await http.post(
+                        f"{base}/v1/inferlet",
+                        json={
+                            "inferlet": "chat-apc",
+                            "input": {"model": "does-not-exist"},
+                            "messages": [{"role": "user", "content": "hi"}],
+                            "stream": False,
+                        },
+                    )
+                    print(f"[harness] POST /v1/inferlet(chat-apc + bad model) -> {r.status_code}")
+                    if r.status_code != 404:
+                        failures.append(
+                            f"/v1/inferlet chat-apc bad model status {r.status_code}"
+                        )
+
+                    # Review v2 follow-ups (F6/F7/F16): param bounds,
+                    # malformed JSON, oversized body, streaming frame
+                    # order, /v1/inferlet messages-precedence.
+                    bad_params = [
+                        ("temperature", -1.0),
+                        ("temperature", 3.0),
+                        ("top_p", 0.0),
+                        ("top_p", 1.5),
+                        ("max_tokens", 0),
+                        ("max_tokens", 1_000_000),
+                    ]
+                    for field, value in bad_params:
+                        payload = {
+                            "model": model_id,
+                            "messages": [{"role": "user", "content": "hi"}],
+                            "stream": False,
+                            field: value,
+                        }
+                        r = await http.post(f"{base}/v1/chat/completions", json=payload)
+                        print(
+                            f"[harness] POST /v1/chat/completions({field}={value!r}) -> {r.status_code}"
+                        )
+                        if r.status_code != 400:
+                            failures.append(
+                                f"/v1/chat/completions {field}={value!r} status {r.status_code}"
+                            )
+                        else:
+                            try:
+                                err = r.json().get("error", {})
+                            except Exception:
+                                err = {}
+                            if err.get("param") != field:
+                                failures.append(
+                                    f"/v1/chat/completions {field}={value!r} param tag {err!r}"
+                                )
+
+                    # Malformed JSON body → 400.
+                    r = await http.post(
+                        f"{base}/v1/chat/completions",
+                        content=b"not json at all",
+                        headers={"Content-Type": "application/json"},
+                    )
+                    print(f"[harness] POST /v1/chat/completions(malformed JSON) -> {r.status_code}")
+                    if r.status_code != 400:
+                        failures.append(
+                            f"/v1/chat/completions malformed status {r.status_code}"
+                        )
+
+                    # Body exceeds CHAT_MAX_BODY (1 MiB) → 413.
+                    big = b"a" * ((1 << 20) + 1024)
+                    r = await http.post(
+                        f"{base}/v1/chat/completions",
+                        content=big,
+                        headers={"Content-Type": "application/json"},
+                    )
+                    print(f"[harness] POST /v1/chat/completions(oversized) -> {r.status_code}")
+                    if r.status_code != 413:
+                        failures.append(
+                            f"/v1/chat/completions oversized status {r.status_code}"
+                        )
+
+                    # /v1/inferlet messages-precedence: input.messages
+                    # wins over top-level messages. Setting input.messages
+                    # to [] while top-level has content → 400 (empty
+                    # messages), proving input was consulted.
+                    r = await http.post(
+                        f"{base}/v1/inferlet",
+                        json={
+                            "inferlet": "chat-apc",
+                            "input": {"model": model_id, "messages": []},
+                            "messages": [{"role": "user", "content": "hi"}],
+                            "stream": False,
+                        },
+                    )
+                    print(
+                        f"[harness] POST /v1/inferlet(input.messages=[] wins) -> {r.status_code}"
+                    )
+                    if r.status_code != 400:
+                        failures.append(
+                            f"/v1/inferlet messages-precedence status {r.status_code} "
+                            f"(input.messages=[] should have won, producing 400)"
+                        )
+
+                    # Streaming frame order (F16b.a): model_ready
+                    # precedes any content frame, the terminal
+                    # chat.completion.chunk carries a finish_reason
+                    # in {stop, length, error}, stream ends with
+                    # [DONE]. Dummy driver can't drive a real
+                    # forward pass — Generator::next surfaces an
+                    # Err — so we expect finish_reason="error" in
+                    # this harness; the assertion is robust to
+                    # either path (a forward-pass-capable driver
+                    # would naturally land on "stop" or "length").
+                    import json as _json
+                    r = await http.post(
+                        f"{base}/v1/chat/completions",
+                        json={
+                            "model": model_id,
+                            "messages": [{"role": "user", "content": "hi"}],
+                            "stream": True,
+                        },
+                    )
+                    print(
+                        f"[harness] POST /v1/chat/completions(stream=true) -> {r.status_code} "
+                        f"content-type={r.headers.get('content-type')!r}"
+                    )
+                    if r.status_code != 200:
+                        failures.append(f"/v1/chat/completions stream status {r.status_code}")
+                    else:
+                        ct = r.headers.get("content-type", "").split(";", 1)[0]
+                        if ct != "text/event-stream":
+                            failures.append(
+                                f"/v1/chat/completions stream content-type {ct!r}"
+                            )
+                        data_lines = [
+                            line[len("data: "):]
+                            for line in r.text.splitlines()
+                            if line.startswith("data: ")
+                        ]
+                        # F9 ordering: first frame is model_ready.
+                        if not data_lines or data_lines[0] != '{"event":"model_ready"}':
+                            failures.append(
+                                f"/v1/chat/completions stream first frame {data_lines[:2]!r}"
+                            )
+                        if "[DONE]" not in data_lines:
+                            failures.append(
+                                f"/v1/chat/completions stream missing [DONE]"
+                            )
+                        # F16b.a: locate the terminal chunk and
+                        # assert its finish_reason is in the
+                        # canonical set.
+                        finish_reason = None
+                        finish_idx = None
+                        for i, d in enumerate(data_lines):
+                            if d == "[DONE]":
+                                continue
+                            try:
+                                obj = _json.loads(d)
+                            except _json.JSONDecodeError:
+                                continue
+                            if obj.get("object") == "chat.completion.chunk":
+                                fr = obj["choices"][0].get("finish_reason")
+                                if fr is not None:
+                                    finish_reason = fr
+                                    finish_idx = i
+                        if finish_reason is None:
+                            failures.append(
+                                f"/v1/chat/completions stream: no terminal chunk with "
+                                f"finish_reason: {data_lines!r}"
+                            )
+                        elif finish_reason not in ("stop", "length", "error"):
+                            failures.append(
+                                f"/v1/chat/completions stream: finish_reason={finish_reason!r} "
+                                f"not in canonical set"
+                            )
+
+                    # F16b.b: mid-stream error ordering. F8 says the
+                    # terminal chat.completion.chunk with
+                    # finish_reason:"error" MUST precede the
+                    # `{"event":"error",…}` diagnostic meta-frame so
+                    # OpenAI clients see the canonical finish first
+                    # and pie-native clients consume the diagnostic
+                    # after.
+                    #
+                    # The dummy driver returns random tokens without
+                    # error and exits on "length"/"stop", so the
+                    # deterministic trigger is impossible at this
+                    # layer. We probe several payloads that would
+                    # surface as Aborted on a live driver under load
+                    # (long input → scheduler-overflow,
+                    # max_tokens-1 → race with stop emission, etc.)
+                    # and check the ordering contract whenever any
+                    # response actually lands on
+                    # finish_reason:"error" OR includes an
+                    # {"event":"error"} meta-frame. If none of the
+                    # probes exercise the contract, we explicitly
+                    # mark the assertion SKIPPED (review F16c —
+                    # NOT a bare print) and point to live-driver
+                    # coverage in  (GUI integration suite).
+                    error_ordering_exercised = False
+                    error_ordering_violated: str | None = None
+                    probes: list[dict] = [
+                        {
+                            "model": model_id,
+                            "messages": [{"role": "user", "content": "trigger error path"}],
+                            "stream": True,
+                        },
+                        {
+                            "model": model_id,
+                            "messages": [
+                                {"role": "user", "content": " ".join(["w"] * 4000)},
+                            ],
+                            "stream": True,
+                            "max_tokens": 4,
+                        },
+                        {
+                            "model": model_id,
+                            "messages": [{"role": "user", "content": "x"}],
+                            "stream": True,
+                            "max_tokens": 1,
+                        },
+                    ]
+                    for probe_payload in probes:
+                        r = await http.post(
+                            f"{base}/v1/chat/completions", json=probe_payload
+                        )
+                        print(
+                            f"[harness] POST /v1/chat/completions(stream=true probe) "
+                            f"-> {r.status_code}"
+                        )
+                        if r.status_code != 200:
+                            continue
+                        data_lines = [
+                            line[len("data: "):]
+                            for line in r.text.splitlines()
+                            if line.startswith("data: ")
+                        ]
+                        error_chunk_idx = None
+                        error_meta_idx = None
+                        for i, d in enumerate(data_lines):
+                            if d == "[DONE]":
+                                continue
+                            try:
+                                obj = _json.loads(d)
+                            except _json.JSONDecodeError:
+                                continue
+                            if (
+                                obj.get("object") == "chat.completion.chunk"
+                                and obj["choices"][0].get("finish_reason") == "error"
+                                and error_chunk_idx is None
+                            ):
+                                error_chunk_idx = i
+                            if obj.get("event") == "error" and error_meta_idx is None:
+                                error_meta_idx = i
+                        if error_chunk_idx is None and error_meta_idx is None:
+                            # Natural exit. F8 contract is
+                            # vacuously satisfied for this probe;
+                            # try next.
+                            continue
+                        error_ordering_exercised = True
+                        if error_chunk_idx is None:
+                            error_ordering_violated = (
+                                f"meta-error frame at idx {error_meta_idx} with no "
+                                f"preceding finish_reason:'error' chunk"
+                            )
+                        elif error_meta_idx is None:
+                            error_ordering_violated = (
+                                f"finish_reason:'error' chunk at idx {error_chunk_idx} "
+                                f"but no {{event:error}} meta-frame followed"
+                            )
+                        elif error_chunk_idx >= error_meta_idx:
+                            error_ordering_violated = (
+                                f"meta-frame at idx {error_meta_idx} precedes "
+                                f"finish_reason chunk at idx {error_chunk_idx}"
+                            )
+                        break
+                    if error_ordering_exercised:
+                        if error_ordering_violated is not None:
+                            failures.append(
+                                f"/v1/chat/completions error-ordering: "
+                                f"{error_ordering_violated} — F8 contract violated"
+                            )
+                    else:
+                        # F16c: do not silently pass. Record an
+                        # explicit SKIPPED entry that surfaces in
+                        # the final report. Comparable to
+                        # `pytest.skip("requires live driver")`;
+                        # this harness is a __main__ script, not a
+                        # pytest module, so we use the harness's
+                        # own skip channel rather than importing
+                        # pytest for one call. F8 ordering remains
+                        # enforced by (a) chat.rs control flow
+                        # (terminal chunk emit precedes diagnostic
+                        # emit by construction, see
+                        # `handle_streaming`) and (b) the
+                        # deterministic live-driver harness in the
+                        # GUI integration suite (Phase 6.1 / ,
+                        # which exercises the Aborted path against
+                        # a forward-pass-capable driver).
+                        skipped.append(
+                            "/v1/chat/completions error-ordering (F8): dummy driver did "
+                            "not produce a finish_reason:'error' or {event:error} frame "
+                            "across 3 trigger probes; contract enforced by chat.rs "
+                            "control flow + live-driver coverage in "
+                        )
+
+                # APC plumbing-alive ( Phase 2): the chat handler
+                # now wires `inferlet::tools::equip_prefix` +
+                # `ToolUseDecoder` + `ReasoningDecoder` into the
+                # generation loop. The dummy driver can't drive a
+                # real forward pass and (depending on the
+                # model template) may have no tool surface, so we
+                # only assert that:
+                #   1. valid OpenAI tools[] payloads PARSE (not 400),
+                #   2. the response stays inside the canonical
+                #      envelope (200 with assistant message, or 500
+                #      with a known error code from the new wiring).
+                # Semantic correctness — tool_call detection,
+                # reasoning_content content — requires a live model
+                # and is gated behind .
+                tool_payload = {
+                    "model": model_id,
+                    "messages": [{"role": "user", "content": "What is 2+2?"}],
+                    "stream": False,
+                    "tools": [{
+                        "type": "function",
+                        "function": {
+                            "name": "calculator",
+                            "description": "Evaluate an arithmetic expression.",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"expr": {"type": "string"}},
+                                "required": ["expr"],
+                            },
+                        },
+                    }],
+                    "tool_choice": "auto",
+                }
+                r = await http.post(
+                    f"{base}/v1/chat/completions", json=tool_payload
+                )
+                print(
+                    f"[harness] POST /v1/chat/completions(tools+tool_choice) "
+                    f"-> {r.status_code}"
+                )
+                if r.status_code == 400:
+                    failures.append(
+                        f"/v1/chat/completions tools-param parse: 400 "
+                        f"{r.text!r} (tools[] schema should deserialize)"
+                    )
+                elif r.status_code == 200:
+                    body = r.json()
+                    msg = body.get("choices", [{}])[0].get("message", {})
+                    if msg.get("role") != "assistant":
+                        failures.append(
+                            f"/v1/chat/completions tools 200 body shape: "
+                            f"missing assistant message: {body!r}"
+                        )
+                elif r.status_code == 500:
+                    code = r.json().get("error", {}).get("code")
+                    if code not in (
+                        "tool_equip_failed",
+                        "tool_decode_failed",
+                        "forward_pass_failed",
+                        "decode_failed",
+                        "reasoning_decode_failed",
+                        "model_load_failed",
+                        "context_create_failed",
+                    ):
+                        failures.append(
+                            f"/v1/chat/completions tools 500 code={code!r} "
+                            f"not in APC-wiring set"
+                        )
+                else:
+                    failures.append(
+                        f"/v1/chat/completions tools status {r.status_code} "
+                        f"unexpected"
+                    )
+
+                # Reasoning plumbing-alive: the ReasoningDecoder runs
+                # unconditionally on every request. Send a prompt
+                # that *would* trigger a thinking model and confirm
+                # the streaming envelope still parses end-to-end —
+                # no frame should be malformed even when no reasoning
+                # tokens are produced. reasoning_content is omitted
+                # via `skip_serializing_if = Option::is_none`, so a
+                # well-behaved stream has the same shape as before
+                # the wiring landed (regression guard).
+                r = await http.post(
+                    f"{base}/v1/chat/completions",
+                    json={
+                        "model": model_id,
+                        "messages": [
+                            {"role": "system", "content": "Think step by step."},
+                            {"role": "user", "content": "Solve: 17*24+13"},
+                        ],
+                        "stream": True,
+                    },
+                )
+                print(
+                    f"[harness] POST /v1/chat/completions(reasoning-prompt) "
+                    f"-> {r.status_code}"
+                )
+                if r.status_code != 200:
+                    failures.append(
+                        f"/v1/chat/completions reasoning stream status {r.status_code}"
+                    )
+                else:
+                    data_lines = [
+                        line[len("data: "):]
+                        for line in r.text.splitlines()
+                        if line.startswith("data: ")
+                    ]
+                    for d in data_lines:
+                        if d == "[DONE]":
+                            continue
+                        try:
+                            _json.loads(d)
+                        except _json.JSONDecodeError as e:
+                            failures.append(
+                                f"/v1/chat/completions reasoning stream: "
+                                f"malformed frame {d!r}: {e}"
+                            )
+                            break
+
+                await client.close()
+
+                # Skipped contracts surface BEFORE pass/fail so a
+                # reviewer scanning the tail of CI output can see
+                # them. Skipped entries don't fail the run (parallel
+                # to pytest's skipped-vs-failed split), but they
+                # MUST be visible — F16c review caught that the
+                # prior bare `print(NOTE: …)` was effectively
+                # invisible to anything past stdout-grep.
+                if skipped:
+                    print("[harness] SKIPPED:")
+                    for s in skipped:
+                        print(f"  - {s}")
+                if failures:
+                    print("[harness] FAILURES:")
+                    for f in failures:
+                        print(f"  - {f}")
+                    return 1
+                if skipped:
+                    print(f"[harness] PASS ({len(skipped)} skipped)")
+                else:
+                    print("[harness] PASS")
+                return 0
+            finally:
+                # Order matters here. The drainer is parked in
+                # `run_in_executor(readline)`, and `cancel()` does NOT
+                # interrupt the executor thread. The cleanest unblock
+                # is to terminate the subprocess first, which sends
+                # EOF down the pipe and lets readline return naturally.
+                # The outer finally is then idempotent via
+                # `proc.poll() is None`.
+                _terminate_subprocess(proc, label="inner")
+                with contextlib.suppress(Exception):
+                    proc.stdout.close()
+                drain_task.cancel()
+                # Narrow the swallowed exceptions to `CancelledError`;
+                # `TimeoutError` is handled explicitly so CI sees a
+                # diagnostic when the executor thread is still parked
+                # past 2s (review v3 F1). Any other exception in the
+                # drainer was a real bug masked by the previous broad
+                # `except Exception` — F7.
+                #
+                # The catch-all `Exception` branch logs + re-raises so
+                # CI sees the propagation explicitly (v4 F2): an
+                # unexpected drainer failure (UnicodeDecodeError, etc.)
+                # used to slip past Cancelled/Timeout handling and
+                # bubble through the outer finally with no breadcrumb.
+                # Python's `finally`-during-unwind semantics still run
+                # the outer cleanup including `_shm_unlink_quiet`, so
+                # raising here doesn't leak the shmem region.
+                try:
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await asyncio.wait_for(drain_task, timeout=2.0)
+                except asyncio.TimeoutError:
+                    print(
+                        "[harness] drain_task abandoned after 2s timeout "
+                        "(executor thread parked on readline; subprocess may "
+                        "not be sending EOF). Thread will leak to process "
+                        "exit.",
+                        flush=True,
+                    )
+                except Exception as e:
+                    print(
+                        f"[harness] drain_task raised unexpected "
+                        f"{type(e).__name__}: {e!r}; outer cleanup will "
+                        f"still run, then exception propagates",
+                        flush=True,
+                    )
+                    raise
+        finally:
+            print("[harness] entering outer cleanup", flush=True)
+            _terminate_subprocess(proc, label="outer")
+            # F6: unlink the region we asked for so a SIGKILL'd engine
+            # doesn't leak it into POSIX's host-global namespace.
+            # The actual region the engine creates is `<base>_g{N}`; we
+            # only spawn DP=1 so `_g0` is the single shard.
+            _shm_unlink_quiet(f"{shmem_base}_g0")
+
+
+if __name__ == "__main__":
+    sys.exit(asyncio.run(main()))

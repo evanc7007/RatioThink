@@ -1,0 +1,429 @@
+#!/usr/bin/env python3
+"""Provenance-stamp helpers for the prebuilt chat-apc wasm.
+
+Imported by `e2e_test.py` for the runtime fail-fast check that guards
+against shipping a wasm out-of-sync with its inputs, and invoked by
+`Scripts/stamp-chat-apc.sh` as a CLI to write or verify
+`prebuilt/chat-apc.wasm.stamp` (, item 4).
+
+CLI:
+
+    python3 _stamp.py write                    # rewrite from current tree
+    python3 _stamp.py verify                   # full verify (inputs + wasm)
+    python3 _stamp.py verify --inputs-only     # verify only inputs
+"""
+from __future__ import annotations
+
+import argparse
+import contextlib
+import hashlib
+import os
+import subprocess
+import sys
+import tarfile
+import tempfile
+from io import BytesIO
+from pathlib import Path
+
+# Co-located with the inferlet sources. ROOT walks up to the macro-repo
+# so we can resolve the `Vendor/pie` submodule.
+INFERLET_DIR = Path(__file__).resolve().parent
+ROOT = INFERLET_DIR.parent.parent
+WASM_PATH = INFERLET_DIR / "prebuilt" / "chat-apc.wasm"
+STAMP_PATH = INFERLET_DIR / "prebuilt" / "chat-apc.wasm.stamp"
+VENDOR_PIE = ROOT / "Vendor" / "pie"
+# Sentinel file inside the submodule. Present iff the submodule worktree
+# is populated; `git -C ... rev-parse HEAD` resolves the gitlink even
+# when the worktree is empty, so we cannot rely on that alone (F6).
+VENDOR_PIE_SENTINEL = VENDOR_PIE / "sdk" / "rust" / "inferlet" / "Cargo.toml"
+
+# Files contributing to the inferlet "source hash" — anything that, if
+# touched, must trigger a wasm rebuild. `Cargo.lock` is tracked here
+# (review v2 F2) so a transitive crate version bump invalidates the
+# stamp symmetrically with `--locked` at build time; without this the
+# audit trail is weaker than the build contract.
+SRC_HASH_PATHS = [
+    INFERLET_DIR / "src",
+    INFERLET_DIR / "Cargo.toml",
+    INFERLET_DIR / "Cargo.lock",
+    INFERLET_DIR / "Pie.toml",
+]
+
+# Canonical schema. Every stamp file MUST set every key non-empty (F1).
+# Forward-compat schema evolution is gated on an explicit `stamp_version`
+# field, not on per-key truthiness.
+CANONICAL_KEYS: tuple[str, ...] = (
+    "vendor_pie_sha",
+    "src_sha256",
+    "wasm_sha256",
+    "wasm_size",
+)
+# Keys whose value derives only from source inputs (not the rebuilt
+# wasm). CI re-asserts these AFTER a fresh `cargo build` to catch
+# Cargo.lock drift / stale-cache divergence the pre-build verify cannot
+# see (F3).
+INPUT_KEYS: tuple[str, ...] = (
+    "vendor_pie_sha",
+    "src_sha256",
+)
+
+# Doc-comment header preserved verbatim across regenerations. Records
+# field authority + regen recipe + guarantee scope so a reader of the
+# committed stamp does not have to grep the repo to understand what
+# each line means OR what the stamp does NOT promise (F4).
+STAMP_HEADER = """\
+# Provenance stamp for the checked-in prebuilt wasm.
+#
+# Bind the artifact to the inputs it was built from: the inferlet sdk
+# is path-deped at `../../Vendor/pie/sdk/rust/inferlet` so a submodule
+# bump or a `src/` edit invalidates the wasm. The e2e harness verifies
+# this stamp matches the current tree before installing the inferlet —
+# if any field drifts the harness fails with a "rebuild required"
+# diagnostic instead of silently shipping a stale binary.
+#
+# Authority of each field (review  carry-over 6a):
+#   - vendor_pie_sha — `git -C Vendor/pie rev-parse HEAD`, *not* the
+#     `.gitmodules` `branch =` recorded pointer; a detached submodule
+#     bump that forgets to update .gitmodules still invalidates the
+#     stamp.
+#   - src_sha256 — sha256 of a deterministic tar over SRC_HASH_PATHS
+#     (src/, Cargo.toml, Cargo.lock, Pie.toml) with zeroed
+#     mtime/uid/gid AND normalized file mode (0o644). Cargo.lock IS a
+#     tracked input (review v2 F2): the build runs with `--locked`,
+#     so the lockfile is the authoritative declaration of every
+#     transitive crate version; a registry-side bump that edits
+#     Cargo.lock must invalidate the stamp symmetrically. The
+#     path-dep on the Vendor/pie sdk is a separate trigger: a
+#     submodule bump invalidates via vendor_pie_sha.
+#   - wasm_sha256 — sha256 of the prebuilt artifact. This is a
+#     **harness-side** staleness guard only; the pie-server upload
+#     path (`add_program`) treats the client-supplied program_hash as
+#     an opaque session-scoped dedup key and never verifies the
+#     buffer (Vendor/pie/runtime/src/server/handler.rs:106).
+#
+# Guarantee scope (review v1 F4):
+#   The stamp catches *accidental* drift only — `src/` edits or
+#   submodule bumps that forgot to rewrite the stamp, or a stale
+#   prebuilt against a fresh source tree. It is NOT a signature: a
+#   coordinated hand-edit of `prebuilt/chat-apc.wasm` plus
+#   `Scripts/stamp-chat-apc.sh write` produces a valid stamp for
+#   arbitrary bytes. Trust the src→wasm relationship only insofar as
+#   CI bears witness via the post-build inputs-only re-verify. A real
+#   integrity story (sigstore signing / server-side allowlist) is
+#   out-of-scope for .
+#
+# Auto-generated by `Scripts/stamp-chat-apc.sh` — do not hand-edit.
+# Regenerate any time `src/`, manifests, or the submodule pointer move:
+#     Scripts/stamp-chat-apc.sh write
+#
+# CI verifies (, item 4):
+#     Scripts/stamp-chat-apc.sh verify           # pre-build, full
+#     Scripts/stamp-chat-apc.sh verify-inputs    # post-build, inputs only
+"""
+
+
+# ---------------------------------------------------------------------------
+# Parsers + hashers
+# ---------------------------------------------------------------------------
+
+def parse_stamp(text: str) -> dict[str, str]:
+    """Tiny `key = "value"` / `key = N` parser (subset of TOML scalars).
+
+    Supported (review  carry-over 6d):
+      * full-line `# comment` (stripped before key=value parsing)
+      * inline `# comment` AFTER an *unquoted* value, e.g. `n = 42  # hex`
+      * `key = "value"` with surrounding double quotes
+      * `key = N` bare numerics
+    NOT supported (intentional — keep the parser small):
+      * `#` characters inside quoted strings (we strip after splitting,
+        so `foo = "a#b"` would lose `#b`). The stamp values are all
+        hex SHAs + byte counts; none contain `#`.
+      * single-quoted strings, multi-line values, arrays.
+    """
+    out: dict[str, str] = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        value = value.strip()
+        if not (value.startswith('"') and value.endswith('"')):
+            hash_idx = value.find("#")
+            if hash_idx >= 0:
+                value = value[:hash_idx].rstrip()
+        value = value.strip('"')
+        out[key.strip()] = value
+    return out
+
+
+def _normalize_tarinfo(info: tarfile.TarInfo) -> tarfile.TarInfo:
+    """Strip every host-specific field that would leak into the hash (F2).
+
+    Without mode normalization a `chmod +x src/lib.rs` or a checkout
+    on a config without `core.fileMode=false` flips `src_sha256` for
+    byte-identical content.
+    """
+    info.mtime = 0
+    info.uid = 0
+    info.gid = 0
+    info.uname = ""
+    info.gname = ""
+    info.mode = 0o755 if info.isdir() else 0o644
+    return info
+
+
+def hash_src_tree(paths: list[Path] | None = None) -> str:
+    """Deterministic hash of inferlet source inputs.
+
+    Stable across machines because we build a tar archive in a fixed
+    order with zeroed mtime / uid / gid / mode, then sha256 it.
+    """
+    paths = list(paths) if paths is not None else list(SRC_HASH_PATHS)
+    buf = BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        for root in sorted(paths, key=lambda p: p.as_posix()):
+            if root.is_dir():
+                for sub in sorted(root.rglob("*"), key=lambda p: p.as_posix()):
+                    if sub.is_file():
+                        info = tar.gettarinfo(
+                            name=str(sub),
+                            arcname=str(sub.relative_to(INFERLET_DIR)),
+                        )
+                        _normalize_tarinfo(info)
+                        with sub.open("rb") as f:
+                            tar.addfile(info, f)
+            elif root.is_file():
+                info = tar.gettarinfo(
+                    name=str(root),
+                    arcname=str(root.relative_to(INFERLET_DIR)),
+                )
+                _normalize_tarinfo(info)
+                with root.open("rb") as f:
+                    tar.addfile(info, f)
+    return hashlib.sha256(buf.getvalue()).hexdigest()
+
+
+def hash_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _assert_vendor_pie_populated() -> None:
+    """Fail loud if Vendor/pie is an uninitialized gitlink (F6/F9).
+
+    `git -C Vendor/pie rev-parse HEAD` succeeds against an unpopulated
+    submodule worktree and returns the gitlink's recorded SHA, which
+    would let `python3 _stamp.py write` produce a plausible-looking
+    stamp against an empty tree. The shell wrapper checks this too,
+    but the python entrypoint must hold the same invariant on direct
+    invocation.
+    """
+    if not VENDOR_PIE_SENTINEL.exists():
+        raise SystemExit(
+            f"Vendor/pie submodule is not populated (missing {VENDOR_PIE_SENTINEL}).\n"
+            "Run: git submodule update --init --recursive Vendor/pie"
+        )
+
+
+def submodule_sha() -> str:
+    """SHA of `Vendor/pie` as resolved by git inside the macro-repo."""
+    _assert_vendor_pie_populated()
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(VENDOR_PIE), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (FileNotFoundError, PermissionError) as e:
+        # Exec-side failure: git binary missing from PATH or not
+        # executable. Distinct from a non-zero exit; raises before
+        # CalledProcessError can fire (review v3 F1). Stripped
+        # sandboxes and CI steps that mutate PATH between checkout
+        # and the stamp call land here.
+        raise SystemExit(
+            "git binary not found or not executable on PATH; required to "
+            f"resolve {VENDOR_PIE} HEAD. Install git or fix PATH before "
+            "running stamp write/verify."
+        ) from e
+    except subprocess.CalledProcessError as e:
+        # Sentinel exists but git itself rejected rev-parse — e.g. a
+        # partially-detached submodule after a botched deinit/init
+        # cycle, or a corrupted .git. Surface git's stderr inside the
+        # same friendly diagnostic the F6 path uses (review v2 F4).
+        stderr = (e.stderr or "").strip() or "(empty)"
+        raise SystemExit(
+            f"git rev-parse HEAD failed inside {VENDOR_PIE} (exit {e.returncode}); "
+            "the submodule may be corrupted or partially detached.\n"
+            "Try: git submodule update --init --recursive Vendor/pie\n"
+            f"git stderr: {stderr}"
+        ) from e
+    return out.stdout.strip()
+
+
+def compute(*, include_wasm: bool = True) -> dict[str, str]:
+    """Compute current actual values for stamp fields.
+
+    `include_wasm=False` skips the prebuilt wasm fields so callers that
+    only care about input-side fields (CI's post-build re-verify) can
+    succeed even if the prebuilt is mid-rebuild or absent.
+    """
+    values: dict[str, str] = {
+        "vendor_pie_sha": submodule_sha(),
+        "src_sha256": hash_src_tree(),
+    }
+    if include_wasm:
+        if not WASM_PATH.exists():
+            raise SystemExit(
+                f"missing prebuilt wasm at {WASM_PATH}; rebuild via "
+                "`Scripts/stamp-chat-apc.sh build` then re-run."
+            )
+        values["wasm_sha256"] = hash_file(WASM_PATH)
+        values["wasm_size"] = str(WASM_PATH.stat().st_size)
+    return values
+
+
+# ---------------------------------------------------------------------------
+# Verify + write
+# ---------------------------------------------------------------------------
+
+def verify(stamp_path: Path = STAMP_PATH, *, inputs_only: bool = False) -> None:
+    """Fail fast if the prebuilt wasm is out of sync with the tree.
+
+    `inputs_only=True` skips the wasm_sha256 / wasm_size comparison and
+    only re-asserts the input-side fields (vendor_pie_sha, src_sha256).
+    CI calls this AFTER a fresh `cargo build` so registry-fetched
+    transitive drift / stale-cache divergence surface as a red build
+    (F3). The pre-build verify still runs full mode.
+
+    Schema enforcement (F1): every canonical key must be present in the
+    parsed stamp AND non-empty. A missing or blank field is a hard
+    failure, not a silent skip — older stamps that predate a field
+    must be regenerated via `Scripts/stamp-chat-apc.sh write`.
+    """
+    if not stamp_path.exists():
+        raise SystemExit(
+            f"missing provenance stamp at {stamp_path}; rebuild the wasm and "
+            "regenerate the stamp before running e2e"
+        )
+    stamp = parse_stamp(stamp_path.read_text())
+
+    missing = [k for k in CANONICAL_KEYS if not stamp.get(k)]
+    if missing:
+        raise SystemExit(
+            f"stamp at {stamp_path} is missing or has empty values for: "
+            f"{', '.join(missing)}.\n"
+            "Regenerate via `Scripts/stamp-chat-apc.sh write`."
+        )
+
+    keys = INPUT_KEYS if inputs_only else CANONICAL_KEYS
+    actual = compute(include_wasm=not inputs_only)
+    mismatches = [
+        f"{key} {stamp[key]} != {actual[key]}"
+        for key in keys
+        if stamp[key] != actual[key]
+    ]
+    if mismatches:
+        scope = "inputs-only" if inputs_only else "full"
+        raise SystemExit(
+            f"chat-apc prebuilt is stale relative to the working tree ({scope}):\n  - "
+            + "\n  - ".join(mismatches)
+            + "\nRebuild the wasm (`Scripts/stamp-chat-apc.sh write` —"
+            " or by hand: `cargo build --release --locked --target wasm32-wasip2`),"
+            " copy it into `prebuilt/`, and rewrite the stamp."
+        )
+    if inputs_only:
+        print(
+            "[stamp] ok (inputs-only): "
+            f"sub={actual['vendor_pie_sha'][:12]} "
+            f"src={actual['src_sha256'][:12]}",
+        )
+    else:
+        print(
+            "[stamp] ok: "
+            f"sub={actual['vendor_pie_sha'][:12]} "
+            f"src={actual['src_sha256'][:12]} "
+            f"wasm={actual['wasm_sha256'][:12]} "
+            f"size={actual['wasm_size']}",
+        )
+
+
+def _render(values: dict[str, str]) -> str:
+    body = (
+        f'vendor_pie_sha = "{values["vendor_pie_sha"]}"\n'
+        f'src_sha256     = "{values["src_sha256"]}"\n'
+        f'wasm_sha256    = "{values["wasm_sha256"]}"\n'
+        f'wasm_size      = {values["wasm_size"]}\n'
+    )
+    return STAMP_HEADER + "\n" + body
+
+
+def write(stamp_path: Path = STAMP_PATH) -> None:
+    """Regenerate the stamp file from the current tree.
+
+    Writes atomically (tempfile + os.replace) and pins mode to 0o644
+    independent of the caller's umask —  item 6b (avoid
+    permission drift between local and CI checkouts).
+    """
+    values = compute()
+    rendered = _render(values)
+    stamp_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(
+        prefix=".stamp-",
+        suffix=".tmp",
+        dir=str(stamp_path.parent),
+    )
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(rendered)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, stamp_path)
+    except BaseException:
+        # Preserve the original exception. Cleanup is best-effort —
+        # any OSError from unlink (FileNotFoundError, PermissionError
+        # on a stripped sandbox, OSError on a read-only mount,
+        # IsADirectoryError) must NOT propagate out and demote the
+        # upstream failure to `__context__` (review v2 F3).
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+    print(
+        f"[stamp] wrote {stamp_path} "
+        f"(sub={values['vendor_pie_sha'][:12]} "
+        f"src={values['src_sha256'][:12]} "
+        f"wasm={values['wasm_sha256'][:12]} "
+        f"size={values['wasm_size']})",
+    )
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def _cli(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        description="Read/write the chat-apc wasm provenance stamp.",
+    )
+    sub = parser.add_subparsers(dest="mode", required=True)
+    p_verify = sub.add_parser("verify", help="fail if stamp drifts from current tree")
+    p_verify.add_argument(
+        "--inputs-only",
+        action="store_true",
+        help="re-assert only vendor_pie_sha + src_sha256 (post-build CI gate)",
+    )
+    sub.add_parser("write", help="rewrite stamp from current tree")
+    args = parser.parse_args(argv)
+    if args.mode == "verify":
+        verify(inputs_only=args.inputs_only)
+    elif args.mode == "write":
+        write()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(_cli(sys.argv[1:]))

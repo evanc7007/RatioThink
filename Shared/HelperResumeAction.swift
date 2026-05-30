@@ -1,0 +1,181 @@
+import Foundation
+
+/// Pure-Swift policy half of the menu-bar Resume action. Extracted
+/// from `HelperAppDelegate.togglePauseResume(_:)` (Helper target, not
+/// SPM-reachable) so `RatioThinkCoreTests` can exercise the resolve-and-
+/// start sequence without spinning up AppKit / NSStatusBar.
+///
+/// HelperMain owns the AppKit half (button representedObject parsing,
+/// log lines) and forwards into `HelperResumeAction.run(...)` for the
+/// decision. Returned `Outcome` lets the caller log the exact failure
+/// reason and lets the test bundle assert against discrete cases
+/// instead of grepping log strings.
+public enum HelperResumeAction {
+  /// One per discrete branch the Resume policy can take. Carried as
+  /// values (not just booleans) so the helper log line carries the
+  /// underlying cause without re-deriving it.
+  public enum Outcome: Equatable, CustomStringConvertible {
+    /// Healthy path — `engineHost.start(spec)` returned `.success`.
+    case started(profileID: String)
+    /// Degraded boot or pre-listener race — no engine host wired.
+    case supervisorMissing
+    /// Degraded boot or test-mode skip — no ProfileStore.
+    case profileStoreMissing
+    /// LaunchSpecResolver not wired (DEBUG smoke path with no
+    /// PIE_SMOKE_FAKE_ENGINE_BIN, test mode without explicit wiring).
+    case resolverMissing
+    /// ProfileStore has no `activeProfileID` — the user has not
+    /// picked one yet. Distinct from `.activeProfileUnreadable`
+    /// (broken marker) so operator logs distinguish the two.
+    ///
+    /// `afterRetry == true` means the F3 retry path ran (marker WAS
+    /// broken), the retry healed the error, AND the post-retry id
+    /// is still nil — the operator's repair was to delete the
+    /// marker rather than write a valid id. Pre-v6 this case
+    /// collapsed into the same log arm as "user never picked one",
+    /// losing the breadcrumb that the retry attempt fired (review
+    /// v6 F3). The principle from v5 F2 — "tried again, still X"
+    /// is a distinct outcome from "first-look X" — now applies
+    /// symmetrically to both X=broken AND X=absent.
+    case noActiveProfile(afterRetry: Bool)
+    /// The on-disk active-profile marker is present but unreadable
+    /// (permission denied, directory at the path, decode failure).
+    /// Carries the underlying `ProfileStoreError.activeProfileReadFailed`
+    /// so the helper log line names the precise cause. Review v3 F1:
+    /// the prior code collapsed this into `.noActiveProfile`, so
+    /// helper.log could not tell never-selected from perms-denied.
+    case activeProfileUnreadable(ProfileStoreError)
+    /// Marker was previously broken (we observed `lastActiveProfileError`),
+    /// the F3 user-Resume retry path called `reloadActiveProfile()`, and
+    /// the post-retry snapshot is STILL broken. Distinct from
+    /// `.activeProfileUnreadable` so helper.log distinguishes
+    /// "tried again, still broken" from "first-look broken" (review
+    /// v5 F2: the prior collapsed code path made both outcomes
+    /// bit-identical in logs).
+    case activeProfileUnreadableAfterRetry(ProfileStoreError)
+    /// `LaunchSpecResolver` rejected the active profile id — surfaces
+    /// `.profileMissing` (id drift between store + resolver) or
+    /// `.spawnFailed` (binary lookup throw, etc.).
+    case resolverFailed(EngineError)
+    /// `PieEngineHost.start` rejected the spec (e.g. `.alreadyRunning`
+    /// race against an external XPC `startEngine` call).
+    case startRejected(EngineError)
+
+    public var description: String {
+      switch self {
+      case .started(let id):          return "started(profileID=\(id))"
+      case .supervisorMissing:        return "supervisorMissing"
+      case .profileStoreMissing:      return "profileStoreMissing"
+      case .resolverMissing:          return "resolverMissing"
+      case .noActiveProfile(let afterRetry):
+        return "noActiveProfile(afterRetry=\(afterRetry))"
+      case .activeProfileUnreadable(let e):
+        return "activeProfileUnreadable(\(e))"
+      case .activeProfileUnreadableAfterRetry(let e):
+        return "activeProfileUnreadableAfterRetry(\(e))"
+      case .resolverFailed(let e):    return "resolverFailed(\(e.code.rawValue): \(e.message))"
+      case .startRejected(let e):     return "startRejected(\(e.code.rawValue): \(e.message))"
+      }
+    }
+  }
+
+  /// Resolve the active profile and ask the supervisor to start it.
+  /// In-process — no XPC round-trip; the menu-bar action lives in the
+  /// helper itself, so the supervisor reference is directly usable.
+  ///
+  /// Two-step lookup (review cycle 149/150 F2):
+  ///   1. Read `store.activeProfileID`. Nil → `.noActiveProfile` —
+  ///      the user has not picked one yet.
+  ///   2. Hand the id to `resolver(id)`. A missing/failed-to-parse
+  ///      entry surfaces as `.resolverFailed(.profileMissing)` so
+  ///      the caller distinguishes "nothing selected" from "selected
+  ///      id is stale" (the prior single-step
+  ///      `store.activeProfile != nil` check collapsed both).
+  ///
+  /// Idempotent against the supervisor's own
+  /// `.starting`/`.running`/`.stopping` rejection (returned as
+  /// `.startRejected(.alreadyRunning)`); the policy here does NOT
+  /// pre-check status so the supervisor stays the single source of
+  /// truth for "is one already in flight".
+  public static func run(
+    engineHost: PieEngineHost?,
+    profileStore: ProfileStore?,
+    resolver: HelperExportedAPI.LaunchSpecResolver?
+  ) -> Outcome {
+    guard let engineHost else { return .supervisorMissing }
+    guard let store = profileStore else { return .profileStoreMissing }
+    guard let resolver else { return .resolverMissing }
+    // User-initiated Resume is the natural retry affordance for a
+    // previously-broken marker (review v4 F3). If the store is
+    // currently carrying `_activeProfileError`, force an authoritative
+    // reload BEFORE consulting `activeProfileID` so an operator who
+    // repaired perms / removed a planted directory sees the click
+    // resolve into a real start instead of bouncing off
+    // `.activeProfileUnreadable` until helper restart.
+    //
+    // Observability (review v5 F2): log the retry attempt at
+    // `.notice` and the still-broken outcome at `.error` so
+    // helper.log distinguishes "no retry, marker was already clean"
+    // from "retried, still broken" — bit-identical in the v4
+    // implementation. The post-retry snapshot is the authoritative
+    // truth (review v5 F5): we read from it directly instead of
+    // re-polling `lastActiveProfileError`, which would race against
+    // a concurrent FS event between the two reads.
+    if store.lastActiveProfileError != nil {
+      Log.helper.notice("HelperResumeAction: active-profile marker was unreadable; attempting reloadActiveProfile() before consulting activeProfileID")
+      let retrySnap = store.reloadActiveProfile()
+      if let retryErr = retrySnap.activeProfileError {
+        Log.helper.error("HelperResumeAction: active-profile marker still unreadable after retry: \(String(describing: retryErr), privacy: .public)")
+        return .activeProfileUnreadableAfterRetry(retryErr)
+      }
+      // Retry healed the error — fall through to the standard
+      // resolve-and-start path using the refreshed snapshot.
+      if let id = retrySnap.activeProfileID {
+        return resolveAndStart(id: id, engineHost: engineHost, resolver: resolver)
+      }
+      // Review v6 F3: retry healed the error but produced no active
+      // id — operator's repair was to remove the marker, not write a
+      // valid one. Distinguish from never-selected so helper.log
+      // shows the retry breadcrumb.
+      return .noActiveProfile(afterRetry: true)
+    }
+    guard let id = store.activeProfileID else {
+      // Disambiguate "never picked" from "marker present but
+      // unreadable" (review v3 F1).
+      if let err = store.lastActiveProfileError {
+        return .activeProfileUnreadable(err)
+      }
+      return .noActiveProfile(afterRetry: false)
+    }
+    return resolveAndStart(id: id, engineHost: engineHost, resolver: resolver)
+  }
+
+  /// Shared resolve→host.start tail (review v6 F6). Both the
+  /// retry-healed branch and the non-retry branch funnel through here
+  /// so a future change to the start path (pre-resolve hook,
+  /// structured `.resolverFailed` log decoration) lives in one place.
+  private static func resolveAndStart(
+    id: String,
+    engineHost: PieEngineHost,
+    resolver: HelperExportedAPI.LaunchSpecResolver
+  ) -> Outcome {
+    switch resolver(id) {
+    case .failure(let err):
+      // Publish EVERY resolver failure (not just `.memoryRisk`) through
+      // the engine's `.failed` status so the App surfaces the reason —
+      // notably `modelMissing` from a fresh install / stale profile —
+      // instead of silently sitting at `.stopped` while the chat
+      // composer defers forever ( follow-up). `HelperStatusItemModel`
+      // gates the Resume affordance on `code.invitesResumeRetry`, so a
+      // recoverable code keeps a working retry while `memoryRisk` does
+      // not invite one.
+      engineHost.recordPreStartFailure(err)
+      return .resolverFailed(err)
+    case .success(let spec):
+      switch engineHost.start(spec) {
+      case .failure(let err): return .startRejected(err)
+      case .success:          return .started(profileID: id)
+      }
+    }
+  }
+}

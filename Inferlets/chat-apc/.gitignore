@@ -1,0 +1,15 @@
+# Defensive: force-track the prebuilt wasm even if a future root rule
+# starts excluding *.wasm globally. The macOS app bundle ships this
+# artifact as a resource, so it must remain in the working tree.
+!prebuilt/
+!prebuilt/*.wasm
+
+# Python bytecode from e2e_test.py / _stamp_test.py / _stamp.py.
+__pycache__/
+*.pyc
+
+# Atomic-write tempfiles from `_stamp.py write` (mkstemp -> os.replace).
+# A SIGKILL between mkstemp and the rename leaves one in prebuilt/;
+# the rename closes the window in the happy path. Keep `prebuilt/`
+# itself force-tracked (see negations above) — these are sub-rules.
+prebuilt/.stamp-*.tmp

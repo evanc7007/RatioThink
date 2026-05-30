@@ -1,0 +1,58 @@
+import Foundation
+import SwiftData
+
+/// Persistent message row inside a `Chat`. Streaming-token writes
+/// land on `content` incrementally — see `MessageStreamWriter` for
+/// the batched-flush policy (every 250 ms, plus a final flush on
+/// `model_ready` / `finish`).
+///
+/// `role` is stored as the wire-shape raw string (`"user"` /
+/// `"assistant"` / `"system"`) so `Message` rows decode straight from
+/// any JSON export without needing a custom transformable; the
+/// `roleEnum` computed property recovers a `ChatMessage.Role`.
+///
+/// `meta` is an opaque JSON blob reserved for engine-shaped extras
+/// (finish reason, model id, token-usage triple, tool-call frames in
+/// v2). Nullable — non-streaming inserts leave it nil.
+@available(macOS 14, *)
+@Model
+public final class Message {
+  @Attribute(.unique) public var id: UUID
+  /// Back-reference to the owning chat. Optional because SwiftData
+  /// represents the inverse of a to-many cascade-delete with a
+  /// nullable to-one (the owning side enforces deletion). Setting
+  /// this to nil orphans the message; the GUI never does that —
+  /// inserts go through `Chat.messages.append`.
+  public var chat: Chat?
+  /// Raw `ChatMessage.Role.rawValue` (`"user"`, `"assistant"`,
+  /// `"system"`). Stored as string so the row decodes straight from
+  /// any JSON export without a custom transformer.
+  public var role: String
+  public var content: String
+  /// Token count populated by the engine on finish; 0 while a
+  /// streaming turn is in flight.
+  public var tokens: Int
+  public var ts: Date
+  /// Opaque JSON blob for engine-shape extras (finish reason, usage,
+  /// model id, future tool-call frames). Nil for plain
+  /// non-streaming inserts.
+  public var meta: Data?
+
+  public init(
+    id: UUID = UUID(),
+    chat: Chat? = nil,
+    role: String,
+    content: String = "",
+    tokens: Int = 0,
+    ts: Date = Date(),
+    meta: Data? = nil
+  ) {
+    self.id = id
+    self.chat = chat
+    self.role = role
+    self.content = content
+    self.tokens = tokens
+    self.ts = ts
+    self.meta = meta
+  }
+}

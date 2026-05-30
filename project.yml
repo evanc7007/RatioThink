@@ -1,0 +1,199 @@
+name: RatioThink
+options:
+  bundleIdPrefix: com.ratiothink.app
+  deploymentTarget:
+    macOS: "14.0"
+  developmentLanguage: en
+  groupSortPosition: top
+  generateEmptyDirectories: true
+
+settings:
+  base:
+    SWIFT_VERSION: "5.10"
+    MACOSX_DEPLOYMENT_TARGET: "14.0"
+    CODE_SIGN_STYLE: Manual
+    CODE_SIGN_IDENTITY: "-"
+    CODE_SIGNING_REQUIRED: YES
+    CODE_SIGNING_ALLOWED: YES
+    GENERATE_INFOPLIST_FILE: YES
+    # GENERATE_INFOPLIST_FILE=YES synthesizes CFBundleShortVersionString /
+    # CFBundleVersion from these build settings; without them the version
+    # keys in each target's info.properties are dropped from the built bundle.
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    ENABLE_HARDENED_RUNTIME: NO
+    DEAD_CODE_STRIPPING: YES
+
+packages:
+  TOMLKit:
+    url: https://github.com/LebJe/TOMLKit
+    from: "0.6.0"
+  MarkdownUI:
+    url: https://github.com/gonzalezreal/swift-markdown-ui
+    from: "2.4.0"
+
+targets:
+  RatioThink:
+    type: application
+    platform: macOS
+    sources:
+      - path: App
+      - path: Shared
+      - path: Resources/Assets.xcassets
+        optional: true
+    # Bundle the chat-apc inferlet (wasm + manifest) into
+    # App.app/Contents/Resources/Inferlets/chat-apc/. Source-tree
+    # layout (`Inferlets/chat-apc/prebuilt/chat-apc.wasm` +
+    # `Inferlets/chat-apc/Pie.toml`) does not map 1:1 to the
+    # bundle subpath the launcher expects, and xcodegen's `resources:`
+    # entries land flat in `Contents/Resources/` (no per-file
+    # destination control), so use a build-phase script with explicit
+    # input/output declarations. Inputs/outputs let the build system
+    # skip the copy when neither file changed ( item 1).
+    postCompileScripts:
+      - name: Bundle chat-apc inferlet
+        script: |
+          set -euo pipefail
+          DEST="${BUILT_PRODUCTS_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/Inferlets/chat-apc"
+          mkdir -p "$DEST"
+          cp "${SRCROOT}/Inferlets/chat-apc/prebuilt/chat-apc.wasm" "$DEST/"
+          cp "${SRCROOT}/Inferlets/chat-apc/Pie.toml" "$DEST/"
+        inputFiles:
+          - $(SRCROOT)/Inferlets/chat-apc/prebuilt/chat-apc.wasm
+          - $(SRCROOT)/Inferlets/chat-apc/Pie.toml
+        outputFiles:
+          - $(BUILT_PRODUCTS_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/Inferlets/chat-apc/chat-apc.wasm
+          - $(BUILT_PRODUCTS_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/Inferlets/chat-apc/Pie.toml
+    # Stage the Helper launchd plist into Contents/Library/LaunchAgents/
+    # so SMAppService.agent(plistName:) can register it. Must be a
+    # postCompileScript (pre-CodeSign) like the inferlet/engine staging:
+    # the plist has to be sealed into the bundle's CodeResources, else
+    # the outer codesign rejects "resource added that did not exist at
+    # signing" and SMAppService refuses an unsealed agent plist.
+      - name: Stage Helper LaunchAgent plist
+        script: |
+          set -euo pipefail
+          DEST="${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Library/LaunchAgents"
+          mkdir -p "$DEST"
+          cp "${SRCROOT}/Helper/com.ratiothink.app.helper.plist" "$DEST/"
+        inputFiles:
+          - $(SRCROOT)/Helper/com.ratiothink.app.helper.plist
+        outputFiles:
+          - $(BUILT_PRODUCTS_DIR)/$(CONTENTS_FOLDER_PATH)/Library/LaunchAgents/com.ratiothink.app.helper.plist
+    # Build the pie engine binary (Vendor/pie `pie-server` crate, bin
+    # `pie`) for the current Xcode arch, stage into
+    # Contents/Resources/pie-engine/pie (the path
+    # Shared/Engine/PieSupervisor.swift expects), and codesign with the
+    # engine's own entitlements.  phase 5.10.
+    #
+    # Must live in postCompileScripts (NOT postBuildScripts): xcodegen
+    # appends postBuild phases after Xcode's implicit CodeSign step,
+    # which would invalidate the bundle's _CodeSignature/CodeResources
+    # seal as soon as we add or replace Contents/Resources/pie-engine/
+    # pie afterwards — notarization rejects "resource added that did
+    # not exist at signing" (review v2 F1). Running pre-CodeSign means
+    # the engine is sealed into CodeResources as part of the bundle.
+    #
+    # To stop Xcode's outer codesign from stripping the engine's own
+    # entitlements (the original review v1 F3 concern), we set
+    # OTHER_CODE_SIGN_FLAGS on the RatioThink target to include
+    # `--preserve-metadata=identifier,entitlements,flags`. That tells
+    # codesign to preserve the engine's standalone entitlements when
+    # it re-signs nested binaries during the bundle seal.
+    #
+    # No `basedOnDependencyAnalysis` block: cargo owns Vendor/pie/'s
+    # dep graph and a fresh cargo no-op is sub-second; declaring an
+    # outputFiles path here lets Xcode skip the phase by mtime even
+    # when sources changed, masking stale-engine bugs (review v1 F2).
+      - name: Build pie engine binary
+        basedOnDependencyAnalysis: false
+        script: |
+          set -euo pipefail
+          "${SRCROOT}/Scripts/build-pie-engine.sh"
+    dependencies:
+      - target: RatioThinkHelper
+        embed: true
+        codeSign: true
+        copy:
+          destination: wrapper
+          subpath: Contents/Library/LoginItems
+      - package: TOMLKit
+      - package: MarkdownUI
+        product: MarkdownUI
+    info:
+      path: App/Info.plist
+      properties:
+        LSMinimumSystemVersion: "14.0"
+        CFBundleIdentifier: com.ratiothink.app
+        CFBundleIconFile: AppIcon
+        CFBundleName: RatioThink
+        CFBundleDisplayName: RatioThink
+        CFBundleShortVersionString: "0.1.0"
+        CFBundleVersion: "1"
+        NSHumanReadableCopyright: "© 2026 RatioThink"
+        NSSupportsAutomaticTermination: false
+        NSSupportsSuddenTermination: false
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.ratiothink.app
+        INFOPLIST_FILE: App/Info.plist
+        CODE_SIGN_ENTITLEMENTS: App/RatioThink.entitlements
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        # Preserve the pie engine's standalone entitlements during the
+        # outer bundle CodeSign. The engine binary is signed in the
+        # `Build pie engine binary` postCompileScript with allow-jit /
+        # network.server / etc.; without these flags Xcode's bundle
+        # codesign re-signs nested executables using the host app's
+        # entitlements, dropping the engine's JIT/network grants and
+        # crashing it under hardened runtime. (Review v1 F3 / v2 F1.)
+        OTHER_CODE_SIGN_FLAGS: $(inherited) --preserve-metadata=identifier,entitlements,flags
+
+  RatioThinkHelper:
+    type: application
+    platform: macOS
+    sources:
+      - path: Helper
+        # Staged into RatioThink.app/Contents/Library/LaunchAgents/ by the RatioThink
+        # target's postCompileScript; not a RatioThinkHelper resource.
+        excludes:
+          - com.ratiothink.app.helper.plist
+      - path: Shared
+    dependencies:
+      - package: TOMLKit
+    info:
+      path: Helper/Info.plist
+      properties:
+        LSUIElement: YES
+        CFBundleIdentifier: com.ratiothink.app.helper
+        CFBundleName: RatioThinkHelper
+        CFBundleDisplayName: RatioThinkHelper
+        CFBundleShortVersionString: "0.1.0"
+        CFBundleVersion: "1"
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.ratiothink.app.helper
+        INFOPLIST_FILE: Helper/Info.plist
+        CODE_SIGN_ENTITLEMENTS: Helper/RatioThinkHelper.entitlements
+
+  RatioThinkTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: Tests/Unit
+    dependencies:
+      - target: RatioThink
+      - package: TOMLKit
+      - package: MarkdownUI
+        product: MarkdownUI
+
+  RatioThinkGUITests:
+    type: bundle.ui-testing
+    platform: macOS
+    sources:
+      - path: Tests/GUIScenarioTests
+    dependencies:
+      - target: RatioThink
+      - target: RatioThinkHelper
+    settings:
+      base:
+        TEST_TARGET_NAME: RatioThink

@@ -1,0 +1,1937 @@
+import XCTest
+import Foundation
+import os
+@testable import RatioThinkCore
+
+/// Integration tests for `ProfileStore`. Each test runs in an
+/// ephemeral temp dir so the FS watcher under test sees a clean
+/// inode and parallel test runs (when enabled) cannot collide on a
+/// shared profiles directory.
+///
+/// Async waiting strategy: the dispatch source schedules reloads on
+/// the store's serial queue (with a debounce window). Tests register
+/// a listener that fulfills an `XCTestExpectation` and then wait
+/// with a generous timeout — FS notifications on macOS are usually
+/// sub-100ms but CI under load can take longer.
+final class ProfileStoreTests: XCTestCase {
+
+  // MARK: - seeding
+
+  func test_seeds_default_chat_toml_on_first_launch() throws {
+    try withTempProfilesDir { dir in
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+
+      let seeded = dir.appendingPathComponent(ProfileStore.defaultChatFilename)
+      XCTAssertTrue(FileManager.default.fileExists(atPath: seeded.path),
+                    "first launch should write chat.toml into an empty profiles dir")
+
+      let body = try String(contentsOf: seeded, encoding: .utf8)
+      XCTAssertEqual(body, ProfileStore.defaultChatTOML)
+
+      let entry = try XCTUnwrap(store.entries.first { $0.url.lastPathComponent == "chat.toml" })
+      XCTAssertNotNil(entry.profile)
+      XCTAssertNil(entry.error)
+      XCTAssertEqual(entry.profile?.id, "chat")
+      XCTAssertEqual(entry.warnings, [])
+    }
+  }
+
+  /// : seeding the default `chat.toml` on a fresh install
+  /// must also write the active-profile marker. Without this, the
+  /// menu-bar Resume click returns `.noActiveProfile` on first launch
+  /// (the seeded entry is present in `entries` but `activeProfileID`
+  /// is nil) and the user has no in-product affordance to pick one.
+  func test_seed_also_writes_default_active_profile_marker_on_first_launch() throws {
+    try withTempProfilesDir { dir in
+      let active = dir.deletingLastPathComponent()
+        .appendingPathComponent("active-profile", isDirectory: false)
+      let store = ProfileStore(directory: dir, activeProfileURL: active)
+      try store.start()
+      defer { store.stop() }
+
+      XCTAssertTrue(FileManager.default.fileExists(atPath: active.path),
+                    "first-launch seed must also write the active-profile marker so Resume is not a silent no-op")
+      let markerBody = try String(contentsOf: active, encoding: .utf8)
+      XCTAssertEqual(markerBody, "chat",
+                     "seeded marker must point at the seeded chat profile id")
+      XCTAssertEqual(store.activeProfileID, "chat",
+                     "store must surface the seeded active id immediately on start()")
+      XCTAssertNil(store.lastActiveProfileError,
+                   "seeded marker must not surface a read error")
+      XCTAssertEqual(store.activeProfile?.id, "chat",
+                     "activeProfile must resolve to the seeded chat profile")
+    }
+  }
+
+  /// : when the profiles dir already has tomls (i.e. seed
+  /// is a no-op), the seed step must NOT plant an active-profile
+  /// marker. Doing so would override the operator's "I have not
+  /// chosen yet" state on subsequent launches.
+  func test_seed_does_not_write_marker_when_profiles_directory_is_populated() throws {
+    try withTempProfilesDir { dir in
+      try writeProfile(into: dir, name: "chat.toml", id: "chat", displayName: "Chat")
+      let active = dir.deletingLastPathComponent()
+        .appendingPathComponent("active-profile", isDirectory: false)
+      let store = ProfileStore(directory: dir, activeProfileURL: active)
+      try store.start()
+      defer { store.stop() }
+
+      XCTAssertFalse(FileManager.default.fileExists(atPath: active.path),
+                     "seed step must be a no-op when tomls already exist; marker must remain absent")
+      XCTAssertNil(store.activeProfileID,
+                   "absent marker must remain the clean 'no selection yet' state")
+    }
+  }
+
+  /// : if the operator has already chosen a profile (marker
+  /// file present) BEFORE the seed step ever ran, the seed must not
+  /// clobber that choice when it later runs against an empty dir
+  /// (rare but defensible — e.g. profiles were manually removed). The
+  /// existing marker wins.
+  func test_seed_preserves_existing_active_profile_marker() throws {
+    try withTempProfilesDir { dir in
+      let active = dir.deletingLastPathComponent()
+        .appendingPathComponent("active-profile", isDirectory: false)
+      try "custom".write(to: active, atomically: true, encoding: .utf8)
+
+      let store = ProfileStore(directory: dir, activeProfileURL: active)
+      try store.start()
+      defer { store.stop() }
+
+      let markerBody = try String(contentsOf: active, encoding: .utf8)
+      XCTAssertEqual(markerBody, "custom",
+                     "seed must not overwrite a pre-existing active-profile marker")
+    }
+  }
+
+  ///  review v1 F4: `defaultProfileID` and the `id =`
+  /// literal inside `defaultChatTOML` are two free-floating constants.
+  /// A future edit that touches one without the other reintroduces
+  /// the silent-no-op (marker points at a non-existent profile id;
+  /// `activeProfile?` resolves to nil; Resume returns
+  /// `.noActiveProfile`). Parse the seeded TOML and pin the invariant
+  /// at CI so drift fails loudly.
+  func test_default_profile_id_matches_default_chat_toml_id() throws {
+    let parsed = try Profile.parse(toml: ProfileStore.defaultChatTOML)
+    XCTAssertEqual(parsed.id, ProfileStore.defaultProfileID,
+                   "defaultProfileID must equal the `id =` literal inside defaultChatTOML; drift reproduces ")
+  }
+
+  ///  review v1 F2 + F8 (refined under review v2 F1):
+  /// marker-write failure must surface `.activeProfileSeedFailed`
+  /// via `lastActiveProfileError`. The fault must break ONLY the
+  /// write path — otherwise the test fails to pin F2's `start()`
+  /// override (reverting that override would still satisfy a test
+  /// that accepts `.activeProfileReadFailed` from the readback).
+  ///
+  /// Mechanism: chmod 0o500 on the marker parent dir (`r-x------`).
+  /// `open(O_CREAT|O_EXCL|O_WRONLY)` needs write + exec on the parent
+  /// → `EACCES`. The marker file itself never exists, so
+  /// `readActiveProfileIDFromDisk` returns `.absent`, and the read
+  /// commit clears `_activeProfileError` to nil. Without the F2
+  /// override in `start()`, `lastActiveProfileError` would stay nil
+  /// (the silent-no-op the fix targets); with it, the snapshot
+  /// carries `.activeProfileSeedFailed`.
+  ///
+  /// Pinned EXACTLY against `.activeProfileSeedFailed` per review v2
+  /// F1 — no accept-either fallback.
+  func test_seed_marker_write_failure_surfaces_activeProfileSeedFailed() throws {
+    try withTempProfilesDir { dir in
+      let active = dir.deletingLastPathComponent()
+        .appendingPathComponent("active-profile", isDirectory: false)
+      let activeParent = active.deletingLastPathComponent()
+
+      // Profiles dir lives below `activeParent` at 0o755, so the
+      // chat.toml seed (which writes inside `profiles/`) still
+      // succeeds — exec on `activeParent` traverses fine, only
+      // file CREATION inside `activeParent` is blocked.
+      try setPermissions(activeParent, mode: 0o500)
+      defer { try? setPermissions(activeParent, mode: 0o755) }
+
+      let store = ProfileStore(directory: dir, activeProfileURL: active)
+      try store.start()
+      defer { store.stop() }
+
+      guard case .activeProfileSeedFailed(let path, _) = store.lastActiveProfileError else {
+        return XCTFail("review v2 F1: must pin .activeProfileSeedFailed exactly; got \(String(describing: store.lastActiveProfileError))")
+      }
+      XCTAssertEqual(path, active.path,
+                     "error must carry the marker path that failed")
+      XCTAssertNil(store.activeProfileID,
+                   "snapshot mask: activeProfileID must be nil while error is live")
+    }
+  }
+
+  /// Companion to the F1 test above: when an operator (or stray
+  /// process) leaves a DIRECTORY at the marker path, the EEXIST
+  /// branch in `seedActiveProfileMarker` must NOT log "existing
+  /// marker wins" — it must surface `.activeProfileSeedFailed` with
+  /// the inode-type tag (review v2 F4). Otherwise an operator
+  /// grepping logs sees "seed succeeded" while Resume silently
+  /// fails downstream.
+  func test_seed_marker_existing_directory_surfaces_seedFailed() throws {
+    try withTempProfilesDir { dir in
+      let active = dir.deletingLastPathComponent()
+        .appendingPathComponent("active-profile", isDirectory: false)
+      try FileManager.default.createDirectory(at: active,
+                                              withIntermediateDirectories: true)
+      defer { try? FileManager.default.removeItem(at: active) }
+
+      let store = ProfileStore(directory: dir, activeProfileURL: active)
+      try store.start()
+      defer { store.stop() }
+
+      // Either `.activeProfileSeedFailed` (review v2 F4 path:
+      // EEXIST → lstat → not S_IFREG) or `.activeProfileReadFailed`
+      // (readback hit the directory first and the F2 override
+      // preserves its priority per review v2 F2). Both are
+      // acceptable here because the contract under test is "an
+      // existing directory at the marker path MUST surface an
+      // actionable error" — the v2 F2 fix explicitly prefers the
+      // read error when both fire.
+      switch store.lastActiveProfileError {
+      case .activeProfileSeedFailed, .activeProfileReadFailed:
+        break
+      default:
+        XCTFail("expected .activeProfileSeedFailed or .activeProfileReadFailed; got \(String(describing: store.lastActiveProfileError))")
+      }
+      XCTAssertNil(store.activeProfileID)
+    }
+  }
+
+  func test_does_not_overwrite_existing_chat_toml() throws {
+    try withTempProfilesDir { dir in
+      let existing = dir.appendingPathComponent("chat.toml")
+      let customBody = """
+      id = "chat"
+      name = "Custom Chat"
+      model = "custom-model"
+      inferlet = "custom-inferlet"
+      """
+      try customBody.write(to: existing, atomically: true, encoding: .utf8)
+
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+
+      let body = try String(contentsOf: existing, encoding: .utf8)
+      XCTAssertEqual(body, customBody,
+                     "existing chat.toml must not be clobbered by the seed step")
+
+      let entry = try XCTUnwrap(store.entries.first { $0.url.lastPathComponent == "chat.toml" })
+      XCTAssertEqual(entry.profile?.name, "Custom Chat")
+    }
+  }
+
+  // MARK: - initial scan
+
+  func test_initial_scan_returns_all_existing_profiles_sorted() throws {
+    try withTempProfilesDir { dir in
+      try writeProfile(into: dir, name: "zeta.toml", id: "zeta", displayName: "Zeta")
+      try writeProfile(into: dir, name: "alpha.toml", id: "alpha", displayName: "Alpha")
+
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+
+      let names = store.entries.map { $0.url.lastPathComponent }
+      XCTAssertEqual(names, ["alpha.toml", "zeta.toml"],
+                     "entries must be sorted by filename for stable UI ordering")
+    }
+  }
+
+  // MARK: - FS watcher
+
+  func test_watcher_picks_up_newly_added_profile() throws {
+    try withTempProfilesDir { dir in
+      let store = ProfileStore(directory: dir)
+      let expect = expectation(description: "watcher fires after profile addition")
+      let nameMatch = "added.toml"
+      let listenerLock = NSLock()
+      var fired = false
+      store.addListener { snap in
+        let hasNew = snap.entries.contains { $0.url.lastPathComponent == nameMatch }
+        listenerLock.lock()
+        defer { listenerLock.unlock() }
+        if hasNew && !fired {
+          fired = true
+          expect.fulfill()
+        }
+      }
+      try store.start()
+      defer { store.stop() }
+
+      try writeProfile(into: dir, name: nameMatch, id: "added", displayName: "Added")
+
+      wait(for: [expect], timeout: 5.0)
+      XCTAssertTrue(store.entries.contains { $0.url.lastPathComponent == nameMatch })
+    }
+  }
+
+  func test_watcher_picks_up_deletion() throws {
+    try withTempProfilesDir { dir in
+      try writeProfile(into: dir, name: "ephemeral.toml", id: "eph", displayName: "Eph")
+
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+
+      // Register the listener AFTER start so the replay snapshot
+      // already contains ephemeral.toml. Otherwise the
+      // pre-initial-scan replay (empty entries) would fulfill the
+      // expectation immediately because `stillThere == false` then.
+      let expect = expectation(description: "watcher fires after profile deletion")
+      let listenerLock = NSLock()
+      var sawFile = false
+      var fired = false
+      store.addListener { snap in
+        let stillThere = snap.entries.contains { $0.url.lastPathComponent == "ephemeral.toml" }
+        listenerLock.lock()
+        defer { listenerLock.unlock() }
+        if stillThere { sawFile = true }
+        if sawFile && !stillThere && !fired {
+          fired = true
+          expect.fulfill()
+        }
+      }
+
+      try FileManager.default.removeItem(at: dir.appendingPathComponent("ephemeral.toml"))
+
+      wait(for: [expect], timeout: 5.0)
+      XCTAssertFalse(store.entries.contains { $0.url.lastPathComponent == "ephemeral.toml" })
+    }
+  }
+
+  // MARK: - per-section validation
+
+  func test_v2_sections_load_as_warnings_not_errors() throws {
+    try withTempProfilesDir { dir in
+      // `mcp_servers` wrong shape (scalar instead of table) → warning.
+      // `routine` correct shape → no warning.
+      let body = """
+      id = "warn"
+      name = "Warn"
+      model = "m"
+      inferlet = "i"
+
+      mcp_servers = "should-be-a-table"
+
+      [routine]
+      kind = "ok"
+      """
+      let url = dir.appendingPathComponent("warn.toml")
+      try body.write(to: url, atomically: true, encoding: .utf8)
+
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+
+      let entry = try XCTUnwrap(store.entries.first { $0.url.lastPathComponent == "warn.toml" })
+      XCTAssertNotNil(entry.profile, "v2-section warnings must NOT reject the profile")
+      XCTAssertNil(entry.error)
+      XCTAssertEqual(entry.warnings.count, 1)
+      XCTAssertEqual(entry.warnings.first?.section, "mcp_servers")
+    }
+  }
+
+  func test_top_level_required_field_missing_is_a_hard_error() throws {
+    try withTempProfilesDir { dir in
+      let body = """
+      name = "no-id"
+      model = "m"
+      inferlet = "i"
+      """
+      let url = dir.appendingPathComponent("broken.toml")
+      try body.write(to: url, atomically: true, encoding: .utf8)
+
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+
+      let entry = try XCTUnwrap(store.entries.first { $0.url.lastPathComponent == "broken.toml" })
+      XCTAssertNil(entry.profile)
+      XCTAssertEqual(entry.error, .missingField("id"))
+    }
+  }
+
+  func test_parse_failure_surfaced_per_file_does_not_poison_other_entries() throws {
+    try withTempProfilesDir { dir in
+      try writeProfile(into: dir, name: "good.toml", id: "good", displayName: "Good")
+
+      let bad = dir.appendingPathComponent("bad.toml")
+      try "this is not = valid [[[toml".write(to: bad, atomically: true, encoding: .utf8)
+
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+
+      let good = try XCTUnwrap(store.entries.first { $0.url.lastPathComponent == "good.toml" })
+      let badEntry = try XCTUnwrap(store.entries.first { $0.url.lastPathComponent == "bad.toml" })
+      XCTAssertTrue(good.isValid)
+      XCTAssertFalse(badEntry.isValid)
+      XCTAssertNotNil(badEntry.error)
+    }
+  }
+
+  // MARK: - lifecycle
+
+  func test_double_start_throws() throws {
+    try withTempProfilesDir { dir in
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+
+      XCTAssertThrowsError(try store.start()) { err in
+        guard case ProfileStoreError.alreadyStarted = err else {
+          return XCTFail("expected .alreadyStarted, got \(err)")
+        }
+      }
+    }
+  }
+
+  func test_stop_is_idempotent() throws {
+    try withTempProfilesDir { dir in
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      store.stop()
+      store.stop()  // must not crash
+    }
+  }
+
+  func test_addListener_replays_current_state() throws {
+    try withTempProfilesDir { dir in
+      try writeProfile(into: dir, name: "first.toml", id: "first", displayName: "First")
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+
+      let expect = expectation(description: "listener fires with replayed snapshot")
+      store.addListener { snap in
+        if snap.entries.contains(where: { $0.url.lastPathComponent == "first.toml" }) {
+          expect.fulfill()
+        }
+      }
+      wait(for: [expect], timeout: 2.0)
+    }
+  }
+
+  // MARK: - directory-level error observability (review v1 F3 + F4)
+
+  /// F3: when the seed write fails (read-only profiles dir), the
+  /// snapshot must expose `directoryError == .seedFailed` so the UI
+  /// can render the real cause instead of an empty-state placeholder.
+  func test_seed_failure_surfaces_to_listeners_via_snapshot() throws {
+    try withTempProfilesDir { dir in
+      // Drop write permission on the profiles dir BEFORE start so
+      // the seed write fails but the dir itself still opens
+      // O_EVTONLY and the scan still succeeds (returns []).
+      try setPermissions(dir, mode: 0o500)
+      defer { try? setPermissions(dir, mode: 0o755) }  // let cleanup proceed
+
+      let store = ProfileStore(directory: dir)
+      let expect = expectation(description: "snapshot carries seedFailed")
+      let listenerLock = NSLock()
+      var fired = false
+      store.addListener { snap in
+        listenerLock.lock()
+        defer { listenerLock.unlock() }
+        if !fired, case .seedFailed = snap.directoryError {
+          XCTAssertTrue(snap.entries.isEmpty,
+                        "seed-failure snapshot should report an empty entries list")
+          fired = true
+          expect.fulfill()
+        }
+      }
+      try store.start()
+      defer { store.stop() }
+
+      wait(for: [expect], timeout: 2.0)
+
+      guard case .seedFailed = store.lastDirectoryError else {
+        return XCTFail("expected .seedFailed in lastDirectoryError, got \(String(describing: store.lastDirectoryError))")
+      }
+    }
+  }
+
+  /// F4: when `contentsOfDirectory` throws (directory deleted under
+  /// the watcher), the next snapshot must expose `directoryError ==
+  /// .scanFailed`. Without this, listeners would see an empty
+  /// snapshot indistinguishable from a normal empty dir while the
+  /// FD-bound watcher silently goes stale.
+  func test_scan_failure_surfaces_to_listeners_via_snapshot() throws {
+    try withTempProfilesDir { dir in
+      try writeProfile(into: dir, name: "before-delete.toml", id: "x", displayName: "X")
+
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+
+      let expect = expectation(description: "snapshot carries scanFailed after dir removed")
+      let listenerLock = NSLock()
+      var fired = false
+      store.addListener { snap in
+        listenerLock.lock()
+        defer { listenerLock.unlock() }
+        if !fired, case .scanFailed = snap.directoryError {
+          fired = true
+          expect.fulfill()
+        }
+      }
+
+      // Yank the watched directory. The dispatch source fires
+      // `.delete`; the debounced reload then runs `contentsOf
+      // Directory` against a path that no longer exists, which
+      // throws and must be surfaced via `directoryError`.
+      try FileManager.default.removeItem(at: dir)
+
+      wait(for: [expect], timeout: 5.0)
+      guard case .scanFailed = store.lastDirectoryError else {
+        return XCTFail("expected .scanFailed in lastDirectoryError, got \(String(describing: store.lastDirectoryError))")
+      }
+    }
+  }
+
+  // MARK: - active profile (Phase 2.4 )
+
+  func test_active_profile_persists_across_store_restart() throws {
+    try withTempProfilesDir { dir in
+      try writeProfile(into: dir, name: "chat.toml", id: "chat", displayName: "Chat")
+      try writeProfile(into: dir, name: "code.toml", id: "code", displayName: "Code")
+
+      let active = dir.deletingLastPathComponent()
+        .appendingPathComponent("active-profile", isDirectory: false)
+
+      // Round-trip 1: activate, then drop the store. The persisted
+      // marker must outlive the in-memory state.
+      do {
+        let store = ProfileStore(directory: dir, activeProfileURL: active)
+        try store.start()
+        XCTAssertNil(store.activeProfileID, "fresh store with no marker file should have nil active id")
+        XCTAssertNil(store.activeProfile)
+        try store.setActiveProfileID("code")
+        XCTAssertEqual(store.activeProfileID, "code")
+        XCTAssertEqual(store.activeProfile?.id, "code")
+        store.stop()
+      }
+
+      // Round-trip 2: a fresh store on the same directory hydrates
+      // the persisted selection.
+      let store2 = ProfileStore(directory: dir, activeProfileURL: active)
+      try store2.start()
+      defer { store2.stop() }
+      XCTAssertEqual(store2.activeProfileID, "code",
+                     "active id must persist across ProfileStore lifecycles")
+      XCTAssertEqual(store2.activeProfile?.id, "code")
+    }
+  }
+
+  func test_active_profile_id_pointing_at_missing_profile_returns_nil_active_profile() throws {
+    try withTempProfilesDir { dir in
+      try writeProfile(into: dir, name: "chat.toml", id: "chat", displayName: "Chat")
+      let active = dir.deletingLastPathComponent()
+        .appendingPathComponent("active-profile", isDirectory: false)
+      let store = ProfileStore(directory: dir, activeProfileURL: active)
+      try store.start()
+      defer { store.stop() }
+      try store.setActiveProfileID("ghost")
+      XCTAssertEqual(store.activeProfileID, "ghost")
+      XCTAssertNil(store.activeProfile,
+                   "activeProfile must be nil when the id has no matching parsed entry")
+    }
+  }
+
+  func test_clear_active_profile_id_removes_persistence_file() throws {
+    try withTempProfilesDir { dir in
+      try writeProfile(into: dir, name: "chat.toml", id: "chat", displayName: "Chat")
+      let active = dir.deletingLastPathComponent()
+        .appendingPathComponent("active-profile", isDirectory: false)
+      let store = ProfileStore(directory: dir, activeProfileURL: active)
+      try store.start()
+      defer { store.stop() }
+      try store.setActiveProfileID("chat")
+      XCTAssertTrue(FileManager.default.fileExists(atPath: active.path))
+      try store.clearActiveProfileID()
+      XCTAssertNil(store.activeProfileID)
+      XCTAssertFalse(FileManager.default.fileExists(atPath: active.path),
+                     "clear must remove the on-disk marker so subsequent boots start clean")
+    }
+  }
+
+  func test_active_profile_directory_at_marker_path_surfaces_read_error() throws {
+    try withTempProfilesDir { dir in
+      try writeProfile(into: dir, name: "chat.toml", id: "chat", displayName: "Chat")
+      // Plant a *directory* at the active-profile marker path. The
+      // store must NOT silently treat this as "no selection" — that
+      // collapse was review cycle 149/150 F1. It must surface
+      // `.activeProfileReadFailed` on the snapshot so the GUI can
+      // render a recoverable error banner.
+      let activePath = dir.deletingLastPathComponent()
+        .appendingPathComponent("active-profile", isDirectory: false)
+      try FileManager.default.createDirectory(at: activePath,
+                                              withIntermediateDirectories: true)
+      defer { try? FileManager.default.removeItem(at: activePath) }
+
+      let store = ProfileStore(directory: dir, activeProfileURL: activePath)
+      try store.start()
+      defer { store.stop() }
+
+      XCTAssertNil(store.activeProfileID,
+                   "unreadable marker must NOT pretend a selection exists")
+      guard case .activeProfileReadFailed(let path, _) = store.lastActiveProfileError else {
+        return XCTFail("expected .activeProfileReadFailed, got \(String(describing: store.lastActiveProfileError))")
+      }
+      XCTAssertEqual(path, activePath.path)
+      XCTAssertNotNil(store.snapshot.activeProfileError,
+                      "snapshot.activeProfileError must mirror lastActiveProfileError so listeners see the cause")
+    }
+  }
+
+  func test_active_profile_unreadable_file_surfaces_read_error() throws {
+    try withTempProfilesDir { dir in
+      try writeProfile(into: dir, name: "chat.toml", id: "chat", displayName: "Chat")
+      let activePath = dir.deletingLastPathComponent()
+        .appendingPathComponent("active-profile", isDirectory: false)
+      // 0o000: even the owner cannot open(2) it. `Data(contentsOf:)`
+      // throws — the store must promote that into
+      // `.activeProfileReadFailed` rather than swallowing via
+      // `try?` (review cycle 149/150 F1).
+      try "chat".write(to: activePath, atomically: true, encoding: .utf8)
+      try FileManager.default.setAttributes(
+        [.posixPermissions: NSNumber(value: 0o000)],
+        ofItemAtPath: activePath.path
+      )
+      defer {
+        try? FileManager.default.setAttributes(
+          [.posixPermissions: NSNumber(value: 0o644)],
+          ofItemAtPath: activePath.path
+        )
+      }
+
+      let store = ProfileStore(directory: dir, activeProfileURL: activePath)
+      try store.start()
+      defer { store.stop() }
+
+      XCTAssertNil(store.activeProfileID)
+      guard case .activeProfileReadFailed = store.lastActiveProfileError else {
+        return XCTFail("expected .activeProfileReadFailed, got \(String(describing: store.lastActiveProfileError))")
+      }
+    }
+  }
+
+  func test_active_profile_marker_absent_is_clean_not_an_error() throws {
+    try withTempProfilesDir { dir in
+      try writeProfile(into: dir, name: "chat.toml", id: "chat", displayName: "Chat")
+      let activePath = dir.deletingLastPathComponent()
+        .appendingPathComponent("active-profile", isDirectory: false)
+      // Marker file deliberately absent — the canonical "no selection
+      // yet" state. Must NOT surface an error.
+      let store = ProfileStore(directory: dir, activeProfileURL: activePath)
+      try store.start()
+      defer { store.stop() }
+      XCTAssertNil(store.activeProfileID)
+      XCTAssertNil(store.lastActiveProfileError,
+                   "absent marker is the clean 'no selection' state, not an error")
+    }
+  }
+
+  func test_setActiveProfileID_clears_stale_read_error() throws {
+    try withTempProfilesDir { dir in
+      try writeProfile(into: dir, name: "chat.toml", id: "chat", displayName: "Chat")
+      let activePath = dir.deletingLastPathComponent()
+        .appendingPathComponent("active-profile", isDirectory: false)
+      try FileManager.default.createDirectory(at: activePath,
+                                              withIntermediateDirectories: true)
+
+      let store = ProfileStore(directory: dir, activeProfileURL: activePath)
+      try store.start()
+      defer { store.stop() }
+      XCTAssertNotNil(store.lastActiveProfileError)
+
+      // Operator repairs the marker manually (delete dir, then set).
+      try FileManager.default.removeItem(at: activePath)
+      try store.setActiveProfileID("chat")
+
+      XCTAssertEqual(store.activeProfileID, "chat")
+      XCTAssertNil(store.lastActiveProfileError,
+                   "a successful write replaces the broken marker — error must clear")
+    }
+  }
+
+  func test_reloadActiveProfile_picks_up_externally_broken_marker_after_start() throws {
+    // Review v3 F2: prior code read the marker only once in
+    // `start()`. An operator who repaired or broke the marker at
+    // runtime saw stale state forever. `reloadActiveProfile()` and
+    // the FS-watcher reload path both re-read it.
+    try withTempProfilesDir { dir in
+      try writeProfile(into: dir, name: "chat.toml", id: "chat", displayName: "Chat")
+      let active = dir.deletingLastPathComponent()
+        .appendingPathComponent("active-profile", isDirectory: false)
+      // Start with a clean (absent) marker — no error.
+      let store = ProfileStore(directory: dir, activeProfileURL: active)
+      try store.start()
+      defer { store.stop() }
+      XCTAssertNil(store.lastActiveProfileError, "sanity: absent marker starts clean")
+
+      // Operator (or rsync, or container restore) plants a directory
+      // at the marker path AFTER start(). Reload must detect it.
+      try FileManager.default.createDirectory(at: active,
+                                              withIntermediateDirectories: true)
+      defer { try? FileManager.default.removeItem(at: active) }
+      store.reloadActiveProfile()
+      guard case .activeProfileReadFailed = store.lastActiveProfileError else {
+        return XCTFail("expected .activeProfileReadFailed after runtime planting, got \(String(describing: store.lastActiveProfileError))")
+      }
+    }
+  }
+
+  func test_reloadActiveProfile_clears_error_after_external_repair() throws {
+    // Symmetric to the previous test: a marker that was broken at
+    // start() must be reload-recoverable without round-tripping
+    // through setActiveProfileID (which would force a specific id
+    // and is not the right API for the GUI retry button).
+    try withTempProfilesDir { dir in
+      try writeProfile(into: dir, name: "chat.toml", id: "chat", displayName: "Chat")
+      let active = dir.deletingLastPathComponent()
+        .appendingPathComponent("active-profile", isDirectory: false)
+      try FileManager.default.createDirectory(at: active,
+                                              withIntermediateDirectories: true)
+      let store = ProfileStore(directory: dir, activeProfileURL: active)
+      try store.start()
+      defer { store.stop() }
+      XCTAssertNotNil(store.lastActiveProfileError, "sanity: broken marker at start")
+
+      // Operator repairs externally (rm -rf the planted dir, then
+      // echo the id). GUI hits "Retry" -> reloadActiveProfile.
+      try FileManager.default.removeItem(at: active)
+      try "chat".write(to: active, atomically: true, encoding: .utf8)
+      store.reloadActiveProfile()
+      XCTAssertNil(store.lastActiveProfileError,
+                   "reloadActiveProfile must clear the stale error after external repair")
+      XCTAssertEqual(store.activeProfileID, "chat",
+                     "reload must surface the repaired marker's id")
+    }
+  }
+
+  func test_authoritative_reload_commits_marker_error_even_when_inmemory_was_healthy() throws {
+    // Review v4 F2 explicit contract: `reloadActiveProfile()` is the
+    // operator-initiated path; a failing read here commits to
+    // `_activeProfileError` so a GUI Retry shows the cause.
+    try withTempProfilesDir { dir in
+      try writeProfile(into: dir, name: "chat.toml", id: "chat", displayName: "Chat")
+      let active = dir.deletingLastPathComponent()
+        .appendingPathComponent("active-profile", isDirectory: false)
+      let store = ProfileStore(directory: dir, activeProfileURL: active)
+      try store.start()
+      defer { store.stop() }
+      try store.setActiveProfileID("chat")
+      try FileManager.default.removeItem(at: active)
+      try FileManager.default.createDirectory(at: active,
+                                              withIntermediateDirectories: true)
+      defer { try? FileManager.default.removeItem(at: active) }
+
+      store.reloadActiveProfile()
+      guard case .activeProfileReadFailed = store.lastActiveProfileError else {
+        return XCTFail("authoritative reload must surface read failure even when in-memory was healthy")
+      }
+      // Review v7 F1: `_activeProfileID` is PRESERVED across a
+      // read-failure on the retry path. The disk read failed, not
+      // the in-memory truth — wiping the id while the engine
+      // subprocess (started against it) is still running would
+      // silently mask a known-good selection. The error is surfaced
+      // on `lastActiveProfileError` so the GUI banner can render
+      // the cause without losing the selection.
+      XCTAssertEqual(store.activeProfileID, "chat",
+                     "v7 F1: read failure on retry must NOT wipe known-good _activeProfileID")
+    }
+  }
+
+  func test_reloadActiveProfile_does_not_deadlock_when_called_from_listener_callback() throws {
+    // Review v4 F5: listener callbacks run on the store's serial
+    // queue. A naive `queue.sync` inside reloadActiveProfile would
+    // deadlock when the listener (e.g. a GUI binding firing a
+    // one-shot retry on snapshot.activeProfileError) calls back in.
+    // Reentrancy is detected via the per-instance `queueKey`; the
+    // body runs inline.
+    //
+    // Guard `fired` with an atomic-store bool (no NSLock) — the
+    // listener fan-out re-enters this closure synchronously from
+    // the inline reloadLocked, and a non-reentrant lock would
+    // deadlock the test itself before the dispatch-queue claim
+    // could be exercised.
+    try withTempProfilesDir { dir in
+      try writeProfile(into: dir, name: "chat.toml", id: "chat", displayName: "Chat")
+      let active = dir.deletingLastPathComponent()
+        .appendingPathComponent("active-profile", isDirectory: false)
+      let store = ProfileStore(directory: dir, activeProfileURL: active)
+      try store.start()
+      defer { store.stop() }
+
+      let exp = expectation(description: "listener-driven reloadActiveProfile completes")
+      let firedFlag = OSAllocatedUnfairLock<Bool>(initialState: false)
+      store.addListener { _ in
+        let shouldFire = firedFlag.withLock { (f: inout Bool) -> Bool in
+          if f { return false }
+          f = true
+          return true
+        }
+        guard shouldFire else { return }
+        // This call would deadlock the dispatch queue under the
+        // prior `queue.sync`-only implementation. Test fails via
+        // the wait timeout if reentrancy regresses.
+        store.reloadActiveProfile()
+        exp.fulfill()
+      }
+      try store.setActiveProfileID("chat")
+      wait(for: [exp], timeout: 5.0)
+    }
+  }
+
+  func test_setActiveProfileID_cancels_pending_debounced_reload_to_prevent_race() throws {
+    // Review v4 F4: setActiveProfileID writes the marker then
+    // updates in-memory state. The post-write update now runs inside
+    // performOnQueue + cancels any pending debounced reload so a
+    // racing background reload cannot clobber the freshly-set id by
+    // reading pre-rename disk state.
+    try withTempProfilesDir { dir in
+      try writeProfile(into: dir, name: "chat.toml", id: "chat", displayName: "Chat")
+      let active = dir.deletingLastPathComponent()
+        .appendingPathComponent("active-profile", isDirectory: false)
+      let store = ProfileStore(directory: dir, activeProfileURL: active)
+      try store.start()
+      defer { store.stop() }
+
+      // Concurrently drop a profile (triggers debounce) then set the
+      // active id. The set must win because it cancels the pending
+      // debounce + writes both disk and memory atomically on `queue`.
+      try writeProfile(into: dir, name: "race.toml", id: "race", displayName: "Race")
+      try store.setActiveProfileID("chat")
+
+      // Even if a debounced reload arrives later, the marker on disk
+      // is `chat`, so the eventual reload commits `chat` (idempotent).
+      XCTAssertEqual(store.activeProfileID, "chat",
+                     "setActiveProfileID must win against a pending debounced reload (review v4 F4)")
+      XCTAssertNil(store.lastActiveProfileError)
+    }
+  }
+
+  func test_createProfile_propagates_dump_failure() throws {
+    // Review v4 F1: dump → `.dumpFailed` wrap was claimed by the
+    // commit message but had no test. Injection seam on the
+    // internal `createProfile(_:filename:dumpProvider:)` overload
+    // covers the throwing branch deterministically (the production
+    // dump path is defense-in-depth — TOMLKit's convert/parse
+    // round-trip is not known to fail on its own output, so a
+    // real-world fault is unreachable, but the wrap shape MUST be
+    // pinned so a future contributor cannot regress to a silent
+    // truncation).
+    try withTempProfilesDir { dir in
+      let store = ProfileStore(directory: dir,
+                               activeProfileURL: dir.deletingLastPathComponent()
+                                 .appendingPathComponent("active-profile"))
+      try store.start()
+      defer { store.stop() }
+      let profile = Profile(id: "x", name: "X", model: "m", inferlet: "i")
+
+      struct InjectedDumpFailure: Error, CustomStringConvertible {
+        var description: String { "injected dump failure for v4 F1 coverage" }
+      }
+      XCTAssertThrowsError(
+        try store.createProfile(profile, filename: nil) { _ in
+          throw InjectedDumpFailure()
+        }
+      ) { err in
+        guard case ProfileStoreError.dumpFailed(let path, let underlying) = err else {
+          return XCTFail("expected ProfileStoreError.dumpFailed, got \(err)")
+        }
+        XCTAssertTrue(path.hasSuffix("x.toml"),
+                      "dumpFailed must carry the destination path: \(path)")
+        XCTAssertTrue(underlying.contains("injected dump failure"),
+                      "dumpFailed must preserve the underlying error description: \(underlying)")
+      }
+      // The truncated file must NOT have been written.
+      XCTAssertFalse(FileManager.default.fileExists(
+        atPath: dir.appendingPathComponent("x.toml").path
+      ), "createProfile must abort the write when dump throws — no truncated TOML on disk")
+    }
+  }
+
+  // MARK: - review v5 / cycle-188 architectural decoupling
+
+  func test_non_utf8_marker_surfaces_activeProfileReadFailed_on_authoritative_read() throws {
+    // Review v6 F8 (rephrased post-cycle-188): pin the non-UTF-8
+    // failure mode on the AUTHORITATIVE read path. Post-cycle-188
+    // there is no background marker re-read — the FS-watcher rescan
+    // only updates `_entries`, not `_activeProfileError`. The
+    // explicit read paths are `start()` (boot) and
+    // `reloadActiveProfile()` (operator retry). This test plants
+    // non-UTF-8 bytes before start and asserts the boot path
+    // surfaces the structured error.
+    try withTempProfilesDir { dir in
+      try writeProfile(into: dir, name: "chat.toml", id: "chat", displayName: "Chat")
+      let active = dir.deletingLastPathComponent()
+        .appendingPathComponent("active-profile", isDirectory: false)
+      // 0xFF 0xFE 0xFD — invalid UTF-8 by construction.
+      try Data([0xFF, 0xFE, 0xFD]).write(to: active)
+      defer { try? FileManager.default.removeItem(at: active) }
+
+      let store = ProfileStore(directory: dir, activeProfileURL: active)
+      try store.start()
+      defer { store.stop() }
+
+      XCTAssertNil(store.activeProfileID,
+                   "non-UTF-8 marker must NOT pretend a selection exists")
+      guard case .activeProfileReadFailed = store.lastActiveProfileError else {
+        return XCTFail("non-UTF-8 marker must commit .activeProfileReadFailed on the authoritative read path, got \(String(describing: store.lastActiveProfileError)) (review v6 F8 / cycle-188)")
+      }
+    }
+  }
+
+  func test_fs_watcher_rescan_does_not_touch_active_profile_state() throws {
+    // Post-cycle-188 contract: the FS-watcher rescan path only
+    // updates `_entries`. A planted directory at the marker after a
+    // successful setActiveProfileID stays invisible to the rescan
+    // (no marker re-read), so in-memory state survives unchanged.
+    // The error WILL surface on the next authoritative read
+    // (reloadActiveProfile / start), not on the background scan.
+    try withTempProfilesDir { dir in
+      try writeProfile(into: dir, name: "chat.toml", id: "chat", displayName: "Chat")
+      let active = dir.deletingLastPathComponent()
+        .appendingPathComponent("active-profile", isDirectory: false)
+      let store = ProfileStore(directory: dir, activeProfileURL: active)
+      try store.start()
+      defer { store.stop() }
+
+      try store.setActiveProfileID("chat")
+      XCTAssertEqual(store.activeProfileID, "chat")
+      XCTAssertNil(store.lastActiveProfileError, "sanity: clean post-set")
+
+      // Plant a directory at the marker — the FS-watcher should NOT
+      // see this on its rescan because the marker lives outside the
+      // watched directory AND reloadLocked no longer reads it.
+      try FileManager.default.removeItem(at: active)
+      try FileManager.default.createDirectory(at: active,
+                                              withIntermediateDirectories: true)
+      defer { try? FileManager.default.removeItem(at: active) }
+
+      let exp = expectation(description: "background rescan completes")
+      let firedFlag = OSAllocatedUnfairLock<Bool>(initialState: false)
+      store.addListener { snap in
+        let shouldFire = firedFlag.withLock { (f: inout Bool) -> Bool in
+          if f { return false }
+          if snap.entries.contains(where: { $0.url.lastPathComponent == "extra.toml" }) {
+            f = true
+            return true
+          }
+          return false
+        }
+        if shouldFire { exp.fulfill() }
+      }
+      try writeProfile(into: dir, name: "extra.toml", id: "extra", displayName: "Extra")
+      wait(for: [exp], timeout: 5.0)
+
+      // FS rescan only touches _entries. Marker state is unchanged.
+      XCTAssertEqual(store.activeProfileID, "chat",
+                     "FS-watcher rescan must not touch _activeProfileID (cycle-188 architectural decoupling)")
+      XCTAssertNil(store.lastActiveProfileError,
+                   "FS-watcher rescan must not touch _activeProfileError (cycle-188)")
+
+      // An explicit reloadActiveProfile DOES see the planted directory.
+      let snap = store.reloadActiveProfile()
+      guard case .activeProfileReadFailed = snap.activeProfileError else {
+        return XCTFail("authoritative reloadActiveProfile must surface .activeProfileReadFailed for planted directory, got \(String(describing: snap.activeProfileError))")
+      }
+    }
+  }
+
+  func test_concurrent_setActiveProfileID_keeps_disk_and_memory_consistent() throws {
+    // Review v5 F3: pre-v5 the disk write happened off-queue and only
+    // the post-write state mutation was queue-serialized. Two
+    // concurrent setters could interleave write-then-queue-arrive in
+    // opposite orders, leaving disk and memory disagreeing. Post-v5
+    // the disk write is inside performOnQueue, so the two operations
+    // are one queue-serial unit and disk content always matches the
+    // in-memory id at quiescence.
+    try withTempProfilesDir { dir in
+      try writeProfile(into: dir, name: "alpha.toml", id: "alpha", displayName: "Alpha")
+      try writeProfile(into: dir, name: "bravo.toml",  id: "bravo",  displayName: "Bravo")
+      let active = dir.deletingLastPathComponent()
+        .appendingPathComponent("active-profile", isDirectory: false)
+      let store = ProfileStore(directory: dir, activeProfileURL: active)
+      try store.start()
+      defer { store.stop() }
+
+      let iterations = 50
+      for _ in 0..<iterations {
+        let group = DispatchGroup()
+        group.enter()
+        DispatchQueue.global().async {
+          try? store.setActiveProfileID("alpha")
+          group.leave()
+        }
+        group.enter()
+        DispatchQueue.global().async {
+          try? store.setActiveProfileID("bravo")
+          group.leave()
+        }
+        group.wait()
+
+        // At quiescence, disk content must match in-memory id.
+        let onDisk: String?
+        if let data = try? Data(contentsOf: active),
+           let raw = String(data: data, encoding: .utf8) {
+          let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+          onDisk = trimmed.isEmpty ? nil : trimmed
+        } else {
+          onDisk = nil
+        }
+        XCTAssertEqual(onDisk, store.activeProfileID,
+                       "disk and memory must agree at quiescence (review v5 F3); disk=\(String(describing: onDisk)) memory=\(String(describing: store.activeProfileID))")
+      }
+    }
+  }
+
+  func test_recursion_canary_short_circuits_at_threshold() throws {
+    // Review v8 F1: a listener that unconditionally calls
+    // `createProfile()` (which synchronously re-enters reloadLocked
+    // via performOnQueue) would stack-overflow in release without a
+    // canary. Pre-v8 the canary was DEBUG-only — production builds
+    // crashed under the same listener pattern. Post-v8 the canary
+    // runs unconditionally, short-circuits the fan-out at threshold,
+    // and increments `reloadShortCircuitCount` so this test can pin
+    // the release behavior.
+    try withTempProfilesDir { dir in
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+
+      let depthCounter = OSAllocatedUnfairLock<Int>(initialState: 0)
+      let cap = ProfileStore.reloadDepthThreshold + 2
+      store.addListener { _ in
+        let d = depthCounter.withLock { (n: inout Int) -> Int in
+          n += 1
+          return n
+        }
+        // Bound the chain so we exit cleanly once the short-circuit
+        // has had a chance to fire AND any subsequent listener fires
+        // do not keep allocating profiles forever.
+        if d >= cap { return }
+        let p = Profile(id: "c\(d)", name: "C\(d)",
+                        model: "m", inferlet: "chat-apc")
+        _ = try? store.createProfile(p)
+      }
+
+      // Trigger the chain from the test thread. createProfile uses
+      // performOnQueue → queue.sync → reloadLocked sync fan-out →
+      // listener-driven recursion. The test thread blocks until the
+      // entire reentrant chain terminates (short-circuit at
+      // threshold), so no Thread.sleep / runloop spin is needed.
+      let root = Profile(id: "root", name: "Root",
+                         model: "m", inferlet: "chat-apc")
+      _ = try? store.createProfile(root)
+
+      XCTAssertGreaterThan(store.reloadShortCircuitCount, 0,
+                           "v8 F1: recursion canary must short-circuit at threshold under listener-from-listener createProfile loops (got reloadShortCircuitCount=\(store.reloadShortCircuitCount))")
+    }
+  }
+
+  func test_stop_then_start_with_broken_marker_clears_stale_active_id() throws {
+    // Review v8 F2: pre-v8 `commitActiveReadResultLocked(.failed)`
+    // unconditionally preserved `_activeProfileID`. A store that was
+    // `stop()`-ped and then re-`start()`-ed against an externally
+    // corrupted marker would resurrect the prior-lifecycle id while
+    // surfacing an error for a *different* selection — silent
+    // disk-vs-memory divergence at boot. Post-v8 the `.start`
+    // CommitSource wipes id on `.failed` so the snapshot reflects
+    // disk truth at boot. `.reload` still preserves (v7 F1).
+    try withTempProfilesDir { dir in
+      try writeProfile(into: dir, name: "chat.toml", id: "chat", displayName: "Chat")
+      let active = dir.deletingLastPathComponent()
+        .appendingPathComponent("active-profile", isDirectory: false)
+      let store = ProfileStore(directory: dir, activeProfileURL: active)
+      try store.start()
+      try store.setActiveProfileID("chat")
+      XCTAssertEqual(store.activeProfileID, "chat", "sanity: clean post-set")
+      store.stop()
+
+      // Externally replace marker file with a directory between
+      // stop() and the next start().
+      try FileManager.default.removeItem(at: active)
+      try FileManager.default.createDirectory(at: active,
+                                              withIntermediateDirectories: true)
+      defer { try? FileManager.default.removeItem(at: active) }
+
+      try store.start()
+      defer { store.stop() }
+
+      // Boot must commit disk truth, NOT preserve the prior-lifecycle id.
+      XCTAssertNil(store.activeProfileID,
+                   "v8 F2: stop/start with broken marker must NOT resurface stale prior-lifecycle id; got \(String(describing: store.activeProfileID))")
+      guard case .activeProfileReadFailed = store.lastActiveProfileError else {
+        return XCTFail("v8 F2: boot must surface .activeProfileReadFailed for broken marker, got \(String(describing: store.lastActiveProfileError))")
+      }
+    }
+  }
+
+  func test_activeProfile_accessor_returns_nil_when_error_is_set() throws {
+    // Review v8 F3: the public `activeProfile` accessor must not
+    // silently return a clean Profile when the on-disk marker is in
+    // an error state. The v7 F1 contract preserves `_activeProfileID`
+    // across read failure for engine-continuity reasons, but
+    // exposing the cached id through `activeProfile` would let any
+    // caller (status-bar UI, debug overlay, XPC bridge) observe a
+    // valid Profile while disk is broken. Hiding the cached id
+    // behind `_activeProfileError != nil` collapses the broken case
+    // to an explicit nil at the accessor boundary.
+    try withTempProfilesDir { dir in
+      try writeProfile(into: dir, name: "chat.toml", id: "chat", displayName: "Chat")
+      let active = dir.deletingLastPathComponent()
+        .appendingPathComponent("active-profile", isDirectory: false)
+      let store = ProfileStore(directory: dir, activeProfileURL: active)
+      try store.start()
+      defer { store.stop() }
+      try store.setActiveProfileID("chat")
+      XCTAssertNotNil(store.activeProfile, "sanity: clean post-set")
+
+      // Provoke a read failure on the retry path. v7 F1 preserves
+      // `_activeProfileID`; v8 F3 hides the cached Profile while
+      // the error is live.
+      try FileManager.default.setAttributes(
+        [.posixPermissions: NSNumber(value: 0o000)],
+        ofItemAtPath: active.path
+      )
+      defer {
+        try? FileManager.default.setAttributes(
+          [.posixPermissions: NSNumber(value: 0o644)],
+          ofItemAtPath: active.path
+        )
+      }
+      _ = store.reloadActiveProfile()
+
+      XCTAssertEqual(store.activeProfileID, "chat",
+                     "v7 F1 contract: id is preserved under the hood")
+      XCTAssertNotNil(store.lastActiveProfileError,
+                      "sanity: error is surfaced")
+      XCTAssertNil(store.activeProfile,
+                   "v8 F3: public activeProfile accessor must return nil when error is set, regardless of preserved id")
+    }
+  }
+
+  func test_createProfile_from_listener_commits_rescan_synchronously() throws {
+    // Review v6 F1 / cycle-188: createProfile-from-listener must see
+    // the new entry in `_entries` synchronously. Post-cycle-188 the
+    // reentrancy guard is gone entirely — reloadLocked just rescans
+    // the directory and fires listeners, with no marker re-read, so
+    // there is no recursive marker-read path to protect against.
+    // The listener uses a one-shot `createdFromListener` guard to
+    // avoid re-creating on the re-fire that its own createProfile
+    // triggers (standard observer-pattern contract).
+    try withTempProfilesDir { dir in
+      try writeProfile(into: dir, name: "chat.toml", id: "chat", displayName: "Chat")
+      let active = dir.deletingLastPathComponent()
+        .appendingPathComponent("active-profile", isDirectory: false)
+      let store = ProfileStore(directory: dir, activeProfileURL: active)
+      try store.start()
+      defer { store.stop() }
+
+      let createdFromListener = OSAllocatedUnfairLock<Bool>(initialState: false)
+      let observed = OSAllocatedUnfairLock<Bool>(initialState: false)
+      let listenerDone = expectation(description: "listener completes createProfile + visibility check")
+
+      store.addListener { _ in
+        let shouldCreate = createdFromListener.withLock { (f: inout Bool) -> Bool in
+          if f { return false }
+          f = true
+          return true
+        }
+        if !shouldCreate {
+          // Subsequent fires (FS-event-driven) — ignored.
+          return
+        }
+        // Drive createProfile from inside the listener. The reload
+        // it triggers re-enters reloadLocked; the guard suppresses
+        // listener fan-out but the rescan must still commit.
+        let p = Profile(id: "fromListener", name: "From Listener",
+                        model: "m", inferlet: "chat-apc")
+        _ = try? store.createProfile(p)
+        // Immediate-visibility contract: entries MUST contain the
+        // new profile synchronously inside this listener.
+        observed.withLock { (o: inout Bool) in
+          o = store.entries.contains { $0.profile?.id == "fromListener" }
+        }
+        listenerDone.fulfill()
+      }
+      wait(for: [listenerDone], timeout: 5.0)
+
+      XCTAssertTrue(observed.withLock { (o: inout Bool) -> Bool in o },
+                    "createProfile invoked from a listener must commit rescan synchronously; new entry MUST appear in store.entries immediately (review v6 F1)")
+      // Also assert from the test thread (after listener returned)
+      // that the store-state contract holds outside the recursive
+      // context.
+      XCTAssertTrue(store.entries.contains { $0.profile?.id == "fromListener" },
+                    "post-listener: entries must still reflect the listener-driven createProfile")
+    }
+  }
+
+  func test_reloadActiveProfile_preserves_known_good_id_when_read_fails_with_chmod_000() throws {
+    // Review v7 F1: a Resume retry that reads the marker MUST NOT
+    // wipe a known-good in-memory selection. The engine subprocess
+    // may already be running against that id; a transient read
+    // failure (NFS hiccup, EIO, Spotlight-touched-marker) on the
+    // retry path used to clear `_activeProfileID` and return
+    // `.noActiveProfile(afterRetry: true)`, silently masking the
+    // truth. Post-v7 the id is preserved across read failures; the
+    // error is surfaced on `_activeProfileError` separately.
+    //
+    // chmod 000 is the closest reproducible analogue of a transient
+    // read failure in CI (provokes NSFileReadNoPermissionError from
+    // `Data(contentsOf:)`). The repair path — operator chmods back
+    // — is not exercised; this test only pins the preservation
+    // contract.
+    try withTempProfilesDir { dir in
+      try writeProfile(into: dir, name: "chat.toml", id: "chat", displayName: "Chat")
+      let active = dir.deletingLastPathComponent()
+        .appendingPathComponent("active-profile", isDirectory: false)
+      let store = ProfileStore(directory: dir, activeProfileURL: active)
+      try store.start()
+      defer { store.stop() }
+
+      try store.setActiveProfileID("chat")
+      XCTAssertEqual(store.activeProfileID, "chat", "sanity: clean post-set")
+      XCTAssertNil(store.lastActiveProfileError)
+
+      // Make marker unreadable. Owner cannot open(2) it.
+      try FileManager.default.setAttributes(
+        [.posixPermissions: NSNumber(value: 0o000)],
+        ofItemAtPath: active.path
+      )
+      defer {
+        try? FileManager.default.setAttributes(
+          [.posixPermissions: NSNumber(value: 0o644)],
+          ofItemAtPath: active.path
+        )
+      }
+
+      let snap = store.reloadActiveProfile()
+      // v9 F1: snapshot masks `activeProfileID` to nil when error is
+      // live so consumers following the snapshot pattern cannot
+      // reconstruct a clean Profile from a broken state.
+      XCTAssertNil(snap.activeProfileID,
+                   "v9 F1: snapshot.activeProfileID must be masked to nil when error is live")
+      guard case .activeProfileReadFailed = snap.activeProfileError else {
+        return XCTFail("returned snapshot must surface .activeProfileReadFailed, got \(String(describing: snap.activeProfileError))")
+      }
+      // v7 F1: the raw `store.activeProfileID` accessor preserves
+      // the in-memory id for engine-continuity; that is the internal
+      // state the snapshot mask hides from consumers.
+      XCTAssertEqual(store.activeProfileID, "chat",
+                     "v7 F1: store.activeProfileID (raw accessor) must reflect preserved id")
+      XCTAssertNotNil(store.lastActiveProfileError,
+                      "v7 F1: store.lastActiveProfileError must reflect the read failure")
+    }
+  }
+
+  func test_reloadActiveProfile_returns_snapshot_matching_state() throws {
+    // Review v5 F5: the signature was `Void`, forcing callers to
+    // poll `lastActiveProfileError` after the call (racy). Post-v5
+    // it returns the post-reload snapshot directly.
+    try withTempProfilesDir { dir in
+      try writeProfile(into: dir, name: "chat.toml", id: "chat", displayName: "Chat")
+      let active = dir.deletingLastPathComponent()
+        .appendingPathComponent("active-profile", isDirectory: false)
+      let store = ProfileStore(directory: dir, activeProfileURL: active)
+      try store.start()
+      defer { store.stop() }
+
+      // Healthy state.
+      try store.setActiveProfileID("chat")
+      let healthy = store.reloadActiveProfile()
+      XCTAssertEqual(healthy.activeProfileID, "chat",
+                     "returned snapshot must carry the current activeProfileID")
+      XCTAssertNil(healthy.activeProfileError,
+                   "returned snapshot must reflect a clean error state when disk is healthy")
+
+      // Broken state.
+      try FileManager.default.removeItem(at: active)
+      try FileManager.default.createDirectory(at: active,
+                                              withIntermediateDirectories: true)
+      defer { try? FileManager.default.removeItem(at: active) }
+      let broken = store.reloadActiveProfile()
+      guard case .activeProfileReadFailed = broken.activeProfileError else {
+        return XCTFail("returned snapshot must surface .activeProfileReadFailed, got \(String(describing: broken.activeProfileError))")
+      }
+      // Review v9 F1: snapshot masks id when error is live.
+      XCTAssertNil(broken.activeProfileID,
+                   "v9 F1: snapshot.activeProfileID must be masked to nil under live error")
+      // Internal v7 F1 contract: raw id is preserved.
+      XCTAssertEqual(store.activeProfileID, "chat",
+                     "v7 F1: store.activeProfileID (raw) preserves id under error for engine-continuity")
+    }
+  }
+
+  func test_snapshot_masks_activeProfileID_to_nil_when_error_is_live() throws {
+    // Review v9 F1: the snapshot factory (`makeSnapshotLocked`) must
+    // mirror the v8 F3 accessor mask. Pre-v9, masking applied only
+    // to `store.activeProfile`; a consumer following the documented
+    // snapshot pattern
+    //   `snap.entries.first { $0.profile?.id == snap.activeProfileID }`
+    // could still reconstruct a clean Profile while disk was broken.
+    // Post-v9 the snapshot's `activeProfileID` is nil whenever
+    // `activeProfileError` is non-nil so both surfaces are
+    // consistent.
+    try withTempProfilesDir { dir in
+      try writeProfile(into: dir, name: "chat.toml", id: "chat", displayName: "Chat")
+      let active = dir.deletingLastPathComponent()
+        .appendingPathComponent("active-profile", isDirectory: false)
+      let store = ProfileStore(directory: dir, activeProfileURL: active)
+      try store.start()
+      defer { store.stop() }
+      try store.setActiveProfileID("chat")
+
+      let listenerSnap = OSAllocatedUnfairLock<ProfileStoreSnapshot?>(initialState: nil)
+      let captured = expectation(description: "listener captures broken-state snapshot")
+      store.addListener { snap in
+        if snap.activeProfileError != nil {
+          listenerSnap.withLock { (s: inout ProfileStoreSnapshot?) in s = snap }
+          captured.fulfill()
+        }
+      }
+      // Break the marker and trigger an authoritative reload.
+      try FileManager.default.removeItem(at: active)
+      try FileManager.default.createDirectory(at: active,
+                                              withIntermediateDirectories: true)
+      defer { try? FileManager.default.removeItem(at: active) }
+      _ = store.reloadActiveProfile()
+      wait(for: [captured], timeout: 5.0)
+
+      let snap = listenerSnap.withLock { (s: inout ProfileStoreSnapshot?) -> ProfileStoreSnapshot? in s }
+      guard let snap else {
+        return XCTFail("expected to capture a broken-state snapshot")
+      }
+      XCTAssertNotNil(snap.activeProfileError,
+                      "sanity: error is live on captured snapshot")
+      XCTAssertNil(snap.activeProfileID,
+                   "v9 F1: snapshot.activeProfileID must be masked to nil — the documented listener-surface pattern must not reconstruct a clean Profile while disk is broken")
+    }
+  }
+
+  func test_stop_resets_cached_directory_state_so_snapshot_does_not_leak_prior_lifecycle() throws {
+    // Review v9 F2: stop() must zero out the cached lifecycle state
+    // (`_entries`, `_lastSeedError`, `_lastScanError`, etc.) so a
+    // post-stop `snapshot` / `entries` / `lastDirectoryError` does
+    // not leak the prior session's observations. Pre-v9 only the
+    // dispatch source was torn down; cached state from before stop
+    // remained visible until the next start completed.
+    try withTempProfilesDir { dir in
+      try writeProfile(into: dir, name: "a.toml", id: "a", displayName: "A")
+      try writeProfile(into: dir, name: "b.toml", id: "b", displayName: "B")
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      XCTAssertEqual(store.entries.count, 2, "sanity: populated post-start")
+
+      store.stop()
+
+      XCTAssertEqual(store.entries.count, 0,
+                     "v9 F2: stop() must clear cached _entries; got \(store.entries.count)")
+      XCTAssertNil(store.lastDirectoryError,
+                   "v9 F2: stop() must clear cached directory error")
+      XCTAssertNil(store.lastActiveProfileError,
+                   "v9 F2: stop() must clear cached active-profile error")
+      XCTAssertEqual(store.reloadShortCircuitCount, 0,
+                     "v9 F2: stop() must zero the canary counter (defense-in-depth)")
+    }
+  }
+
+  func test_recursion_short_circuit_commits_rescan_so_recursive_writes_are_visible() throws {
+    // Review v9 F3: when the canary fires, the recursive
+    // `createProfile` calls have already written their TOML files
+    // to disk. Pre-v9 the short-circuit returned the cached
+    // snapshot without rescanning, leaving those writes silently
+    // orphaned from `_entries` until the next external FS event.
+    // Post-v9 the short-circuit rescans + commits `_entries` (but
+    // still suppresses listener fan-out so the recursion terminates)
+    // so `store.entries` reflects every file on disk after the
+    // chain settles.
+    try withTempProfilesDir { dir in
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+
+      // Listener with bounded recursion. Each fire creates a new
+      // child profile so the chain progresses until short-circuit.
+      let depthCounter = OSAllocatedUnfairLock<Int>(initialState: 0)
+      let cap = ProfileStore.reloadDepthThreshold + 2
+      store.addListener { _ in
+        let d = depthCounter.withLock { (n: inout Int) -> Int in
+          n += 1
+          return n
+        }
+        if d >= cap { return }
+        let p = Profile(id: "child\(d)", name: "C\(d)",
+                        model: "m", inferlet: "chat-apc")
+        _ = try? store.createProfile(p)
+      }
+
+      let root = Profile(id: "root", name: "Root",
+                         model: "m", inferlet: "chat-apc")
+      _ = try? store.createProfile(root)
+
+      XCTAssertGreaterThan(store.reloadShortCircuitCount, 0,
+                           "sanity: short-circuit must fire")
+
+      // Enumerate disk: every TOML file on disk MUST be visible in
+      // `store.entries`. Pre-v9 the short-circuit dropped them
+      // silently; post-v9 the rescan commits them even though
+      // listener fan-out is suppressed.
+      let onDisk = try FileManager.default.contentsOfDirectory(at: dir,
+                                                               includingPropertiesForKeys: nil)
+        .filter { $0.pathExtension == "toml" }
+        .map { $0.lastPathComponent }
+        .sorted()
+      let inEntries = store.entries
+        .map { $0.url.lastPathComponent }
+        .sorted()
+      XCTAssertEqual(onDisk, inEntries,
+                     "v9 F3: short-circuit must rescan + commit _entries so recursive createProfile writes are not silently orphaned. onDisk=\(onDisk) entries=\(inEntries)")
+    }
+  }
+
+  func test_stop_clears_both_activeProfileID_and_activeProfileError_coherently() throws {
+    // Review v10 F1: pre-v10 stopInternal cleared `_activeProfileError`
+    // but preserved `_activeProfileID`. Post-stop the snapshot mask
+    // no longer triggered (error was nil), so a stale prior-lifecycle
+    // id re-exposed itself on the snapshot with NO error signal. A
+    // consumer (HelperResumeAction) couldn't distinguish "stopped
+    // after marker error" from "stopped from clean state". Post-v10
+    // the pair is wiped together so the snapshot stays coherent
+    // across stop().
+    try withTempProfilesDir { dir in
+      try writeProfile(into: dir, name: "chat.toml", id: "chat", displayName: "Chat")
+      let active = dir.deletingLastPathComponent()
+        .appendingPathComponent("active-profile", isDirectory: false)
+      let store = ProfileStore(directory: dir, activeProfileURL: active)
+      try store.start()
+      try store.setActiveProfileID("chat")
+
+      // Provoke v7 F1 preserved-id-with-error pair.
+      try FileManager.default.removeItem(at: active)
+      try FileManager.default.createDirectory(at: active,
+                                              withIntermediateDirectories: true)
+      defer { try? FileManager.default.removeItem(at: active) }
+      _ = store.reloadActiveProfile()
+      XCTAssertEqual(store.activeProfileID, "chat",
+                     "sanity: v7 F1 preserves id across read failure")
+      XCTAssertNotNil(store.lastActiveProfileError,
+                      "sanity: error is live pre-stop")
+
+      store.stop()
+
+      // Post-stop: BOTH wiped. No incoherent "id without error" or
+      // "error without id" shape.
+      XCTAssertNil(store.activeProfileID,
+                   "v10 F1: stop() must wipe _activeProfileID alongside _activeProfileError to keep the snapshot mask invariant coherent")
+      XCTAssertNil(store.lastActiveProfileError,
+                   "v10 F1: stop() must clear _activeProfileError")
+    }
+  }
+
+  func test_stop_drains_in_flight_reloadLocked_so_reset_is_not_overwritten() throws {
+    // Review v10 F2: an in-flight reloadLocked may already have called
+    // scanDirectory() unlocked and be about to re-acquire stateLock
+    // to commit. Pre-v10 stop() acquired stateLock from an arbitrary
+    // thread and reset _entries; the in-flight reload's commit then
+    // silently overwrote that reset. Post-v10 stop() wraps its reset
+    // in `queue.sync`, forcing the serial queue to drain (any
+    // in-flight reloadLocked work item completes first) before the
+    // reset commits.
+    //
+    // Reproducing the race deterministically is awkward, so the test
+    // instead exercises the deterministic-by-construction guarantee:
+    // schedule an FS event to land a debounced reload on the queue,
+    // then call stop() immediately; afterwards assert post-stop state
+    // matches the reset invariant (empty entries). Pre-v10 this
+    // could fail with a non-empty `entries`; post-v10 the queue.sync
+    // pins it.
+    try withTempProfilesDir { dir in
+      try writeProfile(into: dir, name: "a.toml", id: "a", displayName: "A")
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      XCTAssertEqual(store.entries.count, 1, "sanity: 1 entry post-start")
+
+      // Drop a new profile to schedule a debounced reload (queue
+      // tick due after debounceInterval).
+      try writeProfile(into: dir, name: "b.toml", id: "b", displayName: "B")
+
+      // Call stop() immediately. If queue.sync doesn't drain the
+      // in-flight reload, the post-stop state could leak.
+      store.stop()
+
+      XCTAssertEqual(store.entries.count, 0,
+                     "v10 F2: stop() must drain in-flight reloadLocked so its commit cannot overwrite the reset; got entries.count=\(store.entries.count)")
+      XCTAssertNil(store.lastDirectoryError,
+                   "v10 F2: stop()'s reset must not be overwritten by a racing reload")
+    }
+  }
+
+  func test_recursion_short_circuit_schedules_one_deferred_fan_out_at_depth_zero() throws {
+    // Review v10 F3: when reloadLocked short-circuits, set a pending
+    // flag. The outermost reloadLocked's defer fires exactly one
+    // listener fan-out (queue.async) when _reloadDepth returns to 0.
+    // Non-recursive listeners attached for unrelated reasons (status
+    // bar, telemetry) regain their immediate-visibility contract;
+    // the recursive listener is one-shot-disciplined and stops on
+    // its own.
+    try withTempProfilesDir { dir in
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+
+      // Recursive listener: bounded so the chain terminates.
+      let recursiveDepth = OSAllocatedUnfairLock<Int>(initialState: 0)
+      let cap = ProfileStore.reloadDepthThreshold + 2
+      store.addListener { _ in
+        let d = recursiveDepth.withLock { (n: inout Int) -> Int in
+          n += 1
+          return n
+        }
+        if d >= cap { return }
+        let p = Profile(id: "rec\(d)", name: "R\(d)",
+                        model: "m", inferlet: "chat-apc")
+        _ = try? store.createProfile(p)
+      }
+
+      // Non-recursive listener: counts its fires. The post-recursion
+      // deferred fan-out must reach it AT LEAST once even when the
+      // recursive chain hits short-circuit.
+      let observerFires = OSAllocatedUnfairLock<Int>(initialState: 0)
+      let observed = expectation(description: "non-recursive listener observes deferred fan-out")
+      store.addListener { _ in
+        let n = observerFires.withLock { (n: inout Int) -> Int in
+          n += 1
+          return n
+        }
+        if n == 1 { observed.fulfill() }
+      }
+
+      // Trigger the chain.
+      let root = Profile(id: "root", name: "Root",
+                         model: "m", inferlet: "chat-apc")
+      _ = try? store.createProfile(root)
+
+      wait(for: [observed], timeout: 5.0)
+
+      XCTAssertGreaterThan(store.reloadShortCircuitCount, 0,
+                           "sanity: short-circuit fired during the chain")
+      XCTAssertGreaterThan(observerFires.withLock { (n: inout Int) -> Int in n }, 0,
+                           "v10 F3: non-recursive listener must receive a deferred fan-out after short-circuit")
+    }
+  }
+
+  func test_reloadShortCircuitCount_is_process_monotonic_across_stop_start() throws {
+    // Review v11 F4: the canary is a lifetime signal, not a
+    // per-lifecycle counter. A transient stop/start cycle (settings
+    // panel reopen, helper resume) must not erase the cumulative
+    // signal that the recursion canary tripped.
+    try withTempProfilesDir { dir in
+      let store = ProfileStore(directory: dir)
+      try store.start()
+
+      // Drive the canary at least once.
+      let depthCounter = OSAllocatedUnfairLock<Int>(initialState: 0)
+      let cap = ProfileStore.reloadDepthThreshold + 2
+      store.addListener { _ in
+        let d = depthCounter.withLock { (n: inout Int) -> Int in
+          n += 1
+          return n
+        }
+        if d >= cap { return }
+        let p = Profile(id: "rec\(d)", name: "R\(d)",
+                        model: "m", inferlet: "chat-apc")
+        _ = try? store.createProfile(p)
+      }
+      let root = Profile(id: "root", name: "Root",
+                         model: "m", inferlet: "chat-apc")
+      _ = try? store.createProfile(root)
+
+      let before = store.reloadShortCircuitCount
+      XCTAssertGreaterThan(before, 0, "sanity: canary fired at least once")
+
+      // Stop / restart.
+      store.stop()
+      try store.start()
+      defer { store.stop() }
+
+      let after = store.reloadShortCircuitCount
+      XCTAssertEqual(after, before,
+                     "v11 F4: stopInternal must NOT reset reloadShortCircuitCount — canary is process-monotonic across stop/start; before=\(before) after=\(after)")
+    }
+  }
+
+  func test_post_stop_deferred_async_callback_is_gated_by_lifecycle_epoch() throws {
+    // Review v11 F2 / v12 F2: realistic hazard — one deferred async
+    // callback runs and inline-calls `store.stop()`. That bumps the
+    // lifecycle epoch on the SAME queue tick path. Subsequent
+    // deferred callbacks (enqueued by the same defer's fan-out loop
+    // but not yet executed) must observe the epoch shift and no-op.
+    // Without the gate, callback #2..N fire with a pre-stop snapshot
+    // against a torn-down store.
+    //
+    // Test shape:
+    //   · Listener A — first in registration order, fires
+    //     synchronously on the deferred async tick, calls
+    //     `store.stop()` inline (queueKey detection routes to the
+    //     in-queue inline path, bumping the epoch immediately).
+    //   · Listener B — second in registration order, would fire
+    //     after A on the next queue tick. Its dispatched epoch was
+    //     captured at depth-0 unwind; the gate must see A's bump
+    //     and skip B.
+    try withTempProfilesDir { dir in
+      let store = ProfileStore(directory: dir)
+      try store.start()
+
+      // Recursive listener — drives the short-circuit + deferred
+      // fan-out enqueue. Bounded so the chain terminates.
+      let recursiveDepth = OSAllocatedUnfairLock<Int>(initialState: 0)
+      let cap = ProfileStore.reloadDepthThreshold + 2
+      store.addListener { _ in
+        let d = recursiveDepth.withLock { (n: inout Int) -> Int in
+          n += 1
+          return n
+        }
+        if d >= cap { return }
+        let p = Profile(id: "rec\(d)", name: "R\(d)",
+                        model: "m", inferlet: "chat-apc")
+        _ = try? store.createProfile(p)
+      }
+
+      // Listener A — armed AFTER the synchronous outer fan-out so it
+      // fires only on the deferred async tick. Calls store.stop()
+      // inline, which (via queueKey) bumps the epoch on the same
+      // tick.
+      let armed = OSAllocatedUnfairLock<Bool>(initialState: false)
+      let aFired = OSAllocatedUnfairLock<Bool>(initialState: false)
+      store.addListener { _ in
+        guard armed.withLock({ (a: inout Bool) -> Bool in a }) else { return }
+        aFired.withLock { (f: inout Bool) in f = true }
+        // Inline stop. queueKey on-queue branch fires synchronously,
+        // bumping `_lifecycleEpoch` before listener B's queue.async
+        // tick runs.
+        store.stop()
+      }
+
+      // Listener B — armed AFTER outer sync fan-out too. Without
+      // the gate, would fire on its deferred async tick after A's
+      // tick. With the gate, A's stop() shifted the epoch and B's
+      // dispatch (captured the prior epoch) skips.
+      let bFired = OSAllocatedUnfairLock<Bool>(initialState: false)
+      store.addListener { _ in
+        guard armed.withLock({ (a: inout Bool) -> Bool in a }) else { return }
+        bFired.withLock { (f: inout Bool) in f = true }
+      }
+
+      // Trigger the chain. Sync queue.sync drives the outer
+      // reloadLocked, which short-circuits + the depth-0 defer
+      // enqueues the deferred fan-out via queue.async for ALL
+      // listeners (recursive + A + B).
+      let root = Profile(id: "root", name: "Root",
+                         model: "m", inferlet: "chat-apc")
+      _ = try? store.createProfile(root)
+
+      // Arm. Deferred async ticks run on the queue; they will see
+      // armed = true.
+      armed.withLock { (a: inout Bool) in a = true }
+
+      // Wait until A has fired (which calls stop()). After A
+      // returns, B's tick is next on the queue; we want to observe
+      // whether it fires.
+      let aExpect = expectation(description: "listener A fires + calls stop")
+      DispatchQueue.global().async {
+        while !aFired.withLock({ (f: inout Bool) -> Bool in f }) {
+          Thread.sleep(forTimeInterval: 0.01)
+        }
+        // Give B's tick a chance to run after A's tick has finished.
+        Thread.sleep(forTimeInterval: 0.2)
+        aExpect.fulfill()
+      }
+      wait(for: [aExpect], timeout: 5.0)
+
+      XCTAssertTrue(aFired.withLock { (f: inout Bool) -> Bool in f },
+                    "sanity: listener A's deferred tick ran")
+      XCTAssertFalse(bFired.withLock { (f: inout Bool) -> Bool in f },
+                     "v11 F2 (v12 fix): listener B's deferred tick MUST NOT fire after A's inline stop() shifted the lifecycle epoch — the gate must reject the now-stale dispatch")
+    }
+  }
+
+  func test_short_circuit_deferred_fan_out_uses_stashed_snapshot_not_post_unwind_state() throws {
+    // Review v11 F1: the snapshot delivered by the depth-0 deferred
+    // fan-out must reflect state AT short-circuit time, not state
+    // after intermediate unwind frames whose normal fan-out fired
+    // listeners that may have mutated the store. Pre-v11 the defer
+    // built a fresh snapshot via `makeSnapshotLocked()` — any
+    // mutation between short-circuit and depth-0 leaked into the
+    // delivered snapshot, breaking the documented "writes you
+    // missed" contract.
+    try withTempProfilesDir { dir in
+      try writeProfile(into: dir, name: "chat.toml", id: "chat", displayName: "Chat")
+      let active = dir.deletingLastPathComponent()
+        .appendingPathComponent("active-profile", isDirectory: false)
+      let store = ProfileStore(directory: dir, activeProfileURL: active)
+      try store.start()
+      defer { store.stop() }
+      try store.setActiveProfileID("chat")
+
+      // Listener A: recursive + on first fire ALSO clears the active
+      // profile id between the short-circuit (deep in the chain) and
+      // the outermost defer. Without v11 F1 stashing, the deferred
+      // snapshot would reflect activeProfileID == nil (post-clear);
+      // with v11 F1 stashing, the deferred snapshot reflects the
+      // pre-clear state captured at short-circuit.
+      let recursiveDepth = OSAllocatedUnfairLock<Int>(initialState: 0)
+      let cap = ProfileStore.reloadDepthThreshold + 2
+      let didClear = OSAllocatedUnfairLock<Bool>(initialState: false)
+      store.addListener { snap in
+        let d = recursiveDepth.withLock { (n: inout Int) -> Int in
+          n += 1
+          return n
+        }
+        if d == 1 {
+          // First listener fire (outer reloadLocked normal path).
+          // Trigger the recursive chain.
+          let p = Profile(id: "rec1", name: "R1",
+                          model: "m", inferlet: "chat-apc")
+          _ = try? store.createProfile(p)
+          // After the chain returns, clear active profile id
+          // BEFORE the deferred fan-out runs (depth-0 defer fires
+          // after this body returns). Pre-v11 the depth-0 defer
+          // would observe activeProfileID == nil; post-v11 it
+          // delivers the stashed snapshot from short-circuit
+          // (which had activeProfileID == "chat").
+          _ = try? store.clearActiveProfileID()
+        } else if d <= cap {
+          let p = Profile(id: "rec\(d)", name: "R\(d)",
+                          model: "m", inferlet: "chat-apc")
+          _ = try? store.createProfile(p)
+        }
+        // Mark the deferred fan-out's A-callback. ProfileStore
+        // dispatches snap1 (the stash) and snap2 (clear's direct fan-
+        // out) to every listener via per-listener `queue.async`, plus
+        // d1's synchronous fan-out delivers its own snap. The
+        // deferred fan-out's snap1 is uniquely identified by the
+        // pair `activeProfileID == "chat"` (stashed pre-clear) AND
+        // `entries.count >= 5` (chat+trigger+rec1+rec2+rec3, all
+        // committed by d4 short-circuit). d1's sync snap has only 2
+        // entries; clear's snap2 has `activeProfileID == nil`; any
+        // fresh top-level reloadLocked re-entered from queue.async
+        // also reports `activeProfileID == nil` (post-clear). Flipping
+        // didClear here (rather than from the test thread post-
+        // createProfile) puts the flip on the same serial queue as
+        // listener B's iterations — A(snap1) and B(snap1) are
+        // consecutive FIFO entries dispatched by the same depth-0
+        // defer, so B(snap1) is guaranteed to see didClear == true
+        // before any non-deferred B fire reaches the gate. This
+        // closes the TOCTOU between main flipping the flag and the
+        // queue worker draining the dispatch list (v13 fix).
+        if snap.activeProfileID == "chat" && snap.entries.count >= 5 {
+          didClear.withLock { (b: inout Bool) in b = true }
+        }
+      }
+      // Listener B: captures the deferred-fan-out snapshot.
+      let captured = OSAllocatedUnfairLock<ProfileStoreSnapshot?>(initialState: nil)
+      let fanOutFired = expectation(description: "deferred fan-out delivers stashed snapshot")
+      store.addListener { snap in
+        // Listener A flips didClear inside its A(snap1) iteration —
+        // see the v13 comment above. With dispatch FIFO on a serial
+        // queue, the very next B iteration after that flip IS
+        // B(snap1), so this gate latches exactly the deferred fan-
+        // out's snapshot.
+        if didClear.withLock({ (b: inout Bool) -> Bool in b }) {
+          captured.withLock { (s: inout ProfileStoreSnapshot?) in
+            if s == nil {
+              s = snap
+              fanOutFired.fulfill()
+            }
+          }
+        }
+      }
+
+      // Trigger via createProfile on test thread.
+      let trigger = Profile(id: "trigger", name: "Trigger",
+                            model: "m", inferlet: "chat-apc")
+      _ = try? store.createProfile(trigger)
+
+      // The deferred async fan-out should have fired by now —
+      // OR will fire on next tick. Wait.
+      wait(for: [fanOutFired], timeout: 5.0)
+
+      let snap = captured.withLock { (s: inout ProfileStoreSnapshot?) -> ProfileStoreSnapshot? in s }
+      guard let snap else {
+        return XCTFail("expected to capture deferred fan-out snapshot")
+      }
+      // Review v12 F1: the load-bearing assertion is the field that
+      // DIFFERS between stashed and fresh. `_entries` is committed
+      // by both code paths (short-circuit's commit + a hypothetical
+      // fresh `makeSnapshotLocked` at depth-0 both observe the same
+      // committed entries). `activeProfileID` is the discriminator:
+      //   · stashed (correct) — "chat", captured BEFORE listener A
+      //     cleared the active id.
+      //   · fresh (regression) — nil, reflecting post-clear state.
+      // Asserting the discriminator means a future refactor that
+      // removes the stash plumbing turns this test red.
+      XCTAssertEqual(snap.activeProfileID, "chat",
+                     "v11 F1 (v12 fix): deferred fan-out must deliver the SNAPSHOT STASHED at short-circuit time, capturing pre-clear activeProfileID — fresh-at-depth-0 would observe nil")
+      // Secondary sanity: entries reflect committed state regardless
+      // of stashed-vs-fresh, kept as a non-load-bearing check.
+      XCTAssertGreaterThan(snap.entries.count, 1,
+                           "sanity: stashed snapshot also carries the committed recursive writes")
+    }
+  }
+
+  func test_createProfile_writes_toml_and_makes_entry_visible_immediately() throws {
+    try withTempProfilesDir { dir in
+      let active = dir.deletingLastPathComponent()
+        .appendingPathComponent("active-profile", isDirectory: false)
+      let store = ProfileStore(directory: dir, activeProfileURL: active)
+      try store.start()
+      defer { store.stop() }
+
+      let p = Profile(id: "code", name: "Code",
+                      model: "llama-code-7b.gguf", inferlet: "code-apc")
+      let url = try store.createProfile(p)
+      XCTAssertEqual(url.lastPathComponent, "code.toml",
+                     "default filename must be `<profile.id>.toml`")
+      XCTAssertTrue(FileManager.default.fileExists(atPath: url.path))
+      // createProfile force-reloads — the entry is visible without
+      // waiting on the FS watcher debounce.
+      XCTAssertTrue(store.entries.contains { $0.profile?.id == "code" })
+      try store.setActiveProfileID("code")
+      XCTAssertEqual(store.activeProfile?.id, "code")
+      XCTAssertEqual(store.activeProfile?.model, "llama-code-7b.gguf")
+    }
+  }
+
+  // MARK: -  rework: profile-model lookup + write-back
+
+  /// `modelForProfile` wiring: the production swap coordinator
+  /// must learn a profile's model from the store. A bare lookup that
+  /// the closure can call.
+  func test_model_forProfileID_returns_profile_model_and_nil_for_unknown() throws {
+    try withTempProfilesDir { dir in
+      try writeProfile(into: dir, name: "chat.toml", id: "chat", displayName: "Chat")
+      let body = """
+      id = "code"
+      name = "Code"
+      model = "qwen2.5-coder-7b.gguf"
+      inferlet = "chat-apc"
+      """
+      try body.write(to: dir.appendingPathComponent("code.toml"),
+                     atomically: true, encoding: .utf8)
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+
+      XCTAssertEqual(store.model(forProfileID: "code"), "qwen2.5-coder-7b.gguf")
+      XCTAssertEqual(store.model(forProfileID: "chat"), "m")
+      XCTAssertNil(store.model(forProfileID: "does-not-exist"),
+                   "unknown profile id must resolve to nil, not a fabricated default")
+    }
+  }
+
+  /// `setModel` write-back ( step 2/5): assigning a profile's
+  /// default model persists to disk, preserves every other field, and
+  /// is visible immediately (force-reload, no watcher wait).
+  func test_setModel_persists_new_model_and_preserves_other_fields() throws {
+    try withTempProfilesDir { dir in
+      let body = """
+      id = "chat"
+      name = "Chat"
+      icon = "bubble.left.and.bubble.right"
+      model = "old-model.gguf"
+      inferlet = "chat-apc"
+      system_prompt = "You are helpful."
+
+      [sampling]
+      temperature = 0.5
+      top_p = 0.8
+      max_tokens = 1024
+      """
+      try body.write(to: dir.appendingPathComponent("chat.toml"),
+                     atomically: true, encoding: .utf8)
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+
+      try store.setModel("new-model.gguf", forProfileID: "chat")
+
+      XCTAssertEqual(store.model(forProfileID: "chat"), "new-model.gguf")
+      let profile = try XCTUnwrap(store.entries.first { $0.profile?.id == "chat" }?.profile)
+      XCTAssertEqual(profile.model, "new-model.gguf")
+      XCTAssertEqual(profile.name, "Chat", "name must survive the model write")
+      XCTAssertEqual(profile.icon, "bubble.left.and.bubble.right")
+      XCTAssertEqual(profile.inferlet, "chat-apc", "inferlet must survive the model write")
+      XCTAssertEqual(profile.systemPrompt, "You are helpful.")
+      XCTAssertEqual(profile.sampling.temperature, 0.5, accuracy: 0.0001)
+      XCTAssertEqual(profile.sampling.maxTokens, 1024)
+
+      // On-disk round-trip: a fresh scan of the same dir sees the new model.
+      let (reloaded, _) = ProfileStore.scan(directory: dir)
+      XCTAssertEqual(reloaded.first { $0.profile?.id == "chat" }?.profile?.model,
+                     "new-model.gguf",
+                     "model write must land on disk, not just in-memory")
+    }
+  }
+
+  func test_setModel_throws_for_unknown_profile() throws {
+    try withTempProfilesDir { dir in
+      try writeProfile(into: dir, name: "chat.toml", id: "chat", displayName: "Chat")
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+
+      XCTAssertThrowsError(try store.setModel("x.gguf", forProfileID: "ghost"),
+                           "setting a model on a non-existent profile must throw, not silently no-op")
+    }
+  }
+
+  // MARK: - helpers
+
+  private func withTempProfilesDir(_ body: (URL) throws -> Void) throws {
+    let temp = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+      .appendingPathComponent("pie-profile-store-test-\(UUID().uuidString)",
+                              isDirectory: true)
+    let profilesDir = temp.appendingPathComponent("profiles", isDirectory: true)
+    try FileManager.default.createDirectory(at: profilesDir, withIntermediateDirectories: true)
+    var bodyError: Error?
+    do { try body(profilesDir) } catch { bodyError = error }
+    // Permission-failure tests may have chmod'd profilesDir to 0o500
+    // or removed it entirely; both branches are tolerated here so
+    // cleanup never masks the real bodyError.
+    try? setPermissions(profilesDir, mode: 0o755)
+    try? FileManager.default.removeItem(at: temp)
+    if let bodyError { throw bodyError }
+  }
+
+  private func setPermissions(_ url: URL, mode: Int) throws {
+    try FileManager.default.setAttributes(
+      [.posixPermissions: NSNumber(value: mode)],
+      ofItemAtPath: url.path
+    )
+  }
+
+  private func writeProfile(
+    into dir: URL,
+    name: String,
+    id: String,
+    displayName: String
+  ) throws {
+    let body = """
+    id = "\(id)"
+    name = "\(displayName)"
+    model = "m"
+    inferlet = "i"
+    """
+    try body.write(to: dir.appendingPathComponent(name),
+                   atomically: true,
+                   encoding: .utf8)
+  }
+}

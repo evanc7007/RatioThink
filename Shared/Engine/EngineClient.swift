@@ -1,0 +1,408 @@
+import Foundation
+
+/// Wire types + protocol the GUI talks to. v1 has two implementations:
+/// `MockEngineClient` (this phase) drives the UI offline; Phase 6 swaps
+/// in `HTTPEngineClient` that hits the real pie engine on loopback. The
+/// surface here is intentionally narrower than the underlying HTTP API
+/// (no `n`, no `logprobs`, no tool_calls) — we add fields only when a
+/// view actually needs them, so the mock stays small and the HTTP client
+/// has nothing speculative to serialize.
+///
+/// Codable scope:
+/// - **Request bodies** (`ChatRequest`, `InferletRequest`) and
+///   **non-streaming responses** (`EngineHealth`, `ModelInfo`) are
+///   `Codable` and target the OpenAI-flat wire shape the engine
+///   exposes. Phase 6's `HTTPEngineClient` encodes/decodes these
+///   types directly — see the custom `encode(to:)` / `init(from:)`
+///   on `ChatRequest` that flattens `ChatSampling` onto the top
+///   level, and on `InferletRequest` that embeds `input` as an
+///   inline JSON sub-tree rather than a base64 blob.
+/// - **Streaming events** (`LoadEvent`, `ChatEvent`) are
+///   decoder-output types, NOT direct Codable mirrors of the wire.
+///   Their on-the-wire counterparts are OpenAI-style SSE frames
+///   (`data: {...}\n\n`) parsed by a separate frame decoder in
+///   Phase 6 (`OpenAIStreamDecoder → AsyncThrowingStream<ChatEvent>`).
+///   `ChatEvent.finish(reason: .cancelled)` is **client-synthesized**:
+///   the engine never emits `"cancelled"` as a `finish_reason`; the
+///   client constructs it when the consumer task is cancelled so
+///   downstream UI doesn't have to special-case "stream ended with
+///   no terminal frame."
+///
+/// Other conformances:
+/// - `Sendable` so `AsyncThrowingStream<Event, Error>` values cross
+///   actor boundaries without `@unchecked` escape hatches; SwiftUI
+///   views on the main actor consume streams produced off-main.
+/// - `Equatable` so tests can assert exact event ordering without
+///   hand-rolled comparison helpers.
+
+// MARK: - Health
+
+/// Response shape of GET /healthz (design doc §HTTP API):
+/// `{"status":"ok","model":"<id>","uptime_s":…}`. `loadedModel` is
+/// optional because the engine starts up with no model resident — the
+/// healthz handler reports `"model": null` until the first
+/// `loadModel`/inferlet activation. Modeling that as `String?` keeps
+/// the GUI from string-matching `"none"`/`""` sentinels.
+public struct EngineHealth: Codable, Equatable, Sendable {
+  public enum Status: String, Codable, Sendable {
+    case ok
+    case degraded
+  }
+
+  public let status: Status
+  public let loadedModel: String?
+  /// Optional because pie-control's `/healthz` in v1 returns the
+  /// minimal `{"status":"ok"}` shape — no `uptime_s` field. The GUI
+  /// doesn't render uptime today, so we tolerate it being absent
+  /// rather than fail the whole health probe.
+  public let uptimeSeconds: Double?
+
+  public init(status: Status, loadedModel: String? = nil, uptimeSeconds: Double? = nil) {
+    self.status = status
+    self.loadedModel = loadedModel
+    self.uptimeSeconds = uptimeSeconds
+  }
+
+  private enum CodingKeys: String, CodingKey {
+    case status
+    case loadedModel = "model"
+    case uptimeSeconds = "uptime_s"
+  }
+}
+
+// MARK: - Models
+
+/// One entry of the OpenAI-shaped /v1/models listing. v1 surfaces just
+/// the fields the chat UI renders (id + ownedBy + created). `Date` for
+/// `created` because OpenAI uses seconds-since-epoch and `Date` already
+/// has a Codable bridge — `XPCPayloadConfig` pins ISO8601 only on the
+/// XPC wire; HTTP responses use `secondsSince1970` configured on the
+/// HTTP client's decoder in Phase 6.
+public struct ModelInfo: Codable, Equatable, Sendable, Identifiable {
+  public let id: String
+  public let ownedBy: String
+  /// Optional because pie-control's `/v1/models` listing in v1 omits
+  /// `created` — the inferlet has no boot-timestamp source it can
+  /// authoritatively quote. The chat UI sorts by `id` for now;
+  /// `created` returns when pie surfaces a registration timestamp.
+  public let created: Date?
+
+  public init(id: String, ownedBy: String, created: Date? = nil) {
+    self.id = id
+    self.ownedBy = ownedBy
+    self.created = created
+  }
+
+  private enum CodingKeys: String, CodingKey {
+    case id
+    case ownedBy = "owned_by"
+    case created
+  }
+}
+
+// MARK: - Chat request shape
+
+/// One transcript turn. Role is closed-set in v1 (system/user/assistant)
+/// — tool/function roles arrive with the agent loop in v2. `content` is
+/// a single string because the v1 chat UI is text-only; multimodal turns
+/// (image parts, tool-call cards) get a new associated-value enum in v2
+/// rather than a fragile any-Codable bag here.
+public struct ChatMessage: Codable, Equatable, Sendable {
+  public enum Role: String, Codable, Sendable {
+    case system
+    case user
+    case assistant
+  }
+
+  public let role: Role
+  public let content: String
+
+  public init(role: Role, content: String) {
+    self.role = role
+    self.content = content
+  }
+}
+
+/// Sampling parameters passed inline with each chat request. Snake-case
+/// JSON to match OpenAI's body shape so Phase 6 can encode this struct
+/// directly. The trio (temperature/top_p/max_tokens) is what the v1
+/// `𝑇 params` popover edits — anything beyond that lives in
+/// `Profile.inferletArgs` and rides under `inferlet_args` on the wire.
+public struct ChatSampling: Codable, Equatable, Sendable {
+  public let temperature: Double
+  public let topP: Double
+  public let maxTokens: Int
+
+  public init(temperature: Double = 0.7, topP: Double = 0.9, maxTokens: Int = 2048) {
+    self.temperature = temperature
+    self.topP = topP
+    self.maxTokens = maxTokens
+  }
+
+  private enum CodingKeys: String, CodingKey {
+    case temperature
+    case topP = "top_p"
+    case maxTokens = "max_tokens"
+  }
+}
+
+/// Body of POST /v1/chat/completions. `stream` is required on the wire
+/// (engine has different code paths for streaming vs non-streaming); we
+/// expose it but `EngineClient.chatCompletion` only models the streaming
+/// path — a future non-streaming overload can call the same endpoint
+/// with `stream: false`.
+///
+/// `ChatSampling` exists as an ergonomic Swift-side grouping (one
+/// struct to pass between toolbar popover ↔ view model ↔ request
+/// builder), but the wire shape is OpenAI-flat: `temperature`,
+/// `top_p`, `max_tokens` sit at the top level of the JSON body next
+/// to `model`/`messages`/`stream`. The custom `encode(to:)` /
+/// `init(from:)` below maintain that asymmetry so Phase 6's
+/// `HTTPEngineClient` can pass a `ChatRequest` straight to its
+/// `JSONEncoder` with no DTO layer.
+public struct ChatRequest: Codable, Equatable, Sendable {
+  public let model: String
+  public let messages: [ChatMessage]
+  public let sampling: ChatSampling
+  public let stream: Bool
+
+  public init(model: String,
+              messages: [ChatMessage],
+              sampling: ChatSampling = ChatSampling(),
+              stream: Bool = true) {
+    self.model = model
+    self.messages = messages
+    self.sampling = sampling
+    self.stream = stream
+  }
+
+  /// Flat wire keys. No `sampling` envelope — OpenAI's
+  /// /v1/chat/completions accepts `temperature` / `top_p` /
+  /// `max_tokens` at the top level. Any field added here must also
+  /// be touched in both `encode(to:)` and `init(from:)`.
+  private enum CodingKeys: String, CodingKey {
+    case model
+    case messages
+    case stream
+    case temperature
+    case topP = "top_p"
+    case maxTokens = "max_tokens"
+  }
+
+  public func encode(to encoder: Encoder) throws {
+    var c = encoder.container(keyedBy: CodingKeys.self)
+    try c.encode(model, forKey: .model)
+    try c.encode(messages, forKey: .messages)
+    try c.encode(stream, forKey: .stream)
+    try c.encode(sampling.temperature, forKey: .temperature)
+    try c.encode(sampling.topP, forKey: .topP)
+    try c.encode(sampling.maxTokens, forKey: .maxTokens)
+  }
+
+  public init(from decoder: Decoder) throws {
+    let c = try decoder.container(keyedBy: CodingKeys.self)
+    self.model = try c.decode(String.self, forKey: .model)
+    self.messages = try c.decode([ChatMessage].self, forKey: .messages)
+    self.stream = try c.decode(Bool.self, forKey: .stream)
+    self.sampling = ChatSampling(
+      temperature: try c.decode(Double.self, forKey: .temperature),
+      topP: try c.decode(Double.self, forKey: .topP),
+      maxTokens: try c.decode(Int.self, forKey: .maxTokens)
+    )
+  }
+}
+
+/// Body of POST /v1/inferlet — the escape hatch for any inferlet
+/// beyond `chat-apc`. The design doc requires `input` to land on the
+/// wire as an **inline JSON sub-tree** (`"input": {...}`), not a
+/// base64 string — but the dispatcher can't know inferlet-specific
+/// schemas, so we accept opaque `Data` and require it to be valid
+/// UTF-8 JSON. `encode(to:)` parses the bytes through `JSONValue`
+/// (see below) and emits the parsed tree under the `input` key;
+/// `init(from:)` reverses that, re-serializing the sub-tree so
+/// callers get back the same `Data` shape they handed in.
+///
+/// Encoding an `InferletRequest` whose `input` is not valid JSON
+/// throws `EncodingError` — fail closed rather than ship a payload
+/// the engine will reject. `messages` is the optional chat-sugar
+/// surface from the design doc; pass nil for inferlets that have
+/// their own input shape entirely.
+public struct InferletRequest: Codable, Equatable, Sendable {
+  public let inferlet: String
+  public let input: Data
+  public let messages: [ChatMessage]?
+  public let stream: Bool
+
+  public init(inferlet: String,
+              input: Data,
+              messages: [ChatMessage]? = nil,
+              stream: Bool = true) {
+    self.inferlet = inferlet
+    self.input = input
+    self.messages = messages
+    self.stream = stream
+  }
+
+  private enum CodingKeys: String, CodingKey {
+    case inferlet
+    case input
+    case messages
+    case stream
+  }
+
+  public func encode(to encoder: Encoder) throws {
+    var c = encoder.container(keyedBy: CodingKeys.self)
+    try c.encode(inferlet, forKey: .inferlet)
+    try c.encode(stream, forKey: .stream)
+    if let messages {
+      try c.encode(messages, forKey: .messages)
+    }
+    let parsed: JSONValue
+    do {
+      parsed = try JSONDecoder().decode(JSONValue.self, from: input)
+    } catch {
+      throw EncodingError.invalidValue(
+        input,
+        EncodingError.Context(
+          codingPath: encoder.codingPath + [CodingKeys.input],
+          debugDescription: "InferletRequest.input must be valid UTF-8 JSON; got \(error)"
+        )
+      )
+    }
+    try c.encode(parsed, forKey: .input)
+  }
+
+  public init(from decoder: Decoder) throws {
+    let c = try decoder.container(keyedBy: CodingKeys.self)
+    self.inferlet = try c.decode(String.self, forKey: .inferlet)
+    self.stream = try c.decode(Bool.self, forKey: .stream)
+    self.messages = try c.decodeIfPresent([ChatMessage].self, forKey: .messages)
+    let parsed = try c.decode(JSONValue.self, forKey: .input)
+    self.input = try JSONEncoder().encode(parsed)
+  }
+}
+
+/// Lossless intermediate JSON tree for round-tripping arbitrary
+/// JSON sub-trees through `Codable`. Used by `InferletRequest` so
+/// its `input: Data` field can be parsed once and re-emitted as
+/// inline JSON inside a larger encoded body. `internal` because
+/// it's an implementation detail — callers work with `Data`.
+///
+/// `.number` collapses int/double into a single `Double` slot
+/// because JSON itself has only one number type; the encoder
+/// re-emits integral values as integers (no trailing `.0`) so the
+/// wire shape matches what a hand-written client would produce.
+/// `.bool` is matched ahead of `.number` so JSON `true`/`false`
+/// doesn't decode as the numeric `1`/`0`.
+internal enum JSONValue: Codable, Equatable, Sendable {
+  case null
+  case bool(Bool)
+  case number(Double)
+  case string(String)
+  case array([JSONValue])
+  case object([String: JSONValue])
+
+  init(from decoder: Decoder) throws {
+    let c = try decoder.singleValueContainer()
+    if c.decodeNil() { self = .null; return }
+    // `Bool` must be tried before `Double` — Foundation's JSONDecoder
+    // is strict about types, so `true`/`false` won't match Double,
+    // but the order documents intent.
+    if let b = try? c.decode(Bool.self)         { self = .bool(b);   return }
+    if let d = try? c.decode(Double.self)       { self = .number(d); return }
+    if let s = try? c.decode(String.self)       { self = .string(s); return }
+    if let a = try? c.decode([JSONValue].self)  { self = .array(a);  return }
+    if let o = try? c.decode([String: JSONValue].self) { self = .object(o); return }
+    throw DecodingError.dataCorruptedError(
+      in: c,
+      debugDescription: "JSONValue could not decode underlying value"
+    )
+  }
+
+  func encode(to encoder: Encoder) throws {
+    var c = encoder.singleValueContainer()
+    switch self {
+    case .null:           try c.encodeNil()
+    case .bool(let b):    try c.encode(b)
+    case .number(let n):
+      // Preserve integer shape on the wire. JSON has one number
+      // type, but `{"x":1}` should not round-trip to `{"x":1.0}`.
+      if n.truncatingRemainder(dividingBy: 1) == 0,
+         abs(n) < Double(Int64.max) {
+        try c.encode(Int64(n))
+      } else {
+        try c.encode(n)
+      }
+    case .string(let s):  try c.encode(s)
+    case .array(let a):   try c.encode(a)
+    case .object(let o):  try c.encode(o)
+    }
+  }
+}
+
+// MARK: - Events
+
+/// One frame of /v1/models/load (or the SSE meta-frame prefix on a chat
+/// stream). `loading` carries the byte counters the design doc pins on
+/// the meta-frame schema; `etaSeconds` is optional because the engine
+/// only reports it once it has a transfer-rate sample. Closed enum so a
+/// `switch` in the loading-indicator view is exhaustive.
+public enum LoadEvent: Equatable, Sendable {
+  case loading(loadedBytes: UInt64, totalBytes: UInt64, etaSeconds: Double?)
+  case ready
+}
+
+/// One SSE frame from POST /v1/chat/completions. Maps 1:1 to the wire
+/// schema:
+/// - `.modelLoading` / `.modelReady` are the meta-frame prefix (design
+///   doc §SSE meta-frame schema). The GUI feeds them straight into
+///   `ModelLoadCenter` — same observable a bare `loadModel` call drives,
+///   so the loading indicator's source-of-truth doesn't bifurcate.
+/// - `.delta` is OpenAI's `choices[0].delta`. `role` only appears on
+///   the first delta of a turn; subsequent deltas carry content alone.
+/// - `.finish` is a synthetic terminal frame the decoder emits when it
+///   sees `finish_reason != nil`. Streams end with exactly one
+///   `.finish` followed by completion.
+///
+/// `FinishReason` is closed for v1; unknown reasons coming over the
+/// wire decode into `.other(String)` so a future engine extension
+/// doesn't crash the GUI.
+public enum ChatEvent: Equatable, Sendable {
+  case modelLoading(loadedBytes: UInt64, totalBytes: UInt64, etaSeconds: Double?)
+  case modelReady
+  case delta(role: ChatMessage.Role?, content: String)
+  case finish(reason: FinishReason)
+
+  public enum FinishReason: Equatable, Sendable {
+    case stop
+    case length
+    case cancelled
+    case other(String)
+  }
+}
+
+// MARK: - Protocol
+
+/// What the GUI talks to. Implementations:
+/// - `MockEngineClient` (Phase 3): canned data, configurable delays.
+/// - `HTTPEngineClient` (Phase 6): hits the pie engine over loopback
+///   HTTP. Same surface, real bytes.
+///
+/// Streaming methods return `AsyncThrowingStream` rather than
+/// `AsyncStream` so transport errors (HTTP failure, JSON parse error,
+/// engine `error` frame) reach the consumer through the same channel
+/// as data — there is no second error callback to forget about.
+/// Cancellation: consumers cancel by dropping the iterator or calling
+/// `task.cancel()`; the stream's `onTermination` (set by the impl) is
+/// where the network/timer teardown happens.
+///
+/// `Sendable` so the protocol existential can cross actor boundaries —
+/// the chat view runs on `@MainActor` but spawns detached tasks to
+/// consume streams without blocking the UI.
+public protocol EngineClient: Sendable {
+  func health() async throws -> EngineHealth
+  func models() async throws -> [ModelInfo]
+  func loadModel(_ id: String) -> AsyncThrowingStream<LoadEvent, Error>
+  func chatCompletion(_ req: ChatRequest) -> AsyncThrowingStream<ChatEvent, Error>
+  func dispatchInferlet(_ req: InferletRequest) -> AsyncThrowingStream<Data, Error>
+}
