@@ -17,7 +17,38 @@ final class S4_HelperMenuBarGUITests: XCTestCase {
   /// Sibling S5 tests apply the same annotation for the same reason.
   @MainActor
   func test_helper_status_bar_surfaces_design_items() async throws {
+    // Drive a DETERMINISTIC `Engine: stopped` boot WITHOUT a staged model.
+    // `HelperStatusItemModel` renders the status shell from the `.stopped`
+    // status alone and never consults the model, so this menu-shell smoke
+    // needs no weight and must run on a model-less checkout (gated only by
+    // guardSeatedGUI). The helper auto-resumes the ACTIVE profile at boot
+    // (HelperMain.autoResumeEngineOnBoot), so a freshly-seeded PIE_HOME —
+    // whose seed also writes the active-profile marker — would boot to
+    // `starting…`/`Pause Engine`. Pre-write a profile so `seedDefaultsIfEmpty`
+    // skips (a .toml already exists) and NO `<PIE_HOME>/active-profile` marker
+    // is written → `activeProfileID` is nil → autoResume no-ops
+    // (`.noActiveProfile`) → the engine stays `.stopped`. Only the file's
+    // existence matters (the helper never resolves it — no active profile), so
+    // it is a minimal placeholder, NOT a copy of the seed format. PIE_HOME lives
+    // under the runner-writable NSTemporaryDirectory container (the sandboxed
+    // runner cannot create dirs under /tmp).
+    let fm = FileManager.default
+    let tempDir = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+      .appendingPathComponent("pie-s4design-\(UUID().uuidString)", isDirectory: true)
+    let profilesDir = tempDir.appendingPathComponent("profiles", isDirectory: true)
+    try fm.createDirectory(at: profilesDir, withIntermediateDirectories: true)
+    addTeardownBlock { try? fm.removeItem(at: tempDir) }
+    let placeholderProfile = """
+    id = "chat"
+    name = "Chat"
+    model = "placeholder"
+    inferlet = "chat-apc"
+    """
+    try placeholderProfile.write(to: profilesDir.appendingPathComponent("chat.toml"),
+                                 atomically: true, encoding: .utf8)
+
     let app = XCUIApplication(bundleIdentifier: "com.ratiothink.app.helper")
+    app.launchEnvironment["PIE_HOME"] = tempDir.path
     // Debug dev builds are ad-hoc-signed (no Team ID).
     // `HelperXPCListener.verifyStartupInvariants` preconditionFails
     // on `.teamIDAbsent` unless a bypass env is captured. Notarized
@@ -53,6 +84,13 @@ final class S4_HelperMenuBarGUITests: XCTestCase {
                      "Settings…", "Open Logs…", "Quit RatioThink"] {
       XCTAssertTrue(titles.contains(expected),
                     "menu missing '\(expected)'; got: \(titles)")
+    }
+    // Idle-shell determinism: no active profile ⇒ autoResume no-ops, so the
+    // running/starting affordances must be ABSENT — proving the `.stopped`
+    // shell renders without any staged model.
+    for absent in ["Pause Engine", "Engine: starting…"] {
+      XCTAssertFalse(titles.contains(absent),
+                     "idle shell must not show a running/starting affordance; got: \(titles)")
     }
 
     app.typeKey(.escape, modifierFlags: [])

@@ -165,8 +165,12 @@ struct RatioThinkApp: App {
   }
 
   private static func chatTestEngineBaseURL() -> URL? {
-    guard let raw = ProcessInfo.processInfo.environment["PIE_TEST_ENGINE_BASE_URL"],
-          !raw.isEmpty else { return nil }
+    // Gated through HelperConfig so a Release build ignores the override
+    // entirely — the engine-client redirection and the DEBUG status pin both
+    // key off this result, so a non-debug app falls back to the real
+    // Helper-driven engine path (`HelperXPCClient()`) and never honors the
+    // `PIE_TEST_ENGINE_BASE_URL` seam.
+    guard let raw = HelperConfig.testEngineBaseURLOverride() else { return nil }
     return URL(string: raw)
   }
 
