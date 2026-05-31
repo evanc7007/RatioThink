@@ -11,7 +11,7 @@ Release DMGs are signed with a Developer ID and notarized by Apple, so they
 pass Gatekeeper with no extra steps:
 
 1. Download `RatioThink-arm64.dmg` (Apple Silicon) from Releases and open it.
-2. Drag **RatioThink.app** into **Applications**.
+2. In the window that opens, drag **RatioThink.app** onto the **Applications** shortcut.
 3. Open **RatioThink** from Applications.
 
 > **Unsigned / development builds.** A DMG or app you build yourself
@@ -31,6 +31,14 @@ pass Gatekeeper with no extra steps:
 git clone --recurse-submodules https://github.com/shsym/RatioThink.git
 cd RatioThink
 make build          # generates RatioThink.xcodeproj, then builds RatioThink.app + helper
+```
+
+The repo uses git submodules (the Pie engine, plus `ds_store` + `mac_alias` under
+`Scripts/vendor/` which `make dmg-arm64` needs to write the styled DMG window). If
+you cloned without `--recurse-submodules`, initialize them:
+
+```bash
+git submodule update --init --recursive
 ```
 
 To install a signed build into `/Applications` (verified end-to-end: helper + engine + a chat
