@@ -164,6 +164,20 @@ struct RatioThinkApp: App {
     #endif
   }
 
+  /// Test-only engine base-URL override. `PIE_TEST_ENGINE_BASE_URL`
+  /// points the chat client straight at an externally-launched engine,
+  /// bypassing the entire production launch boundary (Helper XPC,
+  /// `EngineStatusStore`, `LaunchSpecResolver`, `PieControlLauncher`,
+  /// `pie serve`). It is honored ONLY in a test harness
+  /// (`PIE_TEST_MODE=1`) or a DEBUG build — a shipped Release
+  /// `RatioThink.app` MUST use the real Helper→engine path. Refusing it
+  /// in Release closes the parity gap two ways: a shipped app can't be
+  /// redirected at a foreign URL, and a "real binary" (Release/packaged)
+  /// scenario cannot silently pass on a fake base URL — if the override
+  /// is set it is ignored and the app exercises the real path (failing
+  /// loudly when no real engine is present). Mirrors
+  /// `HelperXPCListener.isAnonymousModeAllowed` for the
+  /// `PIE_ALLOW_UNSIGNED_CALLERS` bypass.
   private static func chatTestEngineBaseURL() -> URL? {
     // Gated through HelperConfig so a Release build ignores the override
     // entirely — the engine-client redirection and the DEBUG status pin both

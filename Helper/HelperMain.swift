@@ -889,7 +889,20 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
       // so a short /tmp anchor needs nothing from the store and leaves
       // profiles/models/chats untouched. The Helper is app-sandbox=false,
       // so it can create /tmp even when the test runner cannot.
-      pieHome: { try Self.engineRuntimeHome() }
+      pieHome: { try Self.engineRuntimeHome() },
+      // Honor the operator's RAM-guardrail fraction (persisted by the
+      // Settings → Models dial as guardrail.json) at the launch-time size
+      // guard, instead of the hardcoded default. Re-evaluated per resolve
+      // so a dial change takes effect on the next launch with no Helper
+      // restart; falls back to the default fraction when unset/unreadable.
+      memoryPolicy: {
+        let fraction = (try? PieDirs.applicationSupport())
+          .map { GuardrailSettings.loadFraction(root: $0) } ?? GuardrailSettings.defaultFraction
+        return ModelMemoryGuardrail.Policy.recommended(
+          physicalMemoryBytes: SystemMemory.physicalBytes(),
+          fraction: fraction
+        )
+      }
     )
     let closure = resolver.asClosure
     self.launchSpecResolver = closure

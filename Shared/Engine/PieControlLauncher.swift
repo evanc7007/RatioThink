@@ -49,6 +49,11 @@ public enum PieControlLauncher {
     case portFileWriteFailed(path: String, underlying: String)
     case clientError(underlying: String)
     case driverUnsupported(requested: String, binary: String, details: String)
+    /// `PIE_HOME` is so deep that the engine's aux Unix-domain control
+    /// socket path would overrun the OS `sun_path` limit. Thrown by the
+    /// pre-launch budget check so the failure is loud and actionable
+    /// instead of a silent model-load hang.
+    case pieHomePathTooLong(pieHome: String, length: Int, limit: Int)
 
     public var description: String {
       switch self {
@@ -65,6 +70,8 @@ public enum PieControlLauncher {
       case let .clientError(u): return "PieControlLauncher: WS client error: \(u)"
       case let .driverUnsupported(requested, binary, details):
         return "PieControlLauncher: driver unsupported: \(requested) by \(binary): \(details)"
+      case let .pieHomePathTooLong(pieHome, length, limit):
+        return "PieControlLauncher: PIE_HOME path too long (\(length) bytes > \(limit) max): the engine binds a Unix aux socket at \(pieHome)/standalone/<pid>/g0/aux.sock, which would exceed the macOS sun_path limit (\(auxSocketSunPathBytes) bytes) and hang at model load — use a shorter PIE_HOME (production uses ~/Library/Application Support/RatioThink; tests should anchor pieHome at a short /tmp path)"
       }
     }
   }
@@ -405,6 +412,56 @@ public enum PieControlLauncher {
     }
   }
 
+  // MARK: - aux socket path budget
+
+  /// Darwin caps `sockaddr_un.sun_path` at 104 bytes (incl. NUL). The
+  /// `pie serve` engine binds a per-launch aux control socket at
+  /// `$PIE_HOME/standalone/<pid>/g<group>[r<rank>]/aux.sock` (pie
+  /// `server/src/embedded_driver.rs`). A `PIE_HOME` deep enough to push
+  /// that path past the limit makes the engine's `bind()` fail and it
+  /// hangs at model load — the exact failure a too-deep
+  /// `NSTemporaryDirectory()` pieHome produced. The pre-launch check
+  /// below converts that hang into a loud, actionable error.
+  static let auxSocketSunPathBytes = 104
+
+  /// Modeled worst-case engine-appended suffix under PIE_HOME:
+  /// `/standalone/<pid>/g0/aux.sock` — `/standalone/` (12) + a 7-digit
+  /// pid allowance (well beyond macOS pid_max defaults) + `/g0/aux.sock`
+  /// (12) = 31. Single-device Metal is always group 0; any multi-rank
+  /// `r<n>` suffix stays within the pid slack.
+  static let auxSocketSuffixReserve = 31
+
+  /// Longest PIE_HOME (UTF-8 bytes) that still leaves room for the
+  /// engine's aux socket path + NUL terminator: `104 - 1 - 31 = 72`.
+  static var maxSafePieHomePathLength: Int {
+    auxSocketSunPathBytes - 1 - auxSocketSuffixReserve
+  }
+
+  /// `nil` when `pieHome` leaves room for the engine's aux socket;
+  /// otherwise the loud pre-launch error to throw. Pure + deterministic
+  /// (no pid read) so it is directly unit-testable.
+  static func auxSocketBudgetError(pieHome: URL) -> LaunchError? {
+    let length = pieHome.path.utf8.count
+    guard length > maxSafePieHomePathLength else { return nil }
+    return .pieHomePathTooLong(
+      pieHome: pieHome.path,
+      length: length,
+      limit: maxSafePieHomePathLength
+    )
+  }
+
+  /// Whether `modelConfig` spawns a real driver that binds the aux Unix
+  /// socket (and is therefore subject to the `sun_path` budget). The
+  /// `.dummy` driver has no aux socket (pie `rpc_loop.rs`), so its
+  /// launches are exempt — that keeps the long `NSTemporaryDirectory()`
+  /// pieHomes used by the dummy-driver CLI scenarios valid.
+  static func modelConfigBindsAuxSocket(_ modelConfig: ModelConfig) -> Bool {
+    switch modelConfig {
+    case .dummy: return false
+    case .portable, .portableResolved, .metal: return true
+    }
+  }
+
   // MARK: - launch
 
   /// Returns the bound HTTP port and a `LaunchedSession` whose
@@ -412,6 +469,13 @@ public enum PieControlLauncher {
   public static func launch(spec: LaunchSpec) async throws -> (httpPort: UInt16, session: LaunchedSession) {
     guard FileManager.default.fileExists(atPath: spec.pieBinary.path) else {
       throw LaunchError.pieBinaryMissing(path: spec.pieBinary.path)
+    }
+    // Fail loud before spawning if PIE_HOME is so deep the engine's aux
+    // Unix socket path would overrun sun_path and hang. Only real drivers
+    // (portable/metal) bind that socket.
+    if modelConfigBindsAuxSocket(spec.modelConfig),
+       let budgetError = auxSocketBudgetError(pieHome: spec.pieHome) {
+      throw budgetError
     }
     let httpPort = try reserveFreePort()
     let configURL = try writeConfig(modelConfig: spec.modelConfig, in: spec.pieHome)
@@ -741,6 +805,65 @@ public actor LaunchedSession {
   public var pid: pid_t { process.processIdentifier }
   public var isRunning: Bool { process.isRunning }
 
+  /// Resident memory of the live pie process in bytes, or nil if the
+  /// engine is not running or the sample fails. Satisfies
+  /// `PieEngineHost.EngineSession`. Reads the actor-owned pid, then defers
+  /// to the nonisolated `proc_pid_rusage` helper. Measures the parent pie
+  /// process only; summing the process group is a deliberate follow-up.
+  ///
+  /// Liveness gate: never sample a dead/reaped engine. Foundation flips
+  /// `process.isRunning` false the instant the child exits — well before
+  /// `PieEngineHost`'s liveness monitor takes
+  /// ~`livenessFailureThreshold × livenessInterval` (~10 s) to demote
+  /// `_state` from `.running` — so this closes the window where the
+  /// popover would otherwise render a dead engine's STALE RSS (measured:
+  /// `proc_pid_rusage` returns rc==0 with ~1.2 MB of stale bytes for a
+  /// zombie pid). The static helper re-checks the raw pid as defence.
+  public func residentMemoryBytes() async -> UInt64? {
+    guard process.isRunning else { return nil }
+    return LaunchedSession.residentMemory(ofPID: process.processIdentifier)
+  }
+
+  /// `proc_pid_rusage(RUSAGE_INFO_V2)` → `ri_resident_size` for `pid`, or
+  /// nil when `pid` is not a live process or the sample is not a real
+  /// reading. `static` (nonisolated) so unit tests can sample a known pid
+  /// (e.g. `getpid()`) without standing up an actor.
+  ///
+  /// Two gates beyond rc:
+  ///  · LIVENESS — `proc_pid_rusage` returns rc==0 with STALE non-zero
+  ///    bytes for a zombie (exited-but-unreaped) pid, and the OS may reuse
+  ///    a dead pid for an unrelated process. `isPidLive` rejects both, so
+  ///    a dead engine never reports phantom (or someone else's) memory.
+  ///  · NON-ZERO — a live engine is never 0-resident; rc==0 with 0 bytes
+  ///    is an edge/failed reading, not a measurement, so it collapses into
+  ///    the same nil ("unavailable") channel rather than rendering "0 MB".
+  static func residentMemory(ofPID pid: pid_t) -> UInt64? {
+    guard isPidLive(pid) else { return nil }
+    var info = rusage_info_v2()
+    let rc = withUnsafeMutablePointer(to: &info) { ptr -> Int32 in
+      ptr.withMemoryRebound(to: rusage_info_t?.self, capacity: 1) {
+        proc_pid_rusage(pid, RUSAGE_INFO_V2, $0)
+      }
+    }
+    guard rc == 0 else { return nil }
+    guard info.ri_resident_size > 0 else { return nil }
+    return info.ri_resident_size
+  }
+
+  /// True only when `pid` names a LIVE process — not a zombie
+  /// (exited-but-unreaped) nor a vanished/reused-dead pid. Measured:
+  /// `proc_pidinfo(PROC_PIDTBSDINFO)` returns the struct size for a live
+  /// process and 0 for a zombie or a gone pid, so a short read means
+  /// "not live"; the `SZOMB` check is defensive belt-and-suspenders. This
+  /// is the pid-validity guard `proc_pid_rusage` itself cannot provide.
+  static func isPidLive(_ pid: pid_t) -> Bool {
+    guard pid > 0 else { return false }
+    var info = proc_bsdinfo()
+    let size = Int32(MemoryLayout<proc_bsdinfo>.size)
+    let n = proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, size)
+    return n == size && info.pbi_status != UInt32(SZOMB)
+  }
+
   /// Record the control-plane WS address for later liveness probes.
   /// Called once by `launch()` after the handshake resolves it.
   func recordControlWSURL(_ url: URL) { controlWSURL = url }
@@ -1006,6 +1129,12 @@ public actor LaunchedSession {
   }
 
   private nonisolated func diagnose(_ msg: String) {
+    // Route through the unified log so shutdown anomalies (SIGKILL did
+    // not reap the pid, `shm_unlink` FAILED — both host-global corruption
+    // vectors) are visible in the shipped, detached Helper, where stderr
+    // is not captured. Keep the stderr write too for CLI/test contexts
+    // that DO capture it.
+    Log.engine.error("[LaunchedSession] \(msg, privacy: .public)")
     FileHandle.standardError.write(Data("[LaunchedSession] \(msg)\n".utf8))
   }
 }
