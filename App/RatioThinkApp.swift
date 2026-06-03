@@ -36,6 +36,10 @@ struct RatioThinkApp: App {
   @StateObject private var profileStore: ProfileStore
   @StateObject private var swapCoordinator: ProfileSwapCoordinator
   @StateObject private var engineStatusStore: EngineStatusStore
+  /// #412: App-side background-helper health + restart ladder. Driven by the
+  /// same `engineStatus()` poll as `engineStatusStore` (via `onPollOutcome`)
+  /// and surfaced as the toolbar helper-ring + the escalation banner.
+  @StateObject private var helperHealth: HelperHealthController
   @StateObject private var engineClientStore: EngineClientStore
   /// Phase 3.8 (review v2 F1): the Add Model sheet's `.queueDownload`
   /// outcome runs through this controller so the existing
@@ -43,6 +47,10 @@ struct RatioThinkApp: App {
   /// closing + reopening the Settings sheet does not orphan an
   /// in-flight download.
   @StateObject private var downloadController: ModelDownloadController
+  /// #411: once-per-launch GitHub-Releases update check. App-scoped so the
+  /// check (and its single network call) fires once per process; RootView
+  /// observes `pending` to render the non-modal update banner.
+  @StateObject private var updateAvailability = UpdateAvailabilityModel()
 
   @MainActor
   init() {
@@ -150,6 +158,30 @@ struct RatioThinkApp: App {
     _persistenceStatus = StateObject(wrappedValue: status)
     chatContainer = RatioThinkModelContainer.openWithFallback(status: status)
 
+    // #412: App-side helper-health restart ladder. The repair runs the
+    // runtime registration reconcile; a test/automation launch gets a no-op
+    // repair so a GUI run never mutates the real machine's SMAppService
+    // background-item registration (same guard the launch reconcile uses).
+    let helperRepair: () async -> Bool
+    if HelperRegistrationReconciler.isTestLaunch(ProcessInfo.processInfo.environment) {
+      helperRepair = { false }
+    } else {
+      helperRepair = { await HelperRegistrationRepair().repairAndReportReachable() }
+    }
+    let helperHealthController = HelperHealthController(repair: helperRepair)
+    // Drive the ladder from the SAME poll the status mirror runs — no second
+    // XPC surface. Set BEFORE statusStore.start() so the first ticks count.
+    statusStore.onPollOutcome = { [weak helperHealthController] succeeded in
+      helperHealthController?.ingestPollOutcome(succeeded: succeeded)
+    }
+    // #412 review F1: let the chat recovery wait bound itself by the ladder
+    // outcome (give up the moment the ladder hits .unreachable) instead of a
+    // fixed timeout chosen out of sync with the ladder cadence.
+    statusStore.helperHealthProvider = { [weak helperHealthController] in
+      helperHealthController?.health
+    }
+    _helperHealth = StateObject(wrappedValue: helperHealthController)
+
     // Kick the XPC poll loop. Idempotent + cheap — first reply lands
     // within ~one runloop tick when the helper is registered, longer
     // when launchd has not yet published the mach service.
@@ -250,30 +282,26 @@ struct RatioThinkApp: App {
       return
     }
 
-    let registrar = SMAppServiceLoginItemRegistrar()
-    let reconciler = HelperRegistrationReconciler(
-      probeReachable: { await Self.helperReachable() },
-      currentState: { registrar.status.reconcilerState },
-      register: { try registrar.register().reconcilerState },
-      unregister: { try registrar.unregister() }
-    )
-    let outcome = await reconciler.reconcile()
+    // #412: the reconcile is now the shared `HelperRegistrationRepair`
+    // primitive so the launch-time self-heal, the runtime
+    // `HelperHealthController` restart ladder, and the user's "Restart
+    // helper" action all go through one wiring.
+    let outcome = await HelperRegistrationRepair().reconcile()
     NSLog("RatioThinkHelper registration reconcile: \(outcome)")
     Diag.app.event("helper.reconcile", [("outcome", "\(outcome)")])
-    if case .needsApproval = outcome {
+    if outcome.requiresUserApproval {
       // Hard macOS consent gate — route the user to the toggle.
       SMAppService.openSystemSettingsLoginItems()
     }
   }
 
-  /// #5b: user-triggered runtime recovery for the "Helper went down /
-  /// unreachable and only a full app restart fixes it" failure. Re-runs
-  /// the registration reconcile (reloads a wedged/throttled launchd job)
-  /// and then re-starts the engine on the active profile — all without
-  /// quitting the app. The honest-status half (#5a) surfaces the failure
-  /// as a recoverable `.failed(.engineGone)`; this is the recovery ACTION
-  /// behind the "Restart Engine" menu command. A `replyTimeout` from a
-  /// slow start is swallowed by `EngineStatusStore.startEngine` — the
+  /// User-triggered runtime recovery behind the "Restart Engine" menu
+  /// command: reload a wedged or throttled Helper registration via the
+  /// shared `performHelperRegistrationReconcile` (the same
+  /// `HelperRegistrationRepair` primitive the launch-time self-heal and
+  /// the autonomous restart ladder use), then re-start the engine on the
+  /// active profile — without quitting the app. A slow-start
+  /// `replyTimeout` is swallowed by `EngineStatusStore.startEngine`; the
   /// status poll surfaces the real outcome.
   @MainActor
   private func restartEngine() {
@@ -290,22 +318,6 @@ struct RatioThinkApp: App {
         NSLog("Restart Engine: startEngine(\(profileID)) failed: \(error)")
       }
     }
-  }
-
-  /// Returns true as soon as the Helper answers an `engineStatus()` XPC
-  /// call, retrying over a bounded window so a just-launched (or
-  /// just-reloaded) on-demand Helper has time to publish its mach
-  /// service. ~5s worst case.
-  private static func helperReachable(attempts: Int = 8,
-                                      delayMilliseconds: UInt64 = 600) async -> Bool {
-    let client = HelperXPCClient()
-    for attempt in 0..<attempts {
-      if (try? await client.engineStatus()) != nil { return true }
-      if attempt < attempts - 1 {
-        try? await Task.sleep(nanoseconds: delayMilliseconds * 1_000_000)
-      }
-    }
-    return false
   }
 
   /// Durable launch breadcrumb: proves the app process started, and records the
@@ -366,16 +378,36 @@ struct RatioThinkApp: App {
         .environmentObject(engineClientStore)
         .environmentObject(persistenceStatus)
         .environmentObject(engineStatusStore)
+        .environmentObject(helperHealth)
         .environmentObject(downloadController)
+        .environmentObject(updateAvailability)
         .frame(minWidth: 900, minHeight: 600)
     }
     .modelContainer(chatContainer)
     .defaultSize(width: 1200, height: 800)
     .commands {
-      CommandGroup(replacing: .newItem) {
-        Button("New Chat") {}.keyboardShortcut("n")
-        Button("New Chat (Always)") {}.keyboardShortcut("t")
+      // #411: the MANUAL "Check for Updates…" entry, in the standard macOS
+      // spot (App menu, directly under "About RatioThink"). It always checks
+      // and bypasses the ignore-set, complementing the once-per-launch auto
+      // check that surfaces the non-modal UpdateAvailableBanner (RootView /
+      // UpdateAvailabilityModel). Both compare the running version to the
+      // latest GitHub release and, at most, open the release page — neither
+      // downloads or installs (in-app auto-INSTALL via Sparkle is future #178).
+      CommandGroup(after: .appInfo) {
+        Button("Check for Updates…") {
+          Task { await UpdateChecker.checkForUpdates() }
+        }
       }
+      // #411: remove the two orphaned no-op "New Chat" menu commands
+      // (⌘N / "New Chat (Always)" ⌘T) that had replaced the default
+      // File ▸ New. Both were empty closures — they did nothing, while the
+      // live new-chat affordances drive `ChatCreation.create` directly
+      // (chat-list "+" + col-3 zero-state CTA), never a global menu command.
+      // Replacing `.newItem` with an empty group drops both items and their
+      // ⌘N/⌘T shortcuts, and keeps the default "New Window" suppressed — the
+      // app shares one app-scoped `WindowState`, so a second window is a
+      // half-baked surface.
+      CommandGroup(replacing: .newItem) {}
       CommandGroup(after: .sidebar) {
         Button(windowState.columnVisibility == .all ? "Hide Sidebar" : "Show Sidebar") {
           windowState.toggleSidebar()
