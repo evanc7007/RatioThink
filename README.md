@@ -22,6 +22,22 @@ pass Gatekeeper with no extra steps:
 > xattr -dr com.apple.quarantine /Applications/RatioThink.app
 > ```
 
+## Updating
+
+RatioThink does not auto-install updates yet, but it does **check** for them.
+
+- **On launch**, it makes one request to the public
+  [GitHub Releases](https://github.com/shsym/RatioThink/releases) API and, if a
+  newer release exists, shows a dismissable banner with **Download** (opens the
+  release page) and **Ignore this version** (that version stays hidden until a
+  newer one ships). It stays silent if you're up to date or offline.
+- **Anytime**, choose **RatioThink → Check for Updates…** to check on demand;
+  the menu command always checks and ignores any dismissed versions.
+
+Neither path downloads or installs anything automatically — they compare
+versions and link you to the release. (In-app auto-update via Sparkle is tracked
+as future work.)
+
 ## Build from source
 
 **Prerequisites:** an Apple Silicon Mac (arm64), macOS 14+, Xcode (with command-line tools), [XcodeGen](https://github.com/yonaskolb/XcodeGen)
