@@ -256,7 +256,7 @@ final class EngineStatusStoreTests: XCTestCase {
   func test_transient_transport_loss_holds_last_running_status() async throws {
     let client = StubXPCClient()
     client.setNext(.running(port: 51234, profileID: "chat"))
-    let store = EngineStatusStore(client: client, transportLossEscalation: 3)
+    let store = EngineStatusStore(client: client, tierPolicy: StatusTierPolicy(tier1Polls: 2, tier2Polls: 3))
 
     _ = try await store.refresh()
     XCTAssertEqual(store.baseURL, URL(string: "http://127.0.0.1:51234"))
@@ -279,7 +279,7 @@ final class EngineStatusStoreTests: XCTestCase {
   func test_sustained_transport_loss_escalates_to_engineGone() async throws {
     let client = StubXPCClient()
     client.setNext(.running(port: 51234, profileID: "chat"))
-    let store = EngineStatusStore(client: client, transportLossEscalation: 3)
+    let store = EngineStatusStore(client: client, tierPolicy: StatusTierPolicy(tier1Polls: 2, tier2Polls: 3))
     _ = try await store.refresh()
 
     for _ in 0..<3 {
@@ -304,7 +304,7 @@ final class EngineStatusStoreTests: XCTestCase {
   /// resets the counter, so an intermittent helper never escalates.
   func test_successful_poll_resets_transport_failure_counter() async throws {
     let client = StubXPCClient()
-    let store = EngineStatusStore(client: client, transportLossEscalation: 3)
+    let store = EngineStatusStore(client: client, tierPolicy: StatusTierPolicy(tier1Polls: 2, tier2Polls: 3))
 
     store._applyPollForTesting(next: .running(port: 8080, profileID: "chat"), error: nil)
     store._applyPollForTesting(next: nil, error: "blip")
@@ -345,7 +345,10 @@ final class EngineStatusStoreTests: XCTestCase {
   func test_failed_status_surfaces_in_detail() async throws {
     let client = StubXPCClient()
     client.setNext(.failed(code: .spawnFailed, message: "fork ENOENT"))
-    let store = EngineStatusStore(client: client)
+    // initialStatus `.running` ⇒ wasEverRunning, so a post-run `.spawnFailed`
+    // surfaces at once. (The #2 first-load hold defers a transient failure
+    // ONLY during the very first load — covered by its own tests.)
+    let store = EngineStatusStore(client: client, initialStatus: .running(port: 8080, profileID: "chat"))
     _ = try await store.refresh()
     XCTAssertEqual(store.status, .failed(code: .spawnFailed, message: "fork ENOENT"))
     XCTAssertTrue(store.statusDetail.contains("spawnFailed"),
@@ -410,6 +413,60 @@ final class EngineStatusStoreTests: XCTestCase {
     let elapsed = Date().timeIntervalSince(start)
     XCTAssertFalse(recovered)
     XCTAssertGreaterThanOrEqual(elapsed, 0.25, "no give-up signal → honor the timeout")
+  }
+
+  // MARK: - #2 first-load transient-failure hold
+
+  /// A momentary explicit `.spawnFailed` during a FIRST load (never run,
+  /// still starting) is held as `.starting` and never surfaces if the load
+  /// then succeeds — the #2 "no red flash on a slow load" fix.
+  func test_first_load_holds_transient_spawnFailed_until_running() {
+    let store = EngineStatusStore(client: StubXPCClient(),
+      tierPolicy: StatusTierPolicy(tier1Polls: 2, tier2Polls: 5, firstLoadFailureGracePolls: 3))
+    store._applyPollForTesting(next: .failed(code: .spawnFailed, message: "engine exited early"), error: nil)
+    store._applyPollForTesting(next: .failed(code: .spawnFailed, message: "engine exited early"), error: nil)
+    XCTAssertEqual(store.status, .starting, "a transient first-load .spawnFailed must read as Starting…, not error")
+    store._applyPollForTesting(next: .running(port: 8080, profileID: "chat"), error: nil)
+    XCTAssertEqual(store.status, .running(port: 8080, profileID: "chat"))
+    XCTAssertTrue(store.wasEverRunning)
+  }
+
+  /// A genuinely persistent first-load failure still surfaces after the grace.
+  func test_first_load_surfaces_persistent_spawnFailed_after_grace() {
+    let store = EngineStatusStore(client: StubXPCClient(),
+      tierPolicy: StatusTierPolicy(tier1Polls: 2, tier2Polls: 5, firstLoadFailureGracePolls: 3))
+    for _ in 0..<3 {
+      store._applyPollForTesting(next: .failed(code: .spawnFailed, message: "real spawn failure"), error: nil)
+    }
+    guard case .failed(.spawnFailed, _) = store.status else {
+      return XCTFail("a persistent .spawnFailed must surface after the grace; got \(store.status)")
+    }
+  }
+
+  /// Once the engine has run, a `.spawnFailed` is a real failure — surfaced
+  /// immediately, never held (the hold is first-load only).
+  func test_hold_does_not_apply_once_engine_has_run() {
+    let store = EngineStatusStore(client: StubXPCClient(),
+      tierPolicy: StatusTierPolicy(tier1Polls: 2, tier2Polls: 5, firstLoadFailureGracePolls: 3))
+    store._applyPollForTesting(next: .running(port: 8080, profileID: "chat"), error: nil)
+    XCTAssertTrue(store.wasEverRunning)
+    store._applyPollForTesting(next: .failed(code: .spawnFailed, message: "died"), error: nil)
+    guard case .failed(.spawnFailed, _) = store.status else {
+      return XCTFail("post-run .spawnFailed must not be held; got \(store.status)")
+    }
+  }
+
+  /// The engine-axis recovery count the banner tiers off: increments on
+  /// consecutive `.failed(.engineGone)`, resets on any other status.
+  func test_engineGonePolls_counts_consecutive_engineGone_and_resets() {
+    let store = EngineStatusStore(client: StubXPCClient())
+    store._applyPollForTesting(next: .running(port: 8080, profileID: "chat"), error: nil)
+    XCTAssertEqual(store.engineGonePolls, 0)
+    store._applyPollForTesting(next: .failed(code: .engineGone, message: "exit 1"), error: nil)
+    store._applyPollForTesting(next: .failed(code: .engineGone, message: "exit 1"), error: nil)
+    XCTAssertEqual(store.engineGonePolls, 2)
+    store._applyPollForTesting(next: .running(port: 8080, profileID: "chat"), error: nil)
+    XCTAssertEqual(store.engineGonePolls, 0)
   }
 
   private func waitUntil(
