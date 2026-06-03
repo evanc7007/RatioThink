@@ -56,6 +56,15 @@ public final class EngineStatusStore: ObservableObject {
   /// banner must re-render to hide itself when it flips.
   @Published public private(set) var acknowledgedEngineFailureSignature: String?
 
+  /// Wall-clock instant the engine most recently entered `.starting`,
+  /// or `nil` when not starting. Drives the indicator's honest
+  /// "Starting… (elapsed Ns)" copy (#1) via a view-local timer: the
+  /// store stamps the instant on the transition INTO `.starting` and
+  /// clears it on any other state, so it publishes only on transitions
+  /// (never once per poll — preserves the #327 no-per-second-churn rule
+  /// that keeps the status popover from flapping).
+  @Published public private(set) var startingSince: Date?
+
   /// `URL(string: "http://127.0.0.1:<port>")` while running, else
   /// `nil`. Computed live off `status` so the SwiftUI dependency
   /// graph re-evaluates dependent views when status flips.
@@ -71,14 +80,40 @@ public final class EngineStatusStore: ObservableObject {
   private var task: Task<Void, Never>?
   private nonisolated static let log = Logger(subsystem: "com.ratiothink.app", category: "engine-status")
 
+  /// Wall-clock source, injectable so a test can stamp `startingSince`
+  /// deterministically. Defaults to `Date()` (production + existing
+  /// callers unaffected).
+  private let now: @Sendable () -> Date
+
+  /// Consecutive `engineStatus()` polls that FAILED at the transport
+  /// layer (helper unreachable / reply timeout). Reset to 0 on the first
+  /// successful poll. Once it reaches `transportLossEscalation` the store
+  /// synthesizes `.failed(.engineGone)` (#5a) so a vanished/wedged helper
+  /// surfaces a real, recoverable error instead of an honest-but-stuck
+  /// `.starting`.
+  private var consecutiveFailures = 0
+
+  /// How many consecutive failed polls escalate a transport loss to
+  /// `.failed(.engineGone)`. At the 1 Hz default that is ~5 s of
+  /// sustained unreachability — long enough to ride out the ~1–3 s
+  /// on-demand Helper respawn or one slow `engineStatus` reply during a
+  /// heavy model load (anti-flap, #1), short enough to stay responsive.
+  /// Injectable so a test can drive the boundary without sleeping.
+  private let transportLossEscalation: Int
+
   public init(
     client: any AppXPCClient,
     pollInterval: TimeInterval = 1.0,
-    initialStatus: EngineStatus = .starting
+    initialStatus: EngineStatus = .starting,
+    transportLossEscalation: Int = 5,
+    now: @escaping @Sendable () -> Date = { Date() }
   ) {
     self.client = client
     self.pollInterval = pollInterval
+    self.transportLossEscalation = max(1, transportLossEscalation)
+    self.now = now
     self.status = initialStatus
+    if case .starting = initialStatus { self.startingSince = now() }
   }
 
   /// Begin the background poll loop. Idempotent — re-entry while a
@@ -284,14 +319,65 @@ public final class EngineStatusStore: ObservableObject {
   }
 
   private func apply(next: EngineStatus?, error: String?) {
-    if let next, self.status != next {
-      self.status = next
-    } else if next == nil, error != nil, case .running = self.status {
-      self.status = .starting
-    }
-    if self.lastError != error {
-      self.lastError = error
+    if let next {
+      // Successful poll — the helper answered. Clear the transport-loss
+      // counter and mirror the reported status verbatim.
+      consecutiveFailures = 0
+      setStatusAndTrackStarting(next)
+      if self.lastError != nil { self.lastError = nil }
+    } else {
+      // Failed poll — the helper did not answer (unreachable / reply
+      // timeout). A single blip is NOT a failure: the on-demand Helper
+      // respawn takes ~1–3 s and a heavy model load can momentarily delay
+      // one `engineStatus` reply. Hold the LAST known status (anti-flap,
+      // #1) and escalate only once the loss is SUSTAINED.
+      consecutiveFailures += 1
+      if consecutiveFailures >= transportLossEscalation {
+        // #5a: sustained transport loss → synthesize the recoverable
+        // `.failed(.engineGone)` the rest of the app already understands
+        // (red indicator + banner, chat-send retry via `requireBaseURL`,
+        // gate `.engineFailed`) instead of sticking at `.starting`
+        // forever. Synthesize once and hold so a continuing outage does
+        // not re-publish a fresh message every poll.
+        if !isEngineGone(self.status) {
+          let cause = error.flatMap { $0.isEmpty ? nil : $0 } ?? "no response from the engine helper"
+          setStatusAndTrackStarting(.failed(
+            code: .engineGone,
+            message: "Can’t reach the engine — it stopped responding (\(cause)). Use Restart Engine to reconnect."
+          ))
+        }
+        if self.lastError != nil { self.lastError = nil }
+      }
+      // else: transient — keep current status, keep `startingSince`, and
+      // do NOT surface `lastError`, so a slow-but-normal start reads as a
+      // calm "Starting…" rather than a fault at the ~2 s reply-timeout (#1).
     }
     pollCount &+= 1
+  }
+
+  /// Assign `status` (change-guarded) and maintain `startingSince` so the
+  /// indicator can render a live elapsed counter while the engine starts.
+  private func setStatusAndTrackStarting(_ next: EngineStatus) {
+    if self.status != next { self.status = next }
+    if case .starting = next {
+      if self.startingSince == nil { self.startingSince = now() }
+    } else if self.startingSince != nil {
+      self.startingSince = nil
+    }
+  }
+
+  private func isEngineGone(_ status: EngineStatus) -> Bool {
+    if case .failed(.engineGone, _) = status { return true }
+    return false
+  }
+
+  /// Test seam: drive the poll-apply reducer directly, exactly as the
+  /// 1 Hz loop's `refreshOnce` does per tick (`next` on success, `nil` +
+  /// `error` on a transport failure). Lets the anti-flap / escalation /
+  /// `startingSince` logic be pinned deterministically without sleeping
+  /// on the real poll loop. `internal` (RatioThinkCoreTests imports
+  /// `@testable`); never reached by production code.
+  internal func _applyPollForTesting(next: EngineStatus?, error: String?) {
+    apply(next: next, error: error)
   }
 }

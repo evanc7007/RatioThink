@@ -48,7 +48,17 @@ struct ModelLoadIndicator: View {
       showPopover.toggle()
     } label: {
       HStack(spacing: 5) {
-        if let prefix = Self.pipLabel(for: state) {
+        if case .starting = state {
+          // #1: a starting engine reads honestly as "Starting… (Ns)" with
+          // a live elapsed counter — never a fault, even on a slow boot.
+          // The amber dot stays; this replaces the previously-bare
+          // starting pip so a long start is visibly progressing, not
+          // stuck. Driven by a view-local TimelineView off the store's
+          // `startingSince`, so it never adds a per-second @Published
+          // churn source (the #327 popover-stability rule).
+          StartingElapsedLabel(since: engineStatus.startingSince)
+            .frame(maxWidth: 200, alignment: .trailing)
+        } else if let prefix = Self.pipLabel(for: state) {
           HStack(spacing: 0) {
             // Cap width + middle-truncate so a long HF-style leaf can't
             // render unbounded and crowd other toolbar items.
@@ -750,6 +760,41 @@ struct ModelLoadPopover: View {
       return String(format: "%.2f GB", mb / 1024.0)
     }
     return String(format: "%.0f MB", mb)
+  }
+}
+
+/// #1: honest "Starting… (Ns)" pip label. The engine-start path used to
+/// render a bare amber dot whose tooltip flipped to "Helper unreachable: …"
+/// the instant a single status poll hit the 2 s reply timeout, so a normal
+/// slow boot read as a fault. This shows a calm, live elapsed counter
+/// instead — `EngineStatusStore` now escalates to a real `.failed(.engineGone)`
+/// only on SUSTAINED transport loss, so reaching this view always means a
+/// genuine in-progress start. Driven by `TimelineView(.periodic)` so the
+/// tick is a deterministic function of `Date` whose lifetime ends with the
+/// view (matching the indeterminate-arc / ellipsis rationale) — never a
+/// per-second `@Published` source.
+private struct StartingElapsedLabel: View {
+  let since: Date?
+
+  var body: some View {
+    TimelineView(.periodic(from: .now, by: 1)) { context in
+      Text(Self.text(since: since, now: context.date))
+        .monospacedDigit()
+        .lineLimit(1)
+        .truncationMode(.middle)
+        .font(.callout)
+        .foregroundStyle(.secondary)
+    }
+    .accessibilityIdentifier("toolbar.modelLoadIndicator.starting")
+  }
+
+  /// Pure formatter so the copy is unit-testable without a view host.
+  /// `nil`/future `since` (clock skew) collapses to the bare "Starting…".
+  static func text(since: Date?, now: Date) -> String {
+    guard let since else { return "Starting…" }
+    let elapsed = Int(now.timeIntervalSince(since))
+    guard elapsed >= 1 else { return "Starting…" }
+    return "Starting… (\(elapsed)s)"
   }
 }
 
