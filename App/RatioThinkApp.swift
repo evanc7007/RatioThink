@@ -36,6 +36,10 @@ struct RatioThinkApp: App {
   @StateObject private var profileStore: ProfileStore
   @StateObject private var swapCoordinator: ProfileSwapCoordinator
   @StateObject private var engineStatusStore: EngineStatusStore
+  /// #412: App-side background-helper health + restart ladder. Driven by the
+  /// same `engineStatus()` poll as `engineStatusStore` (via `onPollOutcome`)
+  /// and surfaced as the toolbar helper-ring + the escalation banner.
+  @StateObject private var helperHealth: HelperHealthController
   @StateObject private var engineClientStore: EngineClientStore
   /// Phase 3.8 (review v2 F1): the Add Model sheet's `.queueDownload`
   /// outcome runs through this controller so the existing
@@ -150,6 +154,30 @@ struct RatioThinkApp: App {
     _persistenceStatus = StateObject(wrappedValue: status)
     chatContainer = RatioThinkModelContainer.openWithFallback(status: status)
 
+    // #412: App-side helper-health restart ladder. The repair runs the
+    // runtime registration reconcile; a test/automation launch gets a no-op
+    // repair so a GUI run never mutates the real machine's SMAppService
+    // background-item registration (same guard the launch reconcile uses).
+    let helperRepair: () async -> Bool
+    if HelperRegistrationReconciler.isTestLaunch(ProcessInfo.processInfo.environment) {
+      helperRepair = { false }
+    } else {
+      helperRepair = { await HelperRegistrationRepair().repairAndReportReachable() }
+    }
+    let helperHealthController = HelperHealthController(repair: helperRepair)
+    // Drive the ladder from the SAME poll the status mirror runs — no second
+    // XPC surface. Set BEFORE statusStore.start() so the first ticks count.
+    statusStore.onPollOutcome = { [weak helperHealthController] succeeded in
+      helperHealthController?.ingestPollOutcome(succeeded: succeeded)
+    }
+    // #412 review F1: let the chat recovery wait bound itself by the ladder
+    // outcome (give up the moment the ladder hits .unreachable) instead of a
+    // fixed timeout chosen out of sync with the ladder cadence.
+    statusStore.helperHealthProvider = { [weak helperHealthController] in
+      helperHealthController?.health
+    }
+    _helperHealth = StateObject(wrappedValue: helperHealthController)
+
     // Kick the XPC poll loop. Idempotent + cheap — first reply lands
     // within ~one runloop tick when the helper is registered, longer
     // when launchd has not yet published the mach service.
@@ -239,36 +267,17 @@ struct RatioThinkApp: App {
       return
     }
 
-    let registrar = SMAppServiceLoginItemRegistrar()
-    let reconciler = HelperRegistrationReconciler(
-      probeReachable: { await Self.helperReachable() },
-      currentState: { registrar.status.reconcilerState },
-      register: { try registrar.register().reconcilerState },
-      unregister: { try registrar.unregister() }
-    )
-    let outcome = await reconciler.reconcile()
+    // #412: the reconcile is now the shared `HelperRegistrationRepair`
+    // primitive so the launch-time self-heal, the runtime
+    // `HelperHealthController` restart ladder, and the user's "Restart
+    // helper" action all go through one wiring.
+    let outcome = await HelperRegistrationRepair().reconcile()
     NSLog("RatioThinkHelper registration reconcile: \(outcome)")
     Diag.app.event("helper.reconcile", [("outcome", "\(outcome)")])
-    if case .needsApproval = outcome {
+    if outcome.requiresUserApproval {
       // Hard macOS consent gate — route the user to the toggle.
       SMAppService.openSystemSettingsLoginItems()
     }
-  }
-
-  /// Returns true as soon as the Helper answers an `engineStatus()` XPC
-  /// call, retrying over a bounded window so a just-launched (or
-  /// just-reloaded) on-demand Helper has time to publish its mach
-  /// service. ~5s worst case.
-  private static func helperReachable(attempts: Int = 8,
-                                      delayMilliseconds: UInt64 = 600) async -> Bool {
-    let client = HelperXPCClient()
-    for attempt in 0..<attempts {
-      if (try? await client.engineStatus()) != nil { return true }
-      if attempt < attempts - 1 {
-        try? await Task.sleep(nanoseconds: delayMilliseconds * 1_000_000)
-      }
-    }
-    return false
   }
 
   /// Durable launch breadcrumb: proves the app process started, and records the
@@ -329,6 +338,7 @@ struct RatioThinkApp: App {
         .environmentObject(engineClientStore)
         .environmentObject(persistenceStatus)
         .environmentObject(engineStatusStore)
+        .environmentObject(helperHealth)
         .environmentObject(downloadController)
         .frame(minWidth: 900, minHeight: 600)
     }

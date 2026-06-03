@@ -131,6 +131,21 @@ public final class EngineStatusStore: ObservableObject {
     return next
   }
 
+  /// Force one poll, recording BOTH outcomes into `status`/`lastError` (unlike
+  /// `refresh()`, which rethrows on failure WITHOUT recording — see its
+  /// asymmetry note). Used by `ChatRecoveryGate.refreshStatus()` so the chat
+  /// classifier's `isHelperUnreachable`/`isEngineGone` reflect the forced
+  /// probe, catching a sub-second mid-stream helper/engine death the 1Hz
+  /// background loop missed (#393). Also feeds the helper-health ladder via
+  /// `onPollOutcome` (a forced-poll failure is a real reachability signal).
+  func pollRecordingOutcome() async {
+    do {
+      apply(next: try await client.engineStatus(), error: nil)
+    } catch {
+      apply(next: nil, error: String(describing: error))
+    }
+  }
+
   ///  Unload: ask the helper to stop the running engine, freeing the
   /// resident model's RAM. Throws on rejection / transport failure so
   /// the caller keeps the resident-model state when the stop did not
@@ -147,6 +162,26 @@ public final class EngineStatusStore: ObservableObject {
   var onMemoryPollError: (String) -> Void = { message in
     EngineStatusStore.log.error("engineMemory poll failed: \(message, privacy: .public)")
   }
+
+  /// #412: invoked once per `engineStatus()` poll resolution with the
+  /// outcome — `true` when the XPC call returned a value (helper reachable),
+  /// `false` when it threw a transport error. The App wires this to
+  /// `HelperHealthController.ingestPollOutcome` so the helper-restart ladder
+  /// is driven by the SAME poll the status mirror already runs — no second
+  /// XPC surface. Default no-op (mirrors `onMemoryPollError`). Not
+  /// `@Published`: it is an effect hook fired from `apply` on the main actor,
+  /// never a SwiftUI dependency. `@MainActor` so the wired closure can call
+  /// the `@MainActor` controller synchronously.
+  @MainActor public var onPollOutcome: (Bool) -> Void = { _ in }
+
+  /// #412 review F1: source of the App's helper-restart ladder state, so the
+  /// chat recovery wait can be bounded by the LADDER OUTCOME (`.unreachable`
+  /// ⇒ give up now) rather than a fixed timeout chosen out of sync with the
+  /// ladder cadence. Wired by RatioThinkApp to read `HelperHealthController`;
+  /// the default `nil` keeps the engine-gone path + tests on prior behavior.
+  /// `@MainActor` so `helperRecoveryGaveUp` can read it synchronously from the
+  /// main-actor recovery wait.
+  @MainActor public var helperHealthProvider: () -> HelperHealth? = { nil }
 
   /// On-demand engine resident-memory readout for the status popover.
   /// Forwards to the XPC client; on a transport error it returns nil to
@@ -293,5 +328,12 @@ public final class EngineStatusStore: ObservableObject {
       self.lastError = error
     }
     pollCount &+= 1
+    // #412: feed the helper-health ladder. `error == nil` ⟺ the poll
+    // returned an EngineStatus (helper reachable); a non-nil error is a
+    // transport failure (helper unreachable). Both the background loop's
+    // success and failure paths flow through `apply`, so the ladder sees
+    // every tick. Fired last so observers of `status`/`lastError` settle
+    // first.
+    onPollOutcome(error == nil)
   }
 }

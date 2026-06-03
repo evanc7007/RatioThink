@@ -263,6 +263,59 @@ final class EngineDeathRecoveryTests: XCTestCase {
     token.cancel()
   }
 
+  // MARK: - 4b. User Pause out of engineGone clears the attempt ladder (#394)
+
+  func test_userPause_outOfEngineGone_clearsAutoRelaunchAttempts() async throws {
+    // #394: a user Pause out of `.failed(.engineGone)` is an explicit
+    // "off". The recorded death-attempt history must reset so a later
+    // Resume starts the slow-flap ladder fresh — otherwise a
+    // Pause → Resume → quick-death prematurely exhausts the cap, since the
+    // healthy-uptime re-arm needs `healthyUptimeThreshold` of sustained
+    // `.running` the paused user never reaches. `stop()` already cancels
+    // the pending backoff Task (case 4); this pins that it ALSO clears the
+    // attempt timestamps.
+    let launcher: PieEngineHost.LauncherCall = { _ in
+      (port: EnginePort(60095), session: OneShotDeathSession())
+    }
+    let policy = PieEngineHost.RelaunchPolicy(
+      maxAttempts: 2,
+      window: 60,
+      backoffSchedule: [0.4] // long enough that the Pause lands mid-backoff
+    )
+    let box = WeakHostBox()
+    let spec = makeSpec()
+    let relauncher: PieEngineHost.Relauncher = { [box, spec] in _ = box.host?.start(spec) }
+    let host = PieEngineHost(
+      launcher: launcher,
+      livenessInterval: 0.02,
+      livenessFailureThreshold: 1,
+      relaunchPolicy: policy,
+      relauncher: relauncher
+    )
+    box.host = host
+
+    let gone = expectation(description: ".failed(.engineGone)")
+    var hit = false
+    let token = host.observe { status, _ in
+      if case .failed(.engineGone, _) = status, !hit { hit = true; gone.fulfill() }
+    }
+    _ = host.start(spec)
+    await fulfillment(of: [gone], timeout: 2)
+    // The death recorded one ladder attempt: scheduleAutoRelaunchIfAllowed
+    // appends `now` before it sleeps the backoff.
+    XCTAssertEqual(host.autoRelaunchAttemptsForTesting, 1,
+                   "engine death must record one auto-relaunch attempt before the backoff fires")
+
+    host.stop() // user Pause out of .failed(.engineGone), mid-backoff
+    try await waitUntil("host returns to .stopped after user pause") {
+      if case .stopped = host.status { return true }
+      return false
+    }
+    XCTAssertEqual(host.autoRelaunchAttemptsForTesting, 0,
+                   "#394: a user Pause out of engineGone must clear the recorded attempts so a later Resume starts the cap fresh")
+    token.cancel()
+  }
+
   // MARK: - 5. Auto + user-Resume share HelperResumeAction.run funnel
 
   func test_autoRelaunch_and_userResume_share_HelperResumeAction_funnel() async throws {
@@ -622,6 +675,126 @@ final class EngineDeathRecoveryTests: XCTestCase {
                    "F1: no engine-gone warning may surface in the live transcript")
   }
 
+  // MARK: - 11. Mid-stream HELPER death is recoverable (#393/#412)
+
+  func test_helperUnreachable_midStream_waitsAndRetries() async throws {
+    // A HELPER death mid-stream surfaces as a bare transport error (NOT
+    // `HTTPEngineError.engineGone` — the dead helper can't report engineGone).
+    // The classifier's forced poll finds the helper unreachable
+    // (`isHelperUnreachable`), so the turn must be ridden through recovery:
+    // wait for the App's restart ladder to bring the engine back, then retry —
+    // instead of surfacing a raw transport error. Without the #412 broadening
+    // (isEngineGone OR isHelperUnreachable) the assistant would show the ⚠️
+    // error marker instead of the retried answer.
+    struct TransportBoom: Error {}
+    let container = try RatioThinkModelContainer.makeInMemory()
+    let context = ModelContext(container)
+    let chat = Chat()
+    context.insert(chat)
+    chat.messages.append(Message(role: "user", content: "ping", ts: Date(timeIntervalSinceReferenceDate: 1)))
+    try context.save()
+
+    let engine = ProbingChatEngine(
+      firstError: TransportBoom(),
+      successEvents: [.delta(role: .assistant, content: "ack"), .finish(reason: .stop)]
+    )
+    let gate = ScriptedRecoveryGate(initialGone: false, willRecover: true, initialHelperUnreachable: true)
+    let controller = ChatSendController()
+
+    controller.send(
+      chat: chat,
+      context: context,
+      engine: engine,
+      modelLoadCenter: ModelLoadCenter(),
+      persistenceStatus: PersistenceStatus(),
+      options: ChatSendRequestOptions(modelID: "m1"),
+      recoveryGate: gate
+    )
+
+    try await waitUntil("retry stream completes after helper recovery") { !controller.isInFlight }
+    let assistant = chat.messages.first { $0.role == "assistant" }
+    XCTAssertEqual(assistant?.content, "ack",
+                   "a mid-stream helper death must be ridden through recovery + retried, not surfaced as a transport error")
+    XCTAssertEqual(engine.callCount, 2, "exactly one retry after the helper recovered")
+  }
+
+  // MARK: - 12. Recovery wait budget is sized to the fault's recovery path (#412 F1)
+
+  func test_recoveryWait_budget_matches_fault_recovery_path() async throws {
+    // A HELPER death recovers via the App-side restart ladder (first repair
+    // ~17s+), so the wait must use the larger `helperUnreachableWaitTimeout`;
+    // an ENGINE death recovers via PieEngineHost's faster ladder, so it keeps
+    // the tight `waitForReadyTimeout`. The fixed 15s wait used for both was
+    // too short for the helper-ladder path (review F1).
+    let policy = ChatRecoveryPolicy()  // 15s engine / 45s helper
+
+    func runAndCaptureBudget(gone: Bool, helperUnreachable: Bool) async throws -> TimeInterval? {
+      let container = try RatioThinkModelContainer.makeInMemory()
+      let context = ModelContext(container)
+      let chat = Chat()
+      context.insert(chat)
+      chat.messages.append(Message(role: "user", content: "ping", ts: Date(timeIntervalSinceReferenceDate: 1)))
+      try context.save()
+      struct TransportBoom: Error {}
+      let engine = ProbingChatEngine(
+        firstError: gone ? HTTPEngineError.engineGone(detail: "x") : TransportBoom(),
+        successEvents: [.delta(role: .assistant, content: "ack"), .finish(reason: .stop)]
+      )
+      let gate = ScriptedRecoveryGate(initialGone: gone, willRecover: true, initialHelperUnreachable: helperUnreachable)
+      let controller = ChatSendController()
+      controller.send(chat: chat, context: context, engine: engine,
+                      modelLoadCenter: ModelLoadCenter(), persistenceStatus: PersistenceStatus(),
+                      options: ChatSendRequestOptions(modelID: "m1"),
+                      recoveryGate: gate, recoveryPolicy: policy)
+      try await waitUntil("retry settles") { !controller.isInFlight }
+      return gate.lastWaitTimeout
+    }
+
+    let helperBudget = try await runAndCaptureBudget(gone: false, helperUnreachable: true)
+    XCTAssertEqual(helperBudget, policy.helperUnreachableWaitTimeout,
+                   "helper-death branch must use the larger ladder-sized budget")
+    let engineBudget = try await runAndCaptureBudget(gone: true, helperUnreachable: false)
+    XCTAssertEqual(engineBudget, policy.waitForReadyTimeout,
+                   "engine-death branch must keep the tight engine-relaunch budget")
+  }
+
+  // MARK: - 13. Helper-wait ceiling is policy-derived, not a literal (#412 re-F1)
+
+  func test_helperUnreachableCeiling_covers_worstCase_and_tracks_policy() {
+    let probe = HelperReconcileProbeBudget.seconds
+
+    // (a) The default helper-wait timeout MUST be the derived ceiling — not a
+    // hand-picked literal — and that ceiling MUST cover the ladder's worst-case
+    // time-to-.unreachable, modeled here INDEPENDENTLY of the ceiling formula
+    // (1 Hz cadence; each repair attempt probes reachability ~twice). If the
+    // wait could expire before the ladder escalates, `helperRecoveryGaveUp`
+    // never fires and the raw error surfaces — F1 reborn.
+    let p = HelperHealthPolicy()
+    let worstCaseToUnreachable =
+      TimeInterval(p.transientThreshold)
+      + TimeInterval(p.maxRepairAttempts) * (TimeInterval(p.repairGap) + 2 * probe)
+    let ceiling = ChatRecoveryPolicy.helperUnreachableCeiling(for: p, probeBudget: probe)
+    XCTAssertGreaterThanOrEqual(ceiling, worstCaseToUnreachable,
+      "derived ceiling must cover the ladder's worst-case time-to-.unreachable")
+    XCTAssertEqual(ChatRecoveryPolicy().helperUnreachableWaitTimeout, ceiling,
+      "the shipping default must BE the derived ceiling, not a hand-picked literal")
+
+    // (b) The ceiling tracks the policy: bumping ANY ladder knob (or slowing
+    // the reconcile probe) raises it, so a future retune cannot silently push
+    // recovery past a stale ceiling and re-introduce F1.
+    func ceil(_ policy: HelperHealthPolicy, _ pb: TimeInterval = probe) -> TimeInterval {
+      ChatRecoveryPolicy.helperUnreachableCeiling(for: policy, probeBudget: pb)
+    }
+    XCTAssertGreaterThan(ceil(HelperHealthPolicy(transientThreshold: p.transientThreshold + 6)), ceiling,
+      "larger transientThreshold must raise the ceiling")
+    XCTAssertGreaterThan(ceil(HelperHealthPolicy(maxRepairAttempts: p.maxRepairAttempts + 1)), ceiling,
+      "more repair attempts must raise the ceiling")
+    XCTAssertGreaterThan(ceil(HelperHealthPolicy(repairGap: p.repairGap + 5)), ceiling,
+      "larger repairGap must raise the ceiling")
+    XCTAssertGreaterThan(ceil(p, probe + 5), ceiling,
+      "a slower reconcile probe must raise the ceiling")
+  }
+
   // MARK: - helpers
 
   private func makeSpec(profileID: String = "chat") -> PieControlLauncher.LaunchSpec {
@@ -767,16 +940,25 @@ private final class ReasoningRetryEngine: EngineClient, @unchecked Sendable {
 @MainActor
 private final class ScriptedRecoveryGate: ChatRecoveryGate {
   private var goneFlag: Bool
+  private var unreachableFlag: Bool
   let willRecover: Bool
-  init(initialGone: Bool, willRecover: Bool) {
+  init(initialGone: Bool, willRecover: Bool, initialHelperUnreachable: Bool = false) {
     self.goneFlag = initialGone
+    self.unreachableFlag = initialHelperUnreachable
     self.willRecover = willRecover
   }
   var isEngineGone: Bool { goneFlag }
+  var isHelperUnreachable: Bool { unreachableFlag }
+  var helperRecoveryGaveUp: Bool { false }
+  /// Captures the budget `ChatSendController` chose for the wait, so a test
+  /// can assert the helper-unreachable branch gets the larger ladder budget.
+  private(set) var lastWaitTimeout: TimeInterval?
   func refreshStatus() async {}
   func waitUntilRunning(timeout: TimeInterval) async -> Bool {
+    lastWaitTimeout = timeout
     if willRecover {
       goneFlag = false
+      unreachableFlag = false
       return true
     }
     return false
@@ -794,6 +976,8 @@ private final class ParkingRecoveryGate: ChatRecoveryGate {
   private let onEntered: () -> Void
   init(onEntered: @escaping () -> Void) { self.onEntered = onEntered }
   var isEngineGone: Bool { true }
+  var isHelperUnreachable: Bool { false }
+  var helperRecoveryGaveUp: Bool { false }
   func refreshStatus() async {}
   func waitUntilRunning(timeout: TimeInterval) async -> Bool {
     onEntered()

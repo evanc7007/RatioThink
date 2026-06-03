@@ -153,12 +153,12 @@ public final class ChatSendController: ObservableObject {
             return
           }
 
-          let isEngineGoneFault = await Self.classifyEngineGone(
+          let isRecoverableFault = await Self.classifyRecoverable(
             error: error,
             gate: recoveryGate
           )
           guard attemptsRemaining > 0,
-                isEngineGoneFault,
+                isRecoverableFault,
                 let gate = recoveryGate else {
             writer?.cancel()
             // Re-check generation after the `await classifyEngineGone`
@@ -172,11 +172,18 @@ public final class ChatSendController: ObservableObject {
             return
           }
 
-          // Wait for the helper's auto-relaunch ladder to bring the
-          // engine back. If it doesn't recover inside the policy window,
-          // surface the original engine-gone error rather than a generic
-          // timeout so the assistant bubble shows what actually happened.
-          let recovered = await gate.waitUntilRunning(timeout: recoveryPolicy.waitForReadyTimeout)
+          // Wait for recovery to bring the engine back. The budget is sized
+          // to the fault's recovery path (review F1): a HELPER death recovers
+          // via the App-side restart ladder (first repair ~17s+), so it gets
+          // the larger `helperUnreachableWaitTimeout`; an ENGINE death recovers
+          // via PieEngineHost's faster relaunch ladder, so it keeps the tight
+          // `waitForReadyTimeout`. Either wait early-exits the moment the
+          // helper ladder gives up. If recovery doesn't land in budget, surface
+          // the original error so the bubble shows what actually happened.
+          let waitBudget = gate.isHelperUnreachable
+            ? recoveryPolicy.helperUnreachableWaitTimeout
+            : recoveryPolicy.waitForReadyTimeout
+          let recovered = await gate.waitUntilRunning(timeout: waitBudget)
           guard recovered else {
             writer?.cancel()
             // Re-check generation after the `await waitUntilRunning`
@@ -241,23 +248,29 @@ public final class ChatSendController: ObservableObject {
     isInFlight = false
   }
 
-  /// True when `error` should be classified as engine-death by the
-  /// retry path. Two channels:
+  /// True when `error` should be ridden through recovery (wait for the engine
+  /// to come back, then retry the turn) rather than surfaced immediately.
+  /// Channels:
   ///  · `HTTPEngineError.engineGone` thrown synchronously by
   ///    `baseURLProvider` when the cached status is already
-  ///    `.failed(.engineGone)` — the post-poll case.
-  ///  · A streaming throw (URLError, `.http`, `.stream`, …) that races
-  ///    ahead of the poll: force a fresh helper poll and re-check the
-  ///    cached status. This catches the mid-stream death case where the
-  ///    chat fails before the 1Hz background poll has seen the new state.
-  private static func classifyEngineGone(
+  ///    `.failed(.engineGone)` — the post-poll engine-death case.
+  ///  · A streaming throw (URLError, `.http`, `.stream`, …) that races ahead
+  ///    of the 1Hz poll: force a fresh helper poll and re-check. The retried
+  ///    classification covers BOTH (a) the engine died with a live helper
+  ///    (`isEngineGone`), and (b) the HELPER itself died mid-stream
+  ///    (`isHelperUnreachable`) — the App's helper-restart ladder will bring
+  ///    it back, so the turn waits for `.running` and retries instead of
+  ///    surfacing a raw transport error (#393/#412). A non-death fault leaves
+  ///    a reachable helper reporting a non-gone state, so neither flag trips
+  ///    and the error surfaces normally.
+  private static func classifyRecoverable(
     error: Error,
     gate: ChatRecoveryGate?
   ) async -> Bool {
     if case HTTPEngineError.engineGone = error { return true }
     guard let gate else { return false }
     await gate.refreshStatus()
-    return gate.isEngineGone
+    return gate.isEngineGone || gate.isHelperUnreachable
   }
 
   private static func makeRequest(chat: Chat, options: ChatSendRequestOptions) -> ChatRequest {
@@ -379,15 +392,52 @@ public struct ChatRecoveryPolicy: Equatable, Sendable {
   /// entirely (no second pass); `2` (the default) is "initial + one
   /// retry".
   public var maxAttempts: Int
-  /// How long to wait for `recoveryGate.waitUntilRunning(timeout:)` to
-  /// report `.running` again after classifying engine-gone. Picked so
-  /// the helper can ride through its full ladder (2 × 1–2s backoff +
-  /// handshake) without timing out from under us.
+  /// How long to wait for `.running` again after classifying ENGINE-gone
+  /// (helper alive). Sized for `PieEngineHost`'s engine-relaunch ladder
+  /// (2 × 1–2s backoff + handshake) — a few seconds.
   public var waitForReadyTimeout: TimeInterval
 
-  public init(maxAttempts: Int = 2, waitForReadyTimeout: TimeInterval = 15) {
+  /// How long to wait when the fault is a HELPER death (`isHelperUnreachable`).
+  /// Larger than `waitForReadyTimeout` because the App-side helper-restart
+  /// ladder only restores reachability after several poll cycles plus reconcile
+  /// probes (well past the engine-relaunch budget — review F1). NOT a
+  /// hand-picked literal: the default is DERIVED from `HelperHealthPolicy` +
+  /// the reconcile probe budget via `helperUnreachableCeiling(for:probeBudget:)`,
+  /// so a ladder-policy retune cannot silently push recovery past a stale
+  /// ceiling and re-introduce F1 (re-F1, TD2 pt4). The wait ALSO early-exits the
+  /// instant the ladder gives up (`helperRecoveryGaveUp`), so this is an upper
+  /// backstop, not a delay the user always pays.
+  public var helperUnreachableWaitTimeout: TimeInterval
+
+  public init(maxAttempts: Int = 2,
+              waitForReadyTimeout: TimeInterval = 15,
+              helperUnreachableWaitTimeout: TimeInterval =
+                ChatRecoveryPolicy.helperUnreachableCeiling(
+                  for: HelperHealthPolicy(),
+                  probeBudget: HelperReconcileProbeBudget.seconds)) {
     self.maxAttempts = maxAttempts
     self.waitForReadyTimeout = waitForReadyTimeout
+    self.helperUnreachableWaitTimeout = helperUnreachableWaitTimeout
+  }
+
+  /// Upper bound on how long to wait for the App-side helper-restart ladder to
+  /// either recover the engine or escalate to `.unreachable` — DERIVED from the
+  /// ladder policy so it tracks any retune instead of drifting (#412 re-F1,
+  /// TD2 pt4). At the 1 Hz poll cadence `transientThreshold`/`repairGap` are
+  /// seconds; each repair attempt runs the reconcile, which probes reachability
+  /// ~twice (pre-unregister + post-register), so an attempt costs
+  /// `repairGap + 2 × probeBudget`. `margin` covers scheduling slack.
+  /// Overestimates safely: a too-large backstop only delays a give-up the
+  /// `.unreachable` early-exit already short-circuits.
+  public static func helperUnreachableCeiling(
+    for policy: HelperHealthPolicy,
+    probeBudget: TimeInterval,
+    margin: TimeInterval = 8
+  ) -> TimeInterval {
+    let pollSecond: TimeInterval = 1   // the HelperHealthController ladder is poll-clocked at 1 Hz
+    let transient = TimeInterval(policy.transientThreshold) * pollSecond
+    let perAttempt = TimeInterval(policy.repairGap) * pollSecond + 2 * probeBudget
+    return transient + TimeInterval(policy.maxRepairAttempts) * perAttempt + margin
   }
 
   public static let `default` = ChatRecoveryPolicy()
