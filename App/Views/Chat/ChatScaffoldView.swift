@@ -110,6 +110,30 @@ struct ChatScaffoldView: View {
     showNoModelPrompt = true
   }
 
+  /// #4: closes after the engine status FIRST settles this launch, so the
+  /// launch prompt is evaluated exactly once and a later mid-session stop
+  /// never re-pops it. Process-scoped (static) — resets every launch, so
+  /// the app ALWAYS asks once per launch.
+  @MainActor private static var didEvaluateLaunchStartPrompt = false
+
+  /// #4: the engine no longer auto-starts on boot (see
+  /// `HelperMain.autoResumeEngineOnBoot`). Once the status settles, if the
+  /// engine is idle with a default model, proactively raise the existing
+  /// no-model prompt — whose Load action starts the engine — so the user
+  /// explicitly confirms the start instead of it happening silently. The
+  /// initial `.starting` placeholder is skipped so we evaluate the real
+  /// post-launch state, not the "reachability unknown" default.
+  private func maybePromptEngineStartOnLaunch() {
+    guard !Self.didEvaluateLaunchStartPrompt else { return }
+    if case .starting = engineStatusStore.status { return }
+    Self.didEvaluateLaunchStartPrompt = true
+    if LaunchEngineStartPrompt.shouldAsk(
+        status: engineStatusStore.status,
+        profileDefault: selectedProfileDefault) {
+      showNoModelPrompt = true
+    }
+  }
+
   /// True when the slug's app-staged model file exists — the engine's
   /// primary model source. A miss means the prompt offers Download
   /// instead of Load.
@@ -272,6 +296,9 @@ struct ChatScaffoldView: View {
       // observes the engine in any non-failed state, drop it so a stale
       // action error can't outlive the condition it described.
       if case .failed = new {} else { engineActionError = nil }
+      // #4: the engine no longer auto-starts on boot — once status settles
+      // (.starting → .stopped), proactively ask to start the model.
+      maybePromptEngineStartOnLaunch()
     }
     // #397: auto-dismiss the gate once a model resolves (engine came up
     // and reconciled, or a load completed) so the user lands back at the
@@ -282,6 +309,10 @@ struct ChatScaffoldView: View {
       // Seed the toolbar from the persisted profile so the menu
       // label matches what the chat was created with.
       viewModel.selectedProfileID = chat.profileID
+      // #4: covers the case where the engine status already settled before
+      // this view appeared (no .onChange fires) — evaluate the launch ask
+      // here too; the once-flag keeps it from double-prompting.
+      maybePromptEngineStartOnLaunch()
     }
     .onChange(of: viewModel.selectedProfileID) { _, new in
       // Mirror toolbar swaps back into the persistent chat — the
