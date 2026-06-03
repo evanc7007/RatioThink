@@ -229,7 +229,18 @@ struct RatioThinkApp: App {
   private static func reconcileHelperRegistrationIfNeeded() async {
     guard !didReconcileHelperRegistration else { return }
     didReconcileHelperRegistration = true
+    await performHelperRegistrationReconcile()
+  }
 
+  /// The reconcile body, callable on demand. The launch path guards it
+  /// with `didReconcileHelperRegistration` (run once); the runtime
+  /// "Restart Engine" command (#5b) calls it UNGUARDED to repair a Helper
+  /// that went down / unreachable mid-session. Probes the Helper and,
+  /// only if it is unreachable, forces a launchd reload (`unregister()`
+  /// then `register()`) — which resets a wedged or throttled on-demand
+  /// job, the step that previously required a full app restart.
+  @MainActor
+  private static func performHelperRegistrationReconcile() async {
     // A test/automation launch must NOT construct the real registrar or
     // run SMAppService.unregister()/register() — that mutates the real
     // machine's background-item registration. GUI helpers set only
@@ -252,6 +263,32 @@ struct RatioThinkApp: App {
     if case .needsApproval = outcome {
       // Hard macOS consent gate — route the user to the toggle.
       SMAppService.openSystemSettingsLoginItems()
+    }
+  }
+
+  /// #5b: user-triggered runtime recovery for the "Helper went down /
+  /// unreachable and only a full app restart fixes it" failure. Re-runs
+  /// the registration reconcile (reloads a wedged/throttled launchd job)
+  /// and then re-starts the engine on the active profile — all without
+  /// quitting the app. The honest-status half (#5a) surfaces the failure
+  /// as a recoverable `.failed(.engineGone)`; this is the recovery ACTION
+  /// behind the "Restart Engine" menu command. A `replyTimeout` from a
+  /// slow start is swallowed by `EngineStatusStore.startEngine` — the
+  /// status poll surfaces the real outcome.
+  @MainActor
+  private func restartEngine() {
+    Task {
+      await Self.performHelperRegistrationReconcile()
+      guard let profileID = profileStore.activeProfileID,
+            !profileID.isEmpty else {
+        NSLog("Restart Engine: no active profile to start")
+        return
+      }
+      do {
+        try await engineStatusStore.startEngine(profileID: profileID)
+      } catch {
+        NSLog("Restart Engine: startEngine(\(profileID)) failed: \(error)")
+      }
     }
   }
 
@@ -350,9 +387,14 @@ struct RatioThinkApp: App {
         }
         .keyboardShortcut("l", modifiers: [.command, .option])
       }
-      // #358: user-reachable diagnostics. Runs the bundled
-      // collect-diagnostics.sh and reveals the redacted .zip in Finder.
+      // #5b: runtime recovery for a Helper/engine that went down or
+      // unreachable mid-session — reloads the launchd registration and
+      // re-starts the engine without a full app restart. Always reachable
+      // from the menu even when the in-window UI is wedged.
       CommandGroup(after: .help) {
+        Button("Restart Engine") { restartEngine() }
+        // #358: user-reachable diagnostics. Runs the bundled
+        // collect-diagnostics.sh and reveals the redacted .zip in Finder.
         Button("Collect Diagnostics…") {
           Task { await DiagnosticsCollector.collectAndReveal() }
         }
