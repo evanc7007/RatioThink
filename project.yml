@@ -19,8 +19,8 @@ settings:
     # GENERATE_INFOPLIST_FILE=YES synthesizes CFBundleShortVersionString /
     # CFBundleVersion from these build settings; without them the version
     # keys in each target's info.properties are dropped from the built bundle.
-    MARKETING_VERSION: "0.1.0"
-    CURRENT_PROJECT_VERSION: "1"
+    MARKETING_VERSION: "0.1.1"
+    CURRENT_PROJECT_VERSION: "2"
     ENABLE_HARDENED_RUNTIME: NO
     DEAD_CODE_STRIPPING: YES
   configs:
@@ -164,8 +164,8 @@ targets:
         CFBundleIconFile: AppIcon
         CFBundleName: RatioThink
         CFBundleDisplayName: RatioThink
-        CFBundleShortVersionString: "0.1.0"
-        CFBundleVersion: "1"
+        CFBundleShortVersionString: "0.1.1"
+        CFBundleVersion: "2"
         NSHumanReadableCopyright: "© 2026 RatioThink"
         NSSupportsAutomaticTermination: false
         NSSupportsSuddenTermination: false
@@ -203,8 +203,8 @@ targets:
         CFBundleIdentifier: com.ratiothink.app.helper
         CFBundleName: RatioThinkHelper
         CFBundleDisplayName: RatioThinkHelper
-        CFBundleShortVersionString: "0.1.0"
-        CFBundleVersion: "1"
+        CFBundleShortVersionString: "0.1.1"
+        CFBundleVersion: "2"
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.ratiothink.app.helper
