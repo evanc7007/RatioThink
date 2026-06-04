@@ -749,6 +749,41 @@ async def main() -> int:
                                     f"/v1/chat/completions {field}={value!r} param tag {err!r}"
                                 )
 
+                    # #418 (review F1): out-of-range speculation knobs are
+                    # rejected at the 400 boundary with a nested `param`,
+                    # parallel to the max_tokens over-range case above —
+                    # NOT silently clamped.
+                    for sub, value in [("leader_len", 0), ("draft_len", 99999)]:
+                        r = await http.post(
+                            f"{base}/v1/chat/completions",
+                            json={
+                                "model": model_id,
+                                "messages": [{"role": "user", "content": "hi"}],
+                                "stream": False,
+                                "temperature": 0,
+                                "speculation": {"enabled": True, sub: value},
+                            },
+                        )
+                        print(
+                            f"[harness] POST /v1/chat/completions(speculation.{sub}={value}) "
+                            f"-> {r.status_code}"
+                        )
+                        if r.status_code != 400:
+                            failures.append(
+                                f"/v1/chat/completions speculation.{sub}={value} "
+                                f"status {r.status_code} (expected 400)"
+                            )
+                        else:
+                            try:
+                                err = r.json().get("error", {})
+                            except Exception:
+                                err = {}
+                            if err.get("param") != f"speculation.{sub}":
+                                failures.append(
+                                    f"/v1/chat/completions speculation.{sub}={value} "
+                                    f"param tag {err!r} (expected speculation.{sub})"
+                                )
+
                     # Malformed JSON body → 400.
                     r = await http.post(
                         f"{base}/v1/chat/completions",
@@ -772,6 +807,151 @@ async def main() -> int:
                     if r.status_code != 413:
                         failures.append(
                             f"/v1/chat/completions oversized status {r.status_code}"
+                        )
+
+                    # #418: speculative-decode WIRING smoke. The dummy
+                    # driver is non-deterministic (random tokens even at
+                    # temperature 0), so it CANNOT demonstrate draft
+                    # acceptance or greedy token-equivalence — those are
+                    # proven deterministically by the host unit tests
+                    # (`cargo test`: deterministic accounting +
+                    # `greedy_spec_matches_plain_token_stream`) and by a
+                    # real-model run. Here we assert only what the dummy
+                    # CAN show end-to-end: a `speculation` request returns
+                    # a self-consistent `spec_metrics` block, and a normal
+                    # request stays byte-identical (no `spec_metrics`).
+                    # Results are printed inline (flush) so the evidence
+                    # survives even if a later, unrelated harness step
+                    # aborts before the final summary.
+                    import json as _json418
+                    spec418: list[str] = []
+                    r_spec = await http.post(
+                        f"{base}/v1/chat/completions",
+                        json={
+                            "model": model_id,
+                            "messages": [{"role": "user", "content": "alpha beta gamma"}],
+                            "temperature": 0,
+                            "max_tokens": 16,
+                            "speculation": {"enabled": True},
+                        },
+                    )
+                    print(f"[harness] POST chat(speculation) -> {r_spec.status_code}")
+                    if r_spec.status_code != 200:
+                        spec418.append(f"spec status {r_spec.status_code} (expected 200)")
+                    else:
+                        try:
+                            b_spec = _json418.loads(r_spec.text)
+                        except _json418.JSONDecodeError as e:
+                            spec418.append(f"spec body not json: {e}")
+                            b_spec = None
+                        if b_spec is not None:
+                            sm = b_spec.get("spec_metrics")
+                            if sm is None:
+                                spec418.append(f"spec_metrics missing: {b_spec!r}")
+                            else:
+                                print(f"[harness] spec_metrics={sm}", flush=True)
+                                prop = sm.get("proposed_draft_tokens")
+                                acc = sm.get("accepted_draft_tokens")
+                                rej = sm.get("rejected_draft_tokens")
+                                if None in (prop, acc, rej) or acc + rej != prop:
+                                    spec418.append(f"accounting inconsistent: {sm!r}")
+                                if not sm.get("enabled", False):
+                                    spec418.append(f"enabled=false despite greedy+request: {sm!r}")
+                                if sm.get("decode_steps", 0) <= 0:
+                                    spec418.append(f"no decode steps: {sm!r}")
+                    # Normal request (no speculation field) must NOT carry
+                    # spec_metrics — proves normal responses are unchanged.
+                    r_plain = await http.post(
+                        f"{base}/v1/chat/completions",
+                        json={
+                            "model": model_id,
+                            "messages": [{"role": "user", "content": "alpha beta gamma"}],
+                            "temperature": 0,
+                            "max_tokens": 16,
+                        },
+                    )
+                    if r_plain.status_code == 200:
+                        try:
+                            if _json418.loads(r_plain.text).get("spec_metrics") is not None:
+                                spec418.append(
+                                    "plain response carried spec_metrics without a "
+                                    "speculation request (normal responses must stay "
+                                    "byte-identical)"
+                                )
+                        except _json418.JSONDecodeError:
+                            pass
+                    if spec418:
+                        for f in spec418:
+                            print(f"[harness] #418 FAIL: {f}", flush=True)
+                        failures.extend(f"#418 {f}" for f in spec418)
+                    else:
+                        print("[harness] #418 spec_metrics wiring OK", flush=True)
+                    # Acceptance + greedy token-equivalence need a
+                    # deterministic model; the dummy driver can't provide
+                    # one (covered by host cargo tests + a real-model run).
+                    skipped.append(
+                        "#418 spec acceptance + greedy equivalence (dummy driver is "
+                        "non-deterministic; host cargo tests + real-model smoke cover it)"
+                    )
+
+                    # #418 x tool_choice: speculation gates OFF when a tool
+                    # call is FORCED (the sampler is constrained to the
+                    # tool-call grammar; the drafter must not verify against
+                    # it). A forced request that also enables speculation
+                    # must report spec_metrics.enabled=false with
+                    # fallback_reason="tool_choice_forced".
+                    r = await http.post(
+                        f"{base}/v1/chat/completions",
+                        json={
+                            "model": model_id,
+                            "messages": [{"role": "user", "content": "What is 2+2?"}],
+                            "stream": False,
+                            "temperature": 0,
+                            "tools": [{
+                                "type": "function",
+                                "function": {
+                                    "name": "calculator",
+                                    "description": "Evaluate an arithmetic expression.",
+                                    "parameters": {
+                                        "type": "object",
+                                        "properties": {"expr": {"type": "string"}},
+                                        "required": ["expr"],
+                                    },
+                                },
+                            }],
+                            "tool_choice": "required",
+                            "speculation": {"enabled": True},
+                        },
+                    )
+                    print(
+                        f"[harness] POST chat(forced tool + speculation) -> {r.status_code}"
+                    )
+                    if r.status_code == 200:
+                        try:
+                            sm = _json418.loads(r.text).get("spec_metrics")
+                        except _json418.JSONDecodeError:
+                            sm = None
+                        if sm is None:
+                            failures.append(
+                                f"#418 forced-tool: spec_metrics missing: {r.text[:200]!r}"
+                            )
+                        else:
+                            print(f"[harness] forced-tool spec_metrics={sm}", flush=True)
+                            if sm.get("enabled") is not False:
+                                failures.append(
+                                    f"#418 forced-tool: speculation NOT gated off: {sm!r}"
+                                )
+                            if sm.get("fallback_reason") != "tool_choice_forced":
+                                failures.append(
+                                    f"#418 forced-tool: fallback_reason={sm.get('fallback_reason')!r} "
+                                    f"(expected 'tool_choice_forced')"
+                                )
+                    else:
+                        # A non-200 (e.g. model lacks a native tool grammar)
+                        # doesn't exercise the gate; record explicitly.
+                        skipped.append(
+                            f"#418 forced-tool gate (engine returned {r.status_code}, "
+                            f"not a 200 tool-call body)"
                         )
 
                     # /v1/inferlet messages-precedence: input.messages

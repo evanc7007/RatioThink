@@ -42,19 +42,21 @@
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use inferlet::chat;
 use inferlet::Context;
 use inferlet::GrammarConstraint;
 use inferlet::model::Model;
 use inferlet::runtime;
-use inferlet::sample::Sampler;
 use serde::{Deserialize, Serialize};
 use wstd::http::body::IncomingBody;
 use wstd::http::server::{Finished, Responder};
 use wstd::http::{IntoBody, Request, Response};
 
 use super::apc::{ReasoningDecoder, ToolUseDecoder};
+use super::generate::{self, DecodeStrategy};
+use super::spec::{SpecConfig, SpecMetrics};
 use crate::sse::{self, EmitError, Emitter, SseError};
 
 // =============================================================================
@@ -134,6 +136,15 @@ const MAX_TOP_P: f32 = 1.0;
 /// reply length.
 const MAX_MAX_TOKENS: usize = 8192;
 
+/// Inclusive bounds on the #418 speculation knobs. Out-of-range values
+/// are rejected at the 400 boundary (see `validate_sampling`), mirroring
+/// the `max_tokens` contract; `SpecRequest::to_config`'s `.clamp` then
+/// stays only as a redundant safety net.
+const MIN_LEADER_LEN: usize = 1;
+const MAX_LEADER_LEN: usize = 8;
+const MIN_DRAFT_LEN: usize = 1;
+const MAX_DRAFT_LEN: usize = 16;
+
 // =============================================================================
 // Request schema
 // =============================================================================
@@ -158,6 +169,42 @@ pub struct ChatCompletionsRequest {
     #[serde(default)]
     #[allow(dead_code)]
     pub tool_choice: Option<serde_json::Value>,
+    /// chat-apc extension: opt-in linear Cacheback speculative decoding.
+    /// Absent → normal decode, byte-identical to pre-speculation
+    /// behavior. Present → the `spec_metrics` block is returned and,
+    /// when `enabled` + greedy (`temperature == 0`), drafting engages.
+    #[serde(default)]
+    pub speculation: Option<SpecRequest>,
+}
+
+/// Request-side speculation knobs (chat-apc extension). Dimensions
+/// default to the paper-optimal LL=1 / FL=3 and are clamped to safe
+/// bounds. See [`super::spec`].
+#[derive(Deserialize, Clone)]
+pub struct SpecRequest {
+    #[serde(default)]
+    pub enabled: bool,
+    pub leader_len: Option<usize>,
+    pub draft_len: Option<usize>,
+}
+
+impl SpecRequest {
+    fn to_config(&self) -> SpecConfig {
+        let d = SpecConfig::default();
+        SpecConfig {
+            // Redundant safety net: `validate_sampling` already rejects
+            // out-of-range values at the 400 boundary before this runs.
+            leader_len: self
+                .leader_len
+                .unwrap_or(d.leader_len)
+                .clamp(MIN_LEADER_LEN, MAX_LEADER_LEN),
+            draft_len: self
+                .draft_len
+                .unwrap_or(d.draft_len)
+                .clamp(MIN_DRAFT_LEN, MAX_DRAFT_LEN),
+            ..d
+        }
+    }
 }
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -262,6 +309,150 @@ struct ChatCompletion<'a> {
     /// doc + ). Skipped from serialization when empty.
     #[serde(skip_serializing_if = "Option::is_none")]
     warnings: Option<Vec<NonStreamWarning<'a>>>,
+    /// chat-apc extension: speculative-decode metrics. Present only when
+    /// the request included a `speculation` block, so normal responses
+    /// stay byte-identical. Carries draft accounting + throughput, plus
+    /// `fallback_reason` when speculation was requested but inactive.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    spec_metrics: Option<SpecMetricsReport>,
+}
+
+// =============================================================================
+// Speculative-decode metrics (ticket #418)
+// =============================================================================
+
+/// Structured speculation metrics, emitted on the non-stream response as
+/// `spec_metrics` and on the SSE stream as a terminal `spec_metrics`
+/// frame. `generated_tokens` / `decode_steps` / throughput are measured
+/// by the transport loop; the draft accounting comes from the drafter's
+/// shared [`SpecMetrics`].
+#[derive(Serialize)]
+struct SpecMetricsReport {
+    /// Whether drafting actually engaged this turn.
+    enabled: bool,
+    /// Why speculation did not engage despite being requested
+    /// (`disabled`, `non_greedy_sampling`); `None` when it engaged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fallback_reason: Option<&'static str>,
+    generated_tokens: usize,
+    decode_steps: usize,
+    proposed_draft_tokens: usize,
+    accepted_draft_tokens: usize,
+    rejected_draft_tokens: usize,
+    avg_tokens_per_step: f64,
+    decode_tokens_per_sec: f64,
+    leader_len: usize,
+    draft_len: usize,
+}
+
+impl SpecMetricsReport {
+    fn build(
+        enabled: bool,
+        fallback_reason: Option<&'static str>,
+        dims: (usize, usize),
+        spec: SpecMetrics,
+        generated_tokens: usize,
+        decode_steps: usize,
+        elapsed: Duration,
+    ) -> Self {
+        let secs = elapsed.as_secs_f64();
+        Self {
+            enabled,
+            fallback_reason,
+            generated_tokens,
+            decode_steps,
+            proposed_draft_tokens: spec.proposed,
+            accepted_draft_tokens: spec.accepted,
+            rejected_draft_tokens: spec.rejected,
+            avg_tokens_per_step: if decode_steps > 0 {
+                generated_tokens as f64 / decode_steps as f64
+            } else {
+                0.0
+            },
+            decode_tokens_per_sec: if secs > 0.0 {
+                generated_tokens as f64 / secs
+            } else {
+                0.0
+            },
+            leader_len: dims.0,
+            draft_len: dims.1,
+        }
+    }
+
+    /// One parseable line for the smoke harness (mirrors
+    /// `text-completion-spec`'s `SPEC_STATS`). wasm stderr is dropped on
+    /// the daemon path, so this is dev/smoke-tier only — the wire surface
+    /// is the SSE frame / JSON field.
+    fn log_spec_stats(&self) {
+        eprintln!(
+            "SPEC_STATS enabled={} fallback={} generated_tokens={} decode_steps={} \
+             proposed={} accepted={} rejected={} avg_tokens_per_step={:.3} \
+             decode_tokens_per_sec={:.2}",
+            self.enabled,
+            self.fallback_reason.unwrap_or("none"),
+            self.generated_tokens,
+            self.decode_steps,
+            self.proposed_draft_tokens,
+            self.accepted_draft_tokens,
+            self.rejected_draft_tokens,
+            self.avg_tokens_per_step,
+            self.decode_tokens_per_sec,
+        );
+    }
+}
+
+/// SSE wrapper: tags the report with `event:"spec_metrics"` so the GUI's
+/// frame router can branch on it like the other meta-frames.
+#[derive(Serialize)]
+struct SpecMetricsSse<'a> {
+    event: &'static str,
+    #[serde(flatten)]
+    report: &'a SpecMetricsReport,
+}
+
+/// Decide the decode strategy from the request, greedy gate, and whether
+/// a tool call is forced. Returns `(strategy, fallback_reason,
+/// want_metrics, (leader_len, draft_len))`. `want_metrics` is true
+/// whenever the caller sent a `speculation` block, so a requested-but-
+/// inactive run still reports why (no silent no-op).
+///
+/// `forced_tool` gates speculation OFF: when `tool_choice` forces a call
+/// the sampler is constrained to the tool-call grammar, and the drafter's
+/// verify must not run against a grammar-constrained sampler. Forced-tool
+/// is checked before the greedy gate so a forced+greedy request reports
+/// `tool_choice_forced`, not speculative.
+fn plan_strategy(
+    spec: Option<&SpecRequest>,
+    greedy: bool,
+    forced_tool: bool,
+) -> (DecodeStrategy, Option<&'static str>, bool, (usize, usize)) {
+    match spec {
+        None => (DecodeStrategy::Plain, None, false, (0, 0)),
+        Some(s) if s.enabled && forced_tool => {
+            (DecodeStrategy::Plain, Some("tool_choice_forced"), true, (0, 0))
+        }
+        Some(s) if s.enabled && greedy => {
+            let cfg = s.to_config();
+            let dims = (cfg.leader_len, cfg.draft_len);
+            (DecodeStrategy::Speculative(cfg), None, true, dims)
+        }
+        Some(s) if s.enabled => {
+            (DecodeStrategy::Plain, Some("non_greedy_sampling"), true, (0, 0))
+        }
+        Some(_) => (DecodeStrategy::Plain, Some("disabled"), true, (0, 0)),
+    }
+}
+
+/// Stand-alone tokenization of the prompt to seed the drafter's dynamic
+/// table. Exact chat-template alignment isn't required — accepted tokens
+/// grow the cache as generation proceeds (see `super::spec`).
+fn seed_tokens_from(model: &Model, messages: &[ChatMessage]) -> Vec<u32> {
+    let joined = messages
+        .iter()
+        .map(|m| m.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    model.tokenizer().encode(&joined)
 }
 
 #[derive(Serialize)]
@@ -1660,6 +1851,29 @@ fn validate_sampling(req: &ChatCompletionsRequest) -> Result<(), (&'static str, 
             ));
         }
     }
+    // #418: range-check the speculation knobs at the 400 boundary so an
+    // out-of-range value is rejected with a `param`, mirroring
+    // `max_tokens` — rather than silently coerced by `to_config`'s
+    // `.clamp`. `enabled` is a bool (nothing to range-check); cache caps
+    // are internal (not request-settable).
+    if let Some(spec) = &req.speculation {
+        if let Some(n) = spec.leader_len {
+            if !(MIN_LEADER_LEN..=MAX_LEADER_LEN).contains(&n) {
+                return Err((
+                    "speculation.leader_len",
+                    format!("speculation.leader_len must be in [{MIN_LEADER_LEN}, {MAX_LEADER_LEN}]"),
+                ));
+            }
+        }
+        if let Some(n) = spec.draft_len {
+            if !(MIN_DRAFT_LEN..=MAX_DRAFT_LEN).contains(&n) {
+                return Err((
+                    "speculation.draft_len",
+                    format!("speculation.draft_len must be in [{MIN_DRAFT_LEN}, {MAX_DRAFT_LEN}]"),
+                ));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1811,18 +2025,37 @@ async fn handle_streaming(req: ChatCompletionsRequest, res: Responder) -> Finish
     };
     try_emit!(em, &role_chunk, "role_chunk");
 
-    let sampler = Sampler::TopP {
-        temperature,
-        p: top_p,
-    };
     let stop_tokens = chat::stop_tokens(&model);
-    let mut stream = ctx
-        .generate(sampler)
-        .max_tokens(max_tokens)
-        .stop(&stop_tokens);
+    // #418: pick plain vs speculative decode. Speculation engages only
+    // when requested, greedy (temperature 0), AND no tool call is forced
+    // — a forced tool call constrains the sampler to the tool-call
+    // grammar, and the drafter's verify must not run against a
+    // grammar-constrained sampler. Otherwise plain decode, with
+    // `fallback_reason` reporting why (no silent no-op).
+    let greedy = temperature <= 0.0;
+    let (strategy, fallback_reason, want_metrics, dims) =
+        plan_strategy(req.speculation.as_ref(), greedy, forced_tool);
+    let spec_enabled = matches!(strategy, DecodeStrategy::Speculative(_));
+    let sampler = generate::resolve_sampler(temperature, top_p);
+    let seed_tokens = if spec_enabled {
+        seed_tokens_from(&model, &req.messages)
+    } else {
+        Vec::new()
+    };
+    let generate::GenSession {
+        generator: mut stream,
+        metrics: spec_metrics_handle,
+    } = generate::start(&mut ctx, sampler, max_tokens, &stop_tokens, strategy, &seed_tokens);
+    // tool_choice enforcement (from main): constrain to the tool-call
+    // grammar when a call is forced. Speculation is gated off in that
+    // case (`forced_tool` above), so this only ever applies to the plain
+    // generator.
     if let Some(c) = tool_constraint {
         stream = stream.constrain(c);
     }
+    let mut spec_generated = 0usize;
+    let mut spec_steps = 0usize;
+    let spec_start = Instant::now();
     let mut decoder = chat::Decoder::new(&model);
     // Reasoning decoder is always live — cheap on models without a
     // thinking template (returns `Idle` for every batch). Tool-use
@@ -1856,6 +2089,10 @@ async fn handle_streaming(req: ChatCompletionsRequest, res: Responder) -> Finish
             Ok(o) => o,
             Err(e) => break (Outcome::Aborted, Some(("forward_pass_failed", e.to_string()))),
         };
+        // #418: per-step decode accounting (one forward pass; `out.tokens`
+        // is a burst of 1 free pick + accepted drafts under speculation).
+        spec_steps += 1;
+        spec_generated += out.tokens.len();
 
         // Reasoning side: thinking-blocks become `reasoning_content`
         // deltas. `Idle` is the no-op signal; `Start` flips the
@@ -2086,6 +2323,30 @@ async fn handle_streaming(req: ChatCompletionsRequest, res: Responder) -> Finish
             eprintln!("[chat-apc] error-meta serialize bug: {e}");
         }
     }
+    // #418: terminal spec_metrics frame (only when the caller opted into
+    // the speculation surface, so normal streams are byte-identical).
+    if want_metrics {
+        let spec = spec_metrics_handle
+            .map(|h| *h.lock().unwrap())
+            .unwrap_or_default();
+        let report = SpecMetricsReport::build(
+            spec_enabled,
+            fallback_reason,
+            dims,
+            spec,
+            spec_generated,
+            spec_steps,
+            spec_start.elapsed(),
+        );
+        report.log_spec_stats();
+        let frame = SpecMetricsSse {
+            event: "spec_metrics",
+            report: &report,
+        };
+        if let Err(EmitError::Serialize(e)) = em.emit_json(&frame).await {
+            eprintln!("[chat-apc] spec_metrics serialize bug: {e}");
+        }
+    }
     sse::emit_done_logged(&mut em, "stream_exit").await;
     em.finish()
 }
@@ -2148,19 +2409,31 @@ async fn handle_non_streaming(req: ChatCompletionsRequest, res: Responder) -> Fi
         }
     };
     let forced_tool = tool_constraint.is_some();
-
-    let sampler = Sampler::TopP {
-        temperature,
-        p: top_p,
-    };
     let stop_tokens = chat::stop_tokens(&model);
-    let mut stream = ctx
-        .generate(sampler)
-        .max_tokens(max_tokens)
-        .stop(&stop_tokens);
+    // #418: plain vs speculative decode (see handle_streaming for the
+    // greedy + forced-tool gate rationale).
+    let greedy = temperature <= 0.0;
+    let (strategy, fallback_reason, want_metrics, dims) =
+        plan_strategy(req.speculation.as_ref(), greedy, forced_tool);
+    let spec_enabled = matches!(strategy, DecodeStrategy::Speculative(_));
+    let sampler = generate::resolve_sampler(temperature, top_p);
+    let seed_tokens = if spec_enabled {
+        seed_tokens_from(&model, &req.messages)
+    } else {
+        Vec::new()
+    };
+    let generate::GenSession {
+        generator: mut stream,
+        metrics: spec_metrics_handle,
+    } = generate::start(&mut ctx, sampler, max_tokens, &stop_tokens, strategy, &seed_tokens);
+    // tool_choice enforcement (from main); spec is gated off when forced,
+    // so this only applies to the plain generator.
     if let Some(c) = tool_constraint {
         stream = stream.constrain(c);
     }
+    let mut spec_generated = 0usize;
+    let mut spec_steps = 0usize;
+    let spec_start = Instant::now();
     let mut decoder = chat::Decoder::new(&model);
     let mut reason_dec = ReasoningDecoder::new(&model);
     let mut tool_dec = ToolUseDecoder::new(&model);
@@ -2189,6 +2462,10 @@ async fn handle_non_streaming(req: ChatCompletionsRequest, res: Responder) -> Fi
             Ok(o) => o,
             Err(e) => break (Outcome::Aborted, Some(("forward_pass_failed", e.to_string()))),
         };
+        // #418: per-step decode accounting (one forward pass; `out.tokens`
+        // is a burst of 1 free pick + accepted drafts under speculation).
+        spec_steps += 1;
+        spec_generated += out.tokens.len();
 
         // capture the gate state BEFORE feeding the reasoning
         // decoder (see streaming branch + `content_visible`). Mirrors the
@@ -2377,6 +2654,26 @@ async fn handle_non_streaming(req: ChatCompletionsRequest, res: Responder) -> Fi
                 .collect(),
         )
     };
+    // #418: speculation metrics, only when the caller opted into the
+    // surface (so normal responses are byte-identical).
+    let spec_metrics = if want_metrics {
+        let spec = spec_metrics_handle
+            .map(|h| *h.lock().unwrap())
+            .unwrap_or_default();
+        let report = SpecMetricsReport::build(
+            spec_enabled,
+            fallback_reason,
+            dims,
+            spec,
+            spec_generated,
+            spec_steps,
+            spec_start.elapsed(),
+        );
+        report.log_spec_stats();
+        Some(report)
+    } else {
+        None
+    };
     let body = ChatCompletion {
         id: &id,
         object: "chat.completion",
@@ -2394,6 +2691,7 @@ async fn handle_non_streaming(req: ChatCompletionsRequest, res: Responder) -> Fi
         }],
         error: error_block,
         warnings: warnings_vec,
+        spec_metrics,
     };
     // `ChatCompletion` is a closed schema of plain scalars + an
     // assistant message string. None of the fields can fail to
@@ -2718,6 +3016,97 @@ mod tests {
         ]);
         assert_eq!(content, "Plain answer.");
         assert!(reasoning.is_empty());
+    }
+
+    #[test]
+    fn speculation_parses_and_maps_paper_defaults() {
+        let r: ChatCompletionsRequest = serde_json::from_str(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "temperature":0,"speculation":{"enabled":true}}"#,
+        )
+        .unwrap();
+        let s = r.speculation.expect("speculation present");
+        assert!(s.enabled);
+        let cfg = s.to_config();
+        assert_eq!(cfg.leader_len, 1);
+        assert_eq!(cfg.draft_len, 3);
+    }
+
+    #[test]
+    fn absent_speculation_is_none() {
+        let r: ChatCompletionsRequest = serde_json::from_str(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#,
+        )
+        .unwrap();
+        assert!(r.speculation.is_none());
+    }
+
+    #[test]
+    fn spec_dims_out_of_range_rejected() {
+        // F1: out-of-range speculation knobs are rejected at the 400
+        // boundary with a `param`, mirroring max_tokens — NOT silently
+        // clamped. leader_len below range:
+        let req: ChatCompletionsRequest = serde_json::from_str(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "temperature":0,"speculation":{"enabled":true,"leader_len":0}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            validate_sampling(&req).unwrap_err().0,
+            "speculation.leader_len"
+        );
+
+        // draft_len above range:
+        let req: ChatCompletionsRequest = serde_json::from_str(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "temperature":0,"speculation":{"enabled":true,"draft_len":99999}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            validate_sampling(&req).unwrap_err().0,
+            "speculation.draft_len"
+        );
+
+        // in-range values pass; the clamp in to_config is then a
+        // redundant safety net.
+        let req: ChatCompletionsRequest = serde_json::from_str(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "temperature":0,"speculation":{"enabled":true,"leader_len":2,"draft_len":4}}"#,
+        )
+        .unwrap();
+        assert!(validate_sampling(&req).is_ok());
+        let cfg = req.speculation.unwrap().to_config();
+        assert_eq!((cfg.leader_len, cfg.draft_len), (2, 4));
+    }
+
+    #[test]
+    fn plan_strategy_gates_on_greedy_and_enabled() {
+        // requested + greedy + no forced tool -> speculative, no fallback
+        let s = SpecRequest { enabled: true, leader_len: None, draft_len: None };
+        let (st, fb, want, _) = plan_strategy(Some(&s), true, false);
+        assert!(matches!(st, DecodeStrategy::Speculative(_)));
+        assert!(fb.is_none());
+        assert!(want);
+        // requested + non-greedy -> plain, fallback reason
+        let (st, fb, want, _) = plan_strategy(Some(&s), false, false);
+        assert!(matches!(st, DecodeStrategy::Plain));
+        assert_eq!(fb, Some("non_greedy_sampling"));
+        assert!(want);
+        // requested + greedy BUT a tool call is forced -> plain, gated off
+        // with a distinct reason (checked before the greedy gate).
+        let (st, fb, want, _) = plan_strategy(Some(&s), true, true);
+        assert!(matches!(st, DecodeStrategy::Plain));
+        assert_eq!(fb, Some("tool_choice_forced"));
+        assert!(want);
+        // enabled:false -> plain, disabled
+        let off = SpecRequest { enabled: false, leader_len: None, draft_len: None };
+        let (_, fb, want, _) = plan_strategy(Some(&off), true, false);
+        assert_eq!(fb, Some("disabled"));
+        assert!(want);
+        // absent -> plain, no metrics surface
+        let (_, fb, want, _) = plan_strategy(None, true, false);
+        assert!(fb.is_none());
+        assert!(!want);
     }
 
     #[test]
