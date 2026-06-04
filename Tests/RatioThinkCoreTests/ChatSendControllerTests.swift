@@ -282,6 +282,78 @@ final class ChatSendControllerTests: XCTestCase {
       .sorted { $0.ts < $1.ts }
   }
 
+  // MARK: - speculation injection (#426 Fast Think)
+
+  /// Drive `send` and return the single `ChatRequest` the engine saw.
+  private func capturedRequest(
+    speculation: Profile.Speculation?,
+    sampling: ChatSampling = ChatSampling(temperature: 0.7, topP: 0.9, maxTokens: 100)
+  ) async throws -> ChatRequest {
+    let container = try RatioThinkModelContainer.makeInMemory()
+    let context = ModelContext(container)
+    let chat = Chat()
+    context.insert(chat)
+    chat.messages.append(Message(role: "user", content: "hi", ts: Date(timeIntervalSinceReferenceDate: 1)))
+    try context.save()
+
+    let engine = ImmediateChatEngine(events: [.delta(role: .assistant, content: "ok"), .finish(reason: .stop)])
+    let controller = ChatSendController()
+    controller.send(
+      chat: chat,
+      context: context,
+      engine: engine,
+      modelLoadCenter: ModelLoadCenter(),
+      persistenceStatus: PersistenceStatus(),
+      options: ChatSendRequestOptions(modelID: "m", sampling: sampling, speculation: speculation)
+    )
+    try await waitUntil("stream finishes") { !controller.isInFlight }
+    return try XCTUnwrap(engine.requests.first)
+  }
+
+  func test_send_enabledSpeculation_attaches_field_and_forces_greedy_temp() async throws {
+    let req = try await capturedRequest(
+      speculation: Profile.Speculation(enabled: true, leaderLen: 2, draftLen: 5))
+    XCTAssertEqual(req.speculation, ChatSpeculation(enabled: true, leaderLen: 2, draftLen: 5))
+    XCTAssertEqual(req.sampling.temperature, 0, "enabled speculation must force greedy decode")
+    XCTAssertEqual(req.sampling.topP, 0.9, "other sampling knobs preserved")
+    XCTAssertEqual(req.sampling.maxTokens, 100)
+  }
+
+  func test_send_nilSpeculation_no_field_and_temp_unchanged() async throws {
+    let req = try await capturedRequest(speculation: nil)
+    XCTAssertNil(req.speculation, "no profile speculation → byte-identical normal chat")
+    XCTAssertEqual(req.sampling.temperature, 0.7, "temperature untouched without speculation")
+  }
+
+  func test_send_disabledSpeculation_no_field_and_temp_unchanged() async throws {
+    let req = try await capturedRequest(speculation: Profile.Speculation(enabled: false))
+    XCTAssertNil(req.speculation, "disabled speculation must not attach the field")
+    XCTAssertEqual(req.sampling.temperature, 0.7)
+  }
+
+  /// End-to-end golden tie: the seeded built-in "Fast Think" profile must
+  /// produce exactly the inferlet-facing body that engages the #418
+  /// drafter — `speculation.enabled == true` AND a greedy top-level
+  /// `temperature == 0`. Drives the real request builder with the seeded
+  /// TOML's speculation and a NON-greedy toolbar sampling (0.7) to prove
+  /// the chokepoint forces greedy regardless. (#426)
+  func test_seeded_fast_think_profile_yields_drafting_body() async throws {
+    let profile = try Profile.parse(toml: ProfileStore.defaultFastThinkTOML)
+    XCTAssertEqual(profile.speculation, Profile.Speculation(enabled: true),
+                   "seeded Fast Think profile must enable speculation")
+
+    let req = try await capturedRequest(
+      speculation: profile.speculation,
+      sampling: ChatSampling(temperature: 0.7, topP: 0.9, maxTokens: 100))
+
+    let body = try XCTUnwrap(
+      JSONSerialization.jsonObject(with: try JSONEncoder().encode(req)) as? [String: Any])
+    let spec = try XCTUnwrap(body["speculation"] as? [String: Any])
+    XCTAssertEqual(spec["enabled"] as? Bool, true)
+    XCTAssertEqual(body["temperature"] as? Double, 0,
+                   "Fast Think body must be greedy (temp 0) so the drafter engages")
+  }
+
   private func waitUntil(
     _ description: String,
     timeout: TimeInterval = 1,
