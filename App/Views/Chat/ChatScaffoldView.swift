@@ -295,7 +295,6 @@ struct ChatScaffoldView: View {
         onRetryLoad: { model in loadDefaultModel(model) },
         // #397 F1: helper unreachable → force an immediate status re-poll.
         onRefresh: { refreshEngineStatus() },
-        onChooseAnother: { showNoModelPrompt = false },
         onCancel: { showNoModelPrompt = false },
         engineStatus: engineStatusStore.status
       )
