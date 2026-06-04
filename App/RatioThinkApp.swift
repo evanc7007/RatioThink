@@ -36,6 +36,11 @@ struct RatioThinkApp: App {
   @StateObject private var profileStore: ProfileStore
   @StateObject private var swapCoordinator: ProfileSwapCoordinator
   @StateObject private var engineStatusStore: EngineStatusStore
+  /// The reconciled engine-lifecycle source of truth: folds engine status +
+  /// model load into one published `EngineIndicatorState` every surface
+  /// derives from, and invalidates app-side residency when the engine leaves
+  /// `.running` so no surface can claim a resident model on a dead engine.
+  @StateObject private var engineLifecycle: EngineLifecycle
   /// #412: App-side background-helper health + restart ladder. Driven by the
   /// same `engineStatus()` poll as `engineStatusStore` (via `onPollOutcome`)
   /// and surfaced as the toolbar helper-ring + the escalation banner.
@@ -147,6 +152,13 @@ struct RatioThinkApp: App {
     _appPreferences = StateObject(wrappedValue: prefs)
     _profileStore = StateObject(wrappedValue: store)
     _engineStatusStore = StateObject(wrappedValue: statusStore)
+    // The reconciled engine-lifecycle fold + residency invalidation. Borrows
+    // the value-side `statusStore`/`center` built above; observes both and
+    // republishes the single `EngineIndicatorState`.
+    _engineLifecycle = StateObject(wrappedValue: EngineLifecycle(
+      engineStatus: statusStore,
+      modelLoad: center
+    ))
     _engineClientStore = StateObject(wrappedValue: EngineClientStore(client: engine))
     _swapCoordinator = StateObject(wrappedValue: ProfileSwapCoordinator(
       center: center,
@@ -378,6 +390,7 @@ struct RatioThinkApp: App {
         .environmentObject(engineClientStore)
         .environmentObject(persistenceStatus)
         .environmentObject(engineStatusStore)
+        .environmentObject(engineLifecycle)
         .environmentObject(helperHealth)
         .environmentObject(downloadController)
         .environmentObject(updateAvailability)

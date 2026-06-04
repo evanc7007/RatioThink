@@ -27,6 +27,10 @@ struct ChatScaffoldView: View {
   /// #412: background-helper health, forwarded to the toolbar pip's outer ring.
   @EnvironmentObject private var helperHealth: HelperHealthController
   @EnvironmentObject private var profileStore: ProfileStore
+  /// The reconciled engine-lifecycle fold, forwarded to the toolbar pip +
+  /// popover so they derive the resident/offline distinction from the single
+  /// published `indicator`.
+  @EnvironmentObject private var engineLifecycle: EngineLifecycle
   /// Shown when a send is blocked because no model resolves yet. #326
   /// decides the model-availability action (Load / Download / unavailable
   /// via the live `noModelAction`); #397 layers the engine/model lifecycle
@@ -221,7 +225,9 @@ struct ChatScaffoldView: View {
         modelLoadCenter: modelLoadCenter,
         engineStatus: engineStatusStore,
         helperHealth: helperHealth,
-        onUnload: unloadModel
+        engineLifecycle: engineLifecycle,
+        onUnload: unloadModel,
+        onStartEngine: startEngineForSelectedProfile
       )
       Divider().opacity(0.0001) // structural breather; no visible line per §5
       // #326 Path 2: surface a swallowed failed(modelMissing) engine
@@ -383,7 +389,15 @@ struct ChatScaffoldView: View {
     case .failedAfterRetries(let attempts):
       // Don't silently drop: engine running but unreachable for models.
       NSLog("ChatScaffold: /v1/models reconcile failed after \(attempts) attempts while engine .running")
-    case .empty, .notRunning:
+    case .empty:
+      // Engine running but serving NO model — clear any stale residency so
+      // the send gate doesn't pass a model the engine no longer has (the
+      // sibling gap to the leave-`.running` invalidation). No-op while a load
+      // is in flight.
+      modelLoadCenter.engineServesNoModel()
+    case .notRunning:
+      // Engine isn't running — `EngineLifecycle` already invalidated residency
+      // on the leave-`.running` edge; nothing to do here.
       break
     }
   }
@@ -417,9 +431,18 @@ struct ChatScaffoldView: View {
   }
 
   private func currentModelID() -> String? {
-    Self.requestModelID(
+    // A resident model only counts when the engine is actually `.running`.
+    // `EngineLifecycle` clears `residentModelID` on the leave-`.running` edge,
+    // but this guard also covers the brief window before that lands — so a
+    // stopped engine yields `needsDefaultLoad`/`noDefault` (an honest "Load
+    // X?" prompt) instead of a send that passes the gate then fails at HTTP.
+    let engineRunning: Bool = {
+      if case .running = engineStatusStore.status { return true }
+      return false
+    }()
+    return Self.requestModelID(
       modelOverride: viewModel.modelOverride,
-      residentModelID: modelLoadCenter.residentModelID,
+      residentModelID: engineRunning ? modelLoadCenter.residentModelID : nil,
       testModelID: ProcessInfo.processInfo.environment["PIE_TEST_CHAT_MODEL"]
     )
   }
