@@ -33,14 +33,6 @@ pass Gatekeeper with no extra steps:
 3. Open **RatioThink** from Applications and follow the first-launch wizard to download a
    starter model.
 
-> **Unsigned / development builds.** A DMG or app you build yourself
-> (`make dmg-arm64`) is *not* notarized, so Gatekeeper blocks it. For local
-> use only, clear the quarantine flag — notarized release downloads never need
-> this:
-> ```bash
-> xattr -dr com.apple.quarantine /Applications/RatioThink.app
-> ```
-
 ## Build from source
 
 **Prerequisites:** an Apple Silicon Mac (arm64), macOS 14+, Xcode (with command-line tools), [XcodeGen](https://github.com/yonaskolb/XcodeGen)
@@ -74,6 +66,14 @@ make install-app    # build, sign, install into /Applications, launch, verify
 to run and debug locally, but it is *not* a distribution identity — Gatekeeper
 rejects it on download. Producing a DMG that passes `spctl` on other Macs
 requires the notarized release flow below.
+
+> **Unsigned / development builds.** A DMG or app you build yourself
+> (`make dmg-arm64`) is *not* notarized, so Gatekeeper blocks it. For local
+> use only, clear the quarantine flag — notarized release downloads never need
+> this:
+> ```bash
+> xattr -dr com.apple.quarantine /Applications/RatioThink.app
+> ```
 
 ## Troubleshooting / Collect diagnostics
 
