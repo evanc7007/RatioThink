@@ -336,6 +336,17 @@ struct ChatScaffoldView: View {
       chat.profileID = new
       do {
         try modelContext.save()
+        // #3: a profile swap chooses which profile is active. The menu-bar
+        // (menu-icon) engine start reads the GLOBAL active-profile marker
+        // (HelperResumeAction → ProfileStore.activeProfileID), NOT this
+        // per-chat selection — so persist the swap to the marker too.
+        // Otherwise a swap while the engine is stopped leaves the marker on
+        // the old profile and a later menu-icon start launches the OLD
+        // model. Stage-only: this updates the start TARGET, it does not
+        // auto-start the engine. `setActiveProfileID` logs internally on a
+        // write failure (the marker simply stays on the prior profile), so
+        // the `try?` does not silently drop the signal.
+        try? profileStore.setActiveProfileID(new)
       } catch {
         chat.profileID = previous
         // Also revert the toolbar selection so the menu label
