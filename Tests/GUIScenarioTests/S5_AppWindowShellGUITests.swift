@@ -6,7 +6,7 @@ import XCTest
 /// label `Chats` (the `API Endpoints` HTTP-serving feature is hidden in
 /// v0.1.1; its nav row + the empty-state `Add Endpoint` CTA are both gone),
 /// detail empty-state shows the `Start Chat` CTA, Settings opens via Cmd+,
-/// with 5 tabs.
+/// with 4 tabs (the API tab is hidden in v0.1.1 with the rest of the feature).
 final class S5_AppWindowShellGUITests: XCTestCase {
   override func setUp() async throws {
     try guardSeatedGUI()
@@ -99,7 +99,7 @@ final class S5_AppWindowShellGUITests: XCTestCase {
   }
 
   @MainActor
-  func test_cmd_comma_opens_settings_with_five_tabs() async throws {
+  func test_cmd_comma_opens_settings_with_four_tabs() async throws {
     let app = XCUIApplication(bundleIdentifier: "com.ratiothink.app")
     app.launchArguments.append(contentsOf: Self.restorationOffArgs)
     configureCompletedFirstLaunch(app)
@@ -147,8 +147,8 @@ final class S5_AppWindowShellGUITests: XCTestCase {
     // the TabView toolbar itself is broken.
     let toolbarButtons = settings.toolbars.buttons
     XCTAssertEqual(
-      toolbarButtons.count, 5,
-      "Expected 5 TabView toolbar buttons; window: \(settings.debugDescription)"
+      toolbarButtons.count, 4,
+      "Expected 4 TabView toolbar buttons (API tab hidden in v0.1.1); window: \(settings.debugDescription)"
     )
 
     // Query by identifier only (not the label-or-id subscript). Identifier
@@ -156,12 +156,17 @@ final class S5_AppWindowShellGUITests: XCTestCase {
     // verified propagation path for the toolbar button's AX identity on
     // macOS 14+ (pinning only on the inner `.tabItem` Label drops the
     // toolbar count from 5 to 2 — see commit notes).
-    for expected in ["General", "Models", "Profiles", "API", "Advanced"] {
+    for expected in ["General", "Models", "Profiles", "Advanced"] {
       let tab = toolbarButtons.matching(identifier: expected).firstMatch
       XCTAssertTrue(
         tab.waitForExistence(timeout: 3),
         "Settings tab '\(expected)' missing; window: \(settings.debugDescription)"
       )
     }
+    // v0.1.1: the API tab is hidden — its toolbar button must be absent.
+    XCTAssertEqual(
+      toolbarButtons.matching(identifier: "API").count, 0,
+      "Settings should NOT show an 'API' tab in v0.1.1; window: \(settings.debugDescription)"
+    )
   }
 }
