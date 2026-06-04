@@ -4,7 +4,7 @@
 
 # RatioThink
 
-**Private, local AI chat for macOS — powered by your own models.**
+**Private, local AI chat for macOS — powered by various thinking modes.**
 
 ![macOS 14+](https://img.shields.io/badge/macOS-14%2B-black?logo=apple)
 ![Apple Silicon](https://img.shields.io/badge/Apple%20Silicon-arm64-black)
@@ -13,19 +13,17 @@
 
 </div>
 
-RatioThink is a native macOS app that runs open-weight language models entirely on your Mac
-through a bundled [Pie](https://github.com/pie-project/pie) inference engine — no account,
-no cloud, no data leaving the device.
+RatioThink is a native macOS app that runs open-weight language models entirely on your Mac.
+Powered by a bundled [Pie](https://github.com/pie-project/pie) inference engine, it supercharges
+local models using specialized _thinking profiles_.
 
-**v0.1.1 is an early release**, focused on core functionality and bug fixes: local chat,
-basic model management (download or import GGUF models), and engine status while a model
-loads. See the [release notes](https://github.com/shsym/RatioThink/releases) for what's in
-this build.
+## Early release
 
-## Install (DMG)
+v0.1.1 is an early release, focusing on core functionality and bug fixes.
+Since many components are still a work in progress, your feedback is incredibly valuable.
+Feel free to report any issues you find!
 
-Release DMGs are signed with a Developer ID and notarized by Apple, so they
-pass Gatekeeper with no extra steps:
+## Install
 
 1. Download `RatioThink-arm64.dmg` (Apple Silicon) from
    [Releases](https://github.com/shsym/RatioThink/releases) and open it.
@@ -77,11 +75,10 @@ requires the notarized release flow below.
 
 ## Troubleshooting / Collect diagnostics
 
-If RatioThink "does nothing" after launch — no window, no menu-bar icon, no chat —
-collect a diagnostics bundle and send it to the developer.
+If the app misbehaves, you can collect a diagnostics bundle to send to the developer.
 
 **From the app** (if it opens): **Help → Collect Diagnostics…**. It writes a
-`.zip` to your Desktop and reveals it in Finder.
+`.zip` to your Desktop.
 
 **From Terminal** (works even when the app or helper won't launch):
 
@@ -122,9 +119,6 @@ A few known issues in the v0.1.1 release, with workarounds:
   it launches, the failure can be reported as a timeout rather than a clear "couldn't start"
   — the engine-error indicator still appears either way.
   [Fixed in a later build](https://github.com/shsym/RatioThink/pull/36).
-- **A reply can lose its last words if saving fails.** If storage errors out exactly as a
-  streamed answer finishes, the saved copy may drop its final chunk (you'll see an error).
-  Re-generate the reply.
 
 ## Repo layout
 
