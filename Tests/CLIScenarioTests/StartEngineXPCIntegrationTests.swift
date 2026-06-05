@@ -215,6 +215,59 @@ final class StartEngineXPCIntegrationTests: IsolatedTestCase {
     }
   }
 
+  /// #448 quitHelper over the real NSXPC wire: a running engine is stopped
+  /// (reaped) and the helper-self-terminate hook fires, with a nil (accepted)
+  /// reply. Proves the full-product quit reaches `pie` through the Helper —
+  /// the App calls exactly this selector as the final step of a coordinated
+  /// quit, which is what guarantees "no orphan pie".
+  func test_quitHelper_overXPC_stopsEngineAndFiresTermination() async throws {
+    let store = try makeProfileStoreWithChat()
+    defer { store.stop() }
+
+    let host = makeEngineHost(port: 24660)
+    defer { host.stop() }
+
+    let ignored = try writeCapabilityProbe(portable: true, metal: true)
+    let modelsRoot = tempDir.appendingPathComponent("models", isDirectory: true)
+    try FileManager.default.createDirectory(at: modelsRoot, withIntermediateDirectories: true)
+    try Data("ignored".utf8).write(
+      to: modelsRoot.appendingPathComponent("ignored-by-fake-pie.gguf", isDirectory: false)
+    )
+    let resources = try writeInferletResources(name: "chat-apc", version: "0.1.0")
+    let resolver = LaunchSpecResolver(
+      profileStore: store,
+      pieBinary: { ignored },
+      modelsRoot: { modelsRoot },
+      inferletsDir: { self.tempDir.appendingPathComponent("inferlets") },
+      pieControlResources: { resources },
+      pieHome: { self.tempDir },
+      subprocessEnvironment: { [:] }
+    )
+    let terminated = expectation(description: "onQuitRequested (helper self-terminate) fired")
+    let exported = HelperExportedAPI(
+      engineHost: host,
+      launchSpecResolver: resolver.asClosure,
+      onQuitRequested: { terminated.fulfill() }
+    )
+
+    let listenerOwner = HelperXPCListener.startAnonymous(exportedObject: exported)
+    defer { listenerOwner.invalidate() }
+    let connection = NSXPCConnection(listenerEndpoint: listenerOwner.endpoint)
+    connection.remoteObjectInterface = PieHelperXPCInterface.make()
+    connection.resume()
+    defer { connection.invalidate() }
+    let api = try XCTUnwrap(connection.remoteObjectProxyWithErrorHandler { err in
+      XCTFail("XPC proxy error: \(err)")
+    } as? PieHelperXPC, "remote proxy must conform to PieHelperXPC")
+
+    let port = try await callStartEngine(api: api, profileID: "chat", timeout: 8)
+    XCTAssertEqual(port, 24660)
+
+    try await callQuitHelper(api: api, timeout: 8)
+    await fulfillment(of: [terminated], timeout: 5)
+    XCTAssertEqual(host.status, .stopped, "quitHelper must reap the engine before terminating")
+  }
+
   /// Session whose `checkLiveness()` replays a scripted sequence, then
   /// repeats the final element — models a mid-session engine death for
   /// the XPC engine-gone integration test.
@@ -568,6 +621,34 @@ final class StartEngineXPCIntegrationTests: IsolatedTestCase {
           case .success(let port): cont.resume(returning: port)
           case .failure(let err):  cont.resume(throwing: XPCError.engine(err))
           }
+        } catch {
+          cont.resume(throwing: XPCError.wireShape(underlying: error))
+        }
+      }
+    }
+  }
+
+  /// Async bridge over `quitHelper(reply:)`. Resolves on a nil (accepted)
+  /// reply, throws `XPCError.engine` on a non-nil error payload.
+  private func callQuitHelper(api: PieHelperXPC,
+                              timeout: TimeInterval) async throws {
+    try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+      let resumed = ResumedOnceFlag()
+      let timer = DispatchSource.makeTimerSource(queue: .global())
+      timer.schedule(deadline: .now() + timeout)
+      timer.setEventHandler {
+        if resumed.markIfPending() {
+          cont.resume(throwing: XPCError.replyTimeout(timeout: timeout))
+        }
+      }
+      timer.resume()
+      api.quitHelper { errorData in
+        timer.cancel()
+        guard resumed.markIfPending() else { return }
+        guard let errorData else { cont.resume(returning: ()); return }
+        do {
+          let err = try XPCPayload.decode(EngineError.self, from: errorData)
+          cont.resume(throwing: XPCError.engine(err))
         } catch {
           cont.resume(throwing: XPCError.wireShape(underlying: error))
         }

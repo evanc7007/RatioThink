@@ -304,6 +304,49 @@ public final class PieEngineHost: @unchecked Sendable {
     }
   }
 
+  /// #448 quit primitive: `stop()` the engine and invoke `completion`
+  /// exactly once, when the host has reached a terminal state
+  /// (`.stopped`/`.failed`) — which is published only AFTER
+  /// `LaunchedSession.shutdown` (SIGINT → grace → SIGKILL) has reaped the
+  /// `pie` process — or after `timeout` if it never settles. Lets a quit
+  /// path terminate its own process without orphaning the engine. The
+  /// bounded fallback guarantees a wedged engine cannot block quit; a stuck
+  /// pid is then reaped by the OS when the host's process exits. `completion`
+  /// fires on `stateQueue` (terminal path) or a global queue (timeout).
+  public func stopAndWait(timeout: TimeInterval, completion: @escaping @Sendable () -> Void) {
+    let done = OSAllocatedUnfairLock<Bool>(initialState: false)
+    let tokenBox = OSAllocatedUnfairLock<ObservationToken?>(initialState: nil)
+    func cancelObserver() {
+      tokenBox.withLock { (box: inout ObservationToken?) in
+        box?.cancel()
+        box = nil
+      }
+    }
+    func finish() {
+      let already = done.withLock { (d: inout Bool) -> Bool in
+        defer { d = true }
+        return d
+      }
+      cancelObserver()
+      if already { return }
+      completion()
+    }
+    // observe() dispatches the CURRENT status synchronously on stateQueue, so
+    // an already-terminal host fires `finish()` immediately.
+    let token = observe { status, _ in
+      switch status {
+      case .stopped, .failed: finish()
+      case .starting, .running, .stopping: return
+      }
+    }
+    tokenBox.withLock { $0 = token }
+    if done.withLock({ $0 }) { cancelObserver() }
+    stop()
+    if timeout > 0 {
+      DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + timeout, execute: finish)
+    }
+  }
+
   /// Publish a resolver-level failure that happened before `start(_:)`
   /// could create a launch task. This keeps pre-start safety
   /// rejections (notably `.memoryRisk`) visible through the same

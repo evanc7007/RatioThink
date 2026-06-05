@@ -123,6 +123,13 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
   /// URLProtocol stub.
   let downloader: ModelDownloader
 
+  /// #448: invoked after `quitHelper` has stopped + reaped the engine, to
+  /// terminate the Helper process itself. Injected by `HelperMain` as
+  /// `{ NSApp.terminate(nil) }` so this RatioThinkCore type stays AppKit-free
+  /// and unit-testable; `nil` (the default for the stub/test inits) makes
+  /// `quitHelper` reply and then no-op the termination.
+  private let onQuitRequested: (@Sendable () -> Void)?
+
   #if DEBUG
   /// Test seam (review v2 F30, v3 F41, v5 F63). Replaces the
   /// default reply-timeout deadline computation
@@ -145,6 +152,7 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
     self.engineHost = nil
     self.launchSpecResolver = nil
     self.downloader = ModelDownloader()
+    self.onQuitRequested = nil
     #if DEBUG
     self.replyTimeoutOverride = nil
     #endif
@@ -152,10 +160,12 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
   }
 
   public init(engineHost: PieEngineHost? = nil,
-              launchSpecResolver: LaunchSpecResolver? = nil) {
+              launchSpecResolver: LaunchSpecResolver? = nil,
+              onQuitRequested: (@Sendable () -> Void)? = nil) {
     self.engineHost = engineHost
     self.launchSpecResolver = launchSpecResolver
     self.downloader = ModelDownloader()
+    self.onQuitRequested = onQuitRequested
     #if DEBUG
     self.replyTimeoutOverride = nil
     #endif
@@ -170,6 +180,7 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
     self.engineHost = nil
     self.launchSpecResolver = nil
     self.downloader = downloader
+    self.onQuitRequested = nil
     #if DEBUG
     self.replyTimeoutOverride = nil
     #endif
@@ -184,10 +195,12 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
   /// within the same Swift module.
   internal init(engineHost: PieEngineHost?,
                 launchSpecResolver: LaunchSpecResolver?,
-                replyTimeoutOverride: (start: TimeInterval, stop: TimeInterval)?) {
+                replyTimeoutOverride: (start: TimeInterval, stop: TimeInterval)?,
+                onQuitRequested: (@Sendable () -> Void)? = nil) {
     self.engineHost = engineHost
     self.launchSpecResolver = launchSpecResolver
     self.downloader = ModelDownloader()
+    self.onQuitRequested = onQuitRequested
     self.replyTimeoutOverride = replyTimeoutOverride
     super.init()
   }
@@ -619,6 +632,42 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
       reply(PieHelperXPCWire.fallbackReplyEncodeFailureData)
     }
   }
+
+  // MARK: - quitHelper (#448)
+
+  /// Full-product quit. Stops the engine and WAITS for it to reach a
+  /// terminal state — `PieEngineHost.stop()` only publishes `.stopped`
+  /// after `LaunchedSession.shutdown` (SIGINT → grace → SIGKILL) has reaped
+  /// `pie`, so awaiting `.stopped`/`.failed` guarantees no orphan engine
+  /// before the Helper exits. Then replies and fires `onQuitRequested`
+  /// (wired by `HelperMain` to `NSApp.terminate`) for a clean exit so
+  /// launchd's `KeepAlive { SuccessfulExit: false }` does not relaunch it.
+  ///
+  /// A bounded fallback fires the termination even if the engine never
+  /// reaches terminal, so a wedged engine cannot block quit; a stuck pid is
+  /// then reaped by launchd when the Helper exits, the same as any unclean
+  /// death. Idempotent via the single-shot `finished` flag.
+  public func quitHelper(reply: @escaping (Data?) -> Void) {
+    Self.log.info("quitHelper: tearing down engine then terminating helper")
+    guard let engineHost else {
+      // No engine to reap (early boot / stub) — just acknowledge + exit.
+      PieHelperXPCWire.replyStopEngine(nil, via: reply)
+      onQuitRequested?()
+      return
+    }
+    #if DEBUG
+    let deadline = replyTimeoutOverride?.stop ?? Self.stopReplyDeadline
+    #else
+    let deadline = Self.stopReplyDeadline
+    #endif
+    // `stopAndWait` fires the completion exactly once — after `pie` is reaped
+    // (terminal status), or after `deadline` if the engine wedges. Reply then
+    // ask the Helper to terminate cleanly.
+    engineHost.stopAndWait(timeout: deadline) { [onQuitRequested] in
+      PieHelperXPCWire.replyStopEngine(nil, via: reply)
+      onQuitRequested?()
+    }
+  }
 }
 
 /// Degraded-mode `PieHelperXPC` implementation. Used when the helper
@@ -641,13 +690,19 @@ public final class DegradedHelperAPI: NSObject, PieHelperXPC {
   /// `[String]` slot, which the GUI decoded as wire corruption.
   private let emptyProfilesData: Data
 
+  /// #448: self-terminate hook, same contract as `HelperExportedAPI`. A
+  /// degraded Helper owns no engine, so `quitHelper` just acknowledges and
+  /// fires this to exit cleanly.
+  private let onQuitRequested: (@Sendable () -> Void)?
+
   private static let log = Logger(subsystem: "com.ratiothink.app.helper", category: "xpc.exported.degraded")
 
   /// `reasonMessage` is folded into both `EngineError.message` and
   /// `EngineStatus.failed.message` so a single source of truth flows
   /// from PieDirsError → wire → GUI alert.
-  public init(reasonMessage: String) {
+  public init(reasonMessage: String, onQuitRequested: (@Sendable () -> Void)? = nil) {
     self.reasonMessage = reasonMessage
+    self.onQuitRequested = onQuitRequested
     let err = EngineError(code: .degraded, message: reasonMessage)
     do {
       self.degradedErrorData = try XPCPayload.encode(err)
@@ -732,5 +787,15 @@ public final class DegradedHelperAPI: NSObject, PieHelperXPC {
   /// instead of optimistically retrying.
   public func clearKillRejected(reply: @escaping (Data?) -> Void) {
     reply(degradedErrorData)
+  }
+
+  /// #448: a degraded Helper owns no engine, so there is nothing to reap —
+  /// acknowledge the quit and terminate. Honoring quit (rather than
+  /// returning the degraded error) lets the user fully dismiss a broken
+  /// Helper from the menu bar.
+  public func quitHelper(reply: @escaping (Data?) -> Void) {
+    Self.log.info("quitHelper: degraded helper terminating (no engine to reap)")
+    reply(nil)
+    onQuitRequested?()
   }
 }
