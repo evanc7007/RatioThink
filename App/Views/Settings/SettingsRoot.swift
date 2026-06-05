@@ -1,6 +1,6 @@
 import SwiftUI
 
-/// `Settings { SettingsRoot() }` host for the RatioThink app's Cmd-, window.
+/// `Settings { SettingsRoot() }` host for the Rational app's Cmd-, window.
 ///
 /// Four tabs (§5 design): General, Models, Profiles, Advanced. The API tab
 /// is hidden for v0.1.1 (the HTTP-endpoint feature isn't shipping yet) —

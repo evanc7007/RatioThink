@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Offline mock pie engine for README screenshot capture.
 #
-# Serves the four loopback endpoints RatioThink.app's HTTPEngineClient
+# Serves the four loopback endpoints Rational.app's HTTPEngineClient
 # speaks (see Shared/Engine/HTTPEngineClient.swift "Wire shapes"), with
 # canned content, so the REAL app UI can be driven into a populated state
 # for screenshots WITHOUT a real pie engine or a multi-GB model download:

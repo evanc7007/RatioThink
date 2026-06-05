@@ -555,7 +555,7 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
       // Review v16 F2 / v17 F5: a path-traversal attempt or
       // builder-rejected input is a caller-input failure — surface
       // as `.invalidInput` so the GUI renders "please correct
-      // repo/file" rather than "RatioThink internal bug." Reserves
+      // repo/file" rather than "Rational internal bug." Reserves
       // `.wireContractViolation` for actual XPC plumbing bugs per
       // its doc-comment.
       return EngineError(code: .invalidInput,

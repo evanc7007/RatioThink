@@ -1,4 +1,4 @@
-# RatioThink — Test catalog & pre-PR gate
+# Rational — Test catalog & pre-PR gate
 
 The single source of truth for *what tests exist, where they run, and what to
 confirm before opening a PR*. `make help` lists the runnable targets; this doc
@@ -12,7 +12,7 @@ below in the same change.
 | Target | What it runs | Runs where | Gating |
 |---|---|---|---|
 | `make lint` | helper side-effect invariants (static) | anywhere | — |
-| `make build` | Debug build of RatioThink app + helper | anywhere | — |
+| `make build` | Debug build of Rational app + helper | anywhere | — |
 | `make build-tests` | Compile every xcodebuild target + SPM probe | anywhere | — |
 | `make test-xcode-chat-scaffold` | `ChatScaffoldModelSelectionTests` (xcodebuild RatioThinkTests) regression guard | anywhere | — |
 | `make test-unit` | `RatioThinkCoreTests` (SPM, pure logic) | anywhere | — |
@@ -109,7 +109,7 @@ download), `S327` (engine-status pip), `S360` (Models top-align).
 
 ### GUI temp-home cleanup
 
-A GUI suite that needs the non-sandboxed `RatioThink.app` to write a real
+A GUI suite that needs the non-sandboxed `Rational.app` to write a real
 on-disk store stages its `PIE_HOME` under a real `/tmp` path (S285, S286) —
 never `NSTemporaryDirectory()`, which resolves to the sandboxed runner's
 container the app cannot write. Consequence: the suite **cannot delete that
@@ -310,7 +310,7 @@ Expected pass evidence:
   `What code word did I give you?`,
 - request log entry 2 contains the ordered in-session history:
   user turn 1, assistant turn 1, user turn 2,
-- XCUITest terminates/relaunches RatioThink.app with the same `PIE_HOME`, selects the
+- XCUITest terminates/relaunches Rational.app with the same `PIE_HOME`, selects the
   persisted chat, and sends turn 3:
   `Repeat the code word again.`,
 - request log entry 3 contains the ordered persisted history:
@@ -346,6 +346,6 @@ xcodebuild -project RatioThink.xcodeproj \
 ```
 
 `S258_ComposerSendGUITests` is the first GUI suite to exercise the full
-`RatioThink.app → create/select chat → ComposerView send → HTTPEngineClient →
+`Rational.app → create/select chat → ComposerView send → HTTPEngineClient →
 real engine stream → MessageStreamWriter → persisted assistant message` path
 end to end.

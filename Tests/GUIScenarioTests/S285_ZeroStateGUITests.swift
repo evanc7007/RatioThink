@@ -30,7 +30,7 @@ final class S285_ZeroStateGUITests: XCTestCase {
     configureCompletedFirstLaunch(app)
     // Use a real shared /tmp path, NOT NSTemporaryDirectory(): the
     // XCUITest runner is sandboxed, so NSTemporaryDirectory() resolves
-    // to the runner's container tmp, which the non-sandboxed RatioThink.app
+    // to the runner's container tmp, which the non-sandboxed Rational.app
     // cannot write — its on-disk store would silently fall back to
     // in-memory and the "isolated empty store" intent would be a no-op.
     let home = "/tmp/pie-s285-" + UUID().uuidString

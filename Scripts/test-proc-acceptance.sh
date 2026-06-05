@@ -1,7 +1,7 @@
 #!/bin/bash
 # Unit regression for Scripts/lib/proc-acceptance.sh ( F1).
 #
-# Verification must reject any pie/RatioThinkHelper not PROVEN to be from this
+# Verification must reject any pie/RationalHelper not PROVEN to be from this
 # launch: a stale image whose argv still shows the (replaced) bundle path,
 # AND — crucially — a respawn in the SAME wall-clock second as the
 # acceptance epoch (whole-second `etimes` would otherwise compute it as
@@ -13,7 +13,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=lib/proc-acceptance.sh
 . "$ROOT/Scripts/lib/proc-acceptance.sh"
 
-APP="/Applications/RatioThink.app"
+APP="/Applications/Rational.app"
 EPOCH=1000000
 NOW=$EPOCH        # mutable; the date stub reads it
 
@@ -25,7 +25,7 @@ ps() {
   case "$field" in
     args=)
       case "$pid" in
-        100|101|102|103) echo "/Applications/RatioThink.app/Contents/Resources/pie-engine/pie serve --config x" ;;
+        100|101|102|103) echo "/Applications/Rational.app/Contents/Resources/pie-engine/pie serve --config x" ;;
         200)             echo "/Applications/Other.app/Contents/MacOS/Other" ;;
         *)               return 1 ;;
       esac ;;
