@@ -329,14 +329,21 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
         box = nil
       }
     }
-    func fireOnce(_ result: Result<EnginePort, EngineError>) {
+    /// Resolve the single startEngine reply. Returns `true` when THIS call
+    /// won the race (it delivered the reply), `false` when a prior caller
+    /// already replied. The win flag gates the reply-timeout fallback's
+    /// `engineHost.stop()` so only a genuinely-wedged start is cancelled
+    /// (#448).
+    @discardableResult
+    func fireOnce(_ result: Result<EnginePort, EngineError>) -> Bool {
       let already = replied.withLock { (fired: inout Bool) -> Bool in
         defer { fired = true }
         return fired
       }
       cancelObserver()
-      if already { return }
+      if already { return false }
       PieHelperXPCWire.replyStartEngine(result, via: reply)
+      return true
     }
     let token = engineHost.observe { status, _ in
       let shouldFire: (Result<EnginePort, EngineError>)?
@@ -366,17 +373,21 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
     let deadline: TimeInterval = Self.startReplyDeadline
     #endif
     DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + deadline) { [weak engineHost] in
-      // Review v1 F1: cancel the in-flight launch BEFORE firing the
-      // failure reply. Without this the host stays in `.starting`; a
-      // slow `pie serve` boot then publishes `.running` after the
-      // client already received `.handshakeTimeout`, and a subsequent
-      // `startEngine` is rejected with `.alreadyRunning` against an
-      // orphan engine the client never saw acknowledged.
-      engineHost?.stop()
-      fireOnce(.failure(EngineError(
+      // #448: the fallback must stop the engine ONLY when this timeout WON
+      // the reply race — i.e. the start never resolved and the host is still
+      // wedged in `.starting`. Pre-fix, `engineHost.stop()` ran
+      // unconditionally here, so a HEALTHY `.running` engine (whose success
+      // reply was already delivered by the observer) was force-stopped
+      // exactly `deadline`s after every App-driven start — the ~60s "engine
+      // dies after going idle" bug. Gating on the `fireOnce` win flag
+      // preserves the original intent (review v1 F1): a genuinely wedged
+      // launch is cancelled before it can surprise-publish `.running` after
+      // the client gave up, while a started engine is left running.
+      let wonRace = fireOnce(.failure(EngineError(
         code: .handshakeTimeout,
         message: "startEngine reply-timeout fallback fired after \(deadline)s (host never transitioned out of .starting)"
       )))
+      if wonRace { engineHost?.stop() }
     }
   }
 

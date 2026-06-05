@@ -155,6 +155,66 @@ final class StartEngineXPCIntegrationTests: IsolatedTestCase {
     XCTAssertFalse(message.isEmpty, "engine-gone status must carry a cause over the wire")
   }
 
+  /// #448 regression: a HEALTHY engine that reaches `.running` must NOT be
+  /// stopped by the `startEngine` reply-timeout fallback after the deadline
+  /// elapses. Pre-fix, the fallback called `engineHost.stop()`
+  /// unconditionally, killing a running engine exactly `startReplyDeadline`s
+  /// (60s in prod) after every App-driven start — the "engine dies ~1 min
+  /// after going idle" report. Here the deadline is shrunk to 0.3s via the
+  /// DEBUG `replyTimeoutOverride` seam; the engine must still be `.running`
+  /// after the timer would have fired.
+  func test_startEngine_healthyEngineSurvivesReplyDeadline() async throws {
+    let store = try makeProfileStoreWithChat()
+    defer { store.stop() }
+
+    let host = makeEngineHost(port: 24650)
+    defer { host.stop() }
+
+    let ignored = try writeCapabilityProbe(portable: true, metal: true)
+    let modelsRoot = tempDir.appendingPathComponent("models", isDirectory: true)
+    try FileManager.default.createDirectory(at: modelsRoot, withIntermediateDirectories: true)
+    try Data("ignored".utf8).write(
+      to: modelsRoot.appendingPathComponent("ignored-by-fake-pie.gguf", isDirectory: false)
+    )
+    let resources = try writeInferletResources(name: "chat-apc", version: "0.1.0")
+    let resolver = LaunchSpecResolver(
+      profileStore: store,
+      pieBinary: { ignored },
+      modelsRoot: { modelsRoot },
+      inferletsDir: { self.tempDir.appendingPathComponent("inferlets") },
+      pieControlResources: { resources },
+      pieHome: { self.tempDir },
+      subprocessEnvironment: { [:] }
+    )
+    // Shrink ONLY the start deadline so the fallback timer fires ~0.3s after
+    // start; the engine reaches `.running` near-instantly via FakeSession.
+    let exported = HelperExportedAPI(engineHost: host,
+                                     launchSpecResolver: resolver.asClosure,
+                                     replyTimeoutOverride: (start: 0.3, stop: 17))
+
+    let listenerOwner = HelperXPCListener.startAnonymous(exportedObject: exported)
+    defer { listenerOwner.invalidate() }
+    let connection = NSXPCConnection(listenerEndpoint: listenerOwner.endpoint)
+    connection.remoteObjectInterface = PieHelperXPCInterface.make()
+    connection.resume()
+    defer { connection.invalidate() }
+    let api = try XCTUnwrap(connection.remoteObjectProxyWithErrorHandler { err in
+      XCTFail("XPC proxy error: \(err)")
+    } as? PieHelperXPC, "remote proxy must conform to PieHelperXPC")
+
+    let port = try await callStartEngine(api: api, profileID: "chat", timeout: 8)
+    XCTAssertEqual(port, 24650)
+
+    // Wait well past the 0.3s start deadline (when the buggy fallback would
+    // have stopped the engine).
+    try await Task.sleep(nanoseconds: 900_000_000)
+
+    let status = try await callEngineStatus(api: api, timeout: 4)
+    guard case .running = status else {
+      return XCTFail("healthy engine was stopped by the reply-timeout fallback after the deadline (got \(status)) — #448 idle-death regression")
+    }
+  }
+
   /// Session whose `checkLiveness()` replays a scripted sequence, then
   /// repeats the final element — models a mid-session engine death for
   /// the XPC engine-gone integration test.
