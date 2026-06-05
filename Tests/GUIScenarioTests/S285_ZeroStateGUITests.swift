@@ -1,7 +1,7 @@
 import XCTest
 
 /// S285 — UI soundness audit: empty/zero states stay top-aligned and the
-/// col-3 zero-state CTAs are live affordances (not dead buttons).
+/// shipped col-3 zero-state CTA is a live affordance (not a dead button).
 ///
 /// Each test runs against an isolated `PIE_HOME` temp root so the on-disk
 /// `chats.sqlite` starts empty and creating a chat/endpoint here never
@@ -92,25 +92,21 @@ final class S285_ZeroStateGUITests: XCTestCase {
                   "zero-state CTAs must dismiss once a chat is selected")
   }
 
-  /// The col-3 zero-state "Add Endpoint" CTA must create an endpoint and
-  /// open its detail (previously wired to an empty closure).
+  /// v0.1.1 hides the API Endpoints feature, so the col-3 zero-state must
+  /// not expose the old "Add Endpoint" CTA. S5 covers the same shell-level
+  /// absence; this keeps S285's zero-state affordance audit aligned with
+  /// the shipped product while `Start Chat` remains the live CTA above.
   @MainActor
-  func test_add_endpoint_cta_opens_endpoint_detail() async throws {
+  func test_add_endpoint_cta_is_hidden_in_v011() async throws {
     let app = makeApp()
     app.launch()
     defer { app.terminate() }
     XCTAssert(app.wait(for: .runningForeground, timeout: 5))
     app.activate()
 
-    let addEndpoint = app.buttons["Add Endpoint"]
-    XCTAssertTrue(addEndpoint.waitForExistence(timeout: 5),
-                  "col-3 zero-state Add Endpoint CTA missing")
-    addEndpoint.click()
-
-    // The endpoint detail's name field only exists once an endpoint is open.
-    XCTAssertTrue(app.textFields["EndpointName"].waitForExistence(timeout: 5),
-                  "Add Endpoint must create + open an endpoint detail")
-    XCTAssertTrue(addEndpoint.waitForNonExistence(timeout: 5),
-                  "zero-state CTAs must dismiss once an endpoint is selected")
+    XCTAssertTrue(app.buttons["Start Chat"].waitForExistence(timeout: 5),
+                  "shipped col-3 zero-state Start Chat CTA missing")
+    XCTAssertFalse(app.buttons["Add Endpoint"].exists,
+                   "v0.1.1 zero-state must not expose the hidden Add Endpoint CTA")
   }
 }
