@@ -193,6 +193,11 @@ targets:
         # "package" identity kept for compatibility), so PRODUCT_NAME is
         # what renames the bundle + its executable to `Rational`.
         PRODUCT_NAME: Rational
+        # PRODUCT_NAME also drives PRODUCT_MODULE_NAME by default, which would
+        # rename the Swift module to `Rational` and break the 28 `@testable
+        # import RatioThink` test consumers. Pin the module to the kept package
+        # name so the rename stays product-name-only.
+        PRODUCT_MODULE_NAME: RatioThink
         PRODUCT_BUNDLE_IDENTIFIER: com.ratiothink.app
         INFOPLIST_FILE: App/Info.plist
         CODE_SIGN_ENTITLEMENTS: App/RatioThink.entitlements
@@ -234,6 +239,9 @@ targets:
         # embedded bundle + executable — the launchd plist BundleProgram
         # path (Helper/com.ratiothink.app.helper.plist) tracks this name.
         PRODUCT_NAME: RationalHelper
+        # Keep the Swift module name (= build package), independent of the
+        # renamed product, mirroring the app target.
+        PRODUCT_MODULE_NAME: RatioThinkHelper
         PRODUCT_BUNDLE_IDENTIFIER: com.ratiothink.app.helper
         INFOPLIST_FILE: Helper/Info.plist
         CODE_SIGN_ENTITLEMENTS: Helper/RatioThinkHelper.entitlements
@@ -248,6 +256,14 @@ targets:
       - package: TOMLKit
       - package: MarkdownUI
         product: MarkdownUI
+    settings:
+      base:
+        # The RatioThink target ships Rational.app (PRODUCT_NAME, #445), but
+        # xcodegen derives TEST_HOST from the host target NAME, yielding the
+        # now-nonexistent RatioThink.app. A dead TEST_HOST makes Xcode drop this
+        # bundle from the RatioThink scheme's test action ("isn't a member of the
+        # scheme"). Point it at the real product so the unit tests host + run.
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/Rational.app/Contents/MacOS/Rational"
 
   RatioThinkGUITests:
     type: bundle.ui-testing
