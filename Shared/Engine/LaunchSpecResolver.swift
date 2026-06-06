@@ -132,8 +132,12 @@ public struct LaunchSpecResolver {
         message: "launch path resolution failed: \(String(describing: error))"
       ))
     }
+    guard let model = profile.model,
+          !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+      return .failure(Self.noDefaultModelError(profile: profile))
+    }
     let modelPath = Self.joinModelPath(modelsRoot: models,
-                                       slug: profile.model)
+                                       slug: model)
     return .success(PieSupervisor.LaunchSpec(
       binaryURL: binary,
       modelPath: modelPath,
@@ -176,11 +180,15 @@ public struct LaunchSpecResolver {
     // can't select them, but a stale or hand-authored profile could still
     // name one — fail fast with a clear reason instead of handing the
     // engine a shard it cannot load.
-    let modelLeaf = profile.model.split(separator: "/").last.map(String.init) ?? profile.model
+    guard let model = profile.model,
+          !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+      return .failure(Self.noDefaultModelError(profile: profile))
+    }
+    let modelLeaf = model.split(separator: "/").last.map(String.init) ?? model
     if HFCacheCatalog.isSplitShardFilename(modelLeaf) {
       return .failure(EngineError(
         code: .invalidInput,
-        message: "\(HFCacheCatalog.shardedUnsupportedReason) (model=\(profile.model))"
+        message: "\(HFCacheCatalog.shardedUnsupportedReason) (model=\(model))"
       ))
     }
     let binary: URL
@@ -222,7 +230,7 @@ public struct LaunchSpecResolver {
         shmemName: shmem,
         inferletNameAtVersion: inferletNameAtVersion,
         profileID: profile.id,
-        modelConfig: .portableResolved(servedModelID: profile.model, modelRef: modelRef)
+        modelConfig: .portableResolved(servedModelID: model, modelRef: modelRef)
       )
       return .success(spec)
     } catch {
@@ -237,12 +245,16 @@ public struct LaunchSpecResolver {
   private func resolveModelRef(profile: Profile,
                                modelsRoot: URL,
                                fileManager: FileManager = .default) -> Result<String, EngineError> {
-    let localPath = Self.joinModelPath(modelsRoot: modelsRoot, slug: profile.model)
+    guard let model = profile.model,
+          !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+      return .failure(Self.noDefaultModelError(profile: profile))
+    }
+    let localPath = Self.joinModelPath(modelsRoot: modelsRoot, slug: model)
     switch Self.validateAppStagedModel(at: localPath, fileManager: fileManager) {
     case .success(true):
       switch ModelMemoryGuardrail.validate(
         resolvedModelURL: URL(fileURLWithPath: localPath, isDirectory: false),
-        modelID: profile.model,
+        modelID: model,
         policy: memoryPolicy(),
         fileManager: fileManager
       ) {
@@ -259,12 +271,12 @@ public struct LaunchSpecResolver {
         profile: profile,
         appPath: localPath,
         appPathProblem: problem.reason,
-        hfIdentity: Self.hfIdentity(forModelSlug: profile.model),
+        hfIdentity: Self.hfIdentity(forModelSlug: model),
         hfHome: hfHome()
       ))
     }
 
-    let hfIdentity = Self.hfIdentity(forModelSlug: profile.model)
+    let hfIdentity = Self.hfIdentity(forModelSlug: model)
     let hfCacheRoot = hfHome()
     if let hfIdentity {
       switch HFCacheResolver(hfHome: hfCacheRoot, fileManager: fileManager)
@@ -272,7 +284,7 @@ public struct LaunchSpecResolver {
       case .hit(let cached):
         switch ModelMemoryGuardrail.validate(
           resolvedModelURL: cached,
-          modelID: profile.model,
+          modelID: model,
           policy: memoryPolicy(),
           fileManager: fileManager
         ) {
@@ -348,7 +360,7 @@ public struct LaunchSpecResolver {
                                         hfHome: URL,
                                         hfProblem: HFCacheResolver.CacheProblem? = nil) -> EngineError {
     var parts = [
-      "model missing for profile \(profile.id.debugDescription): \(profile.model.debugDescription)",
+      "model missing for profile \(profile.id.debugDescription): \((profile.model ?? "<none>").debugDescription)",
       "checked app-staged path \(appPath)",
     ]
     if let appPathProblem {
@@ -365,6 +377,13 @@ public struct LaunchSpecResolver {
       parts.append("recovery: import/stage a GGUF at \(appPath)")
     }
     return EngineError(code: .modelMissing, message: parts.joined(separator: "; "))
+  }
+
+  private static func noDefaultModelError(profile: Profile) -> EngineError {
+    EngineError(
+      code: .modelMissing,
+      message: "profile \(profile.id.debugDescription) has no default model; choose or download a model before starting"
+    )
   }
 
   private static func downloadCommand(for identity: (repo: String, file: String?)) -> String {

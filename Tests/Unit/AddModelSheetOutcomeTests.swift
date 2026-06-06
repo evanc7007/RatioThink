@@ -58,6 +58,34 @@ final class AddModelSheetOutcomeTests: XCTestCase {
                   "all-failure case must still be visible — not silently dropped; got: \(formatted)")
   }
 
+  func test_delete_referenced_model_message_names_profiles_and_clears_defaults() {
+    let row = InstalledModel(
+      filename: "Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf",
+      url: URL(fileURLWithPath: "/tmp/Qwen3-0.6B-Q8_0.gguf"),
+      sizeBytes: 10,
+      modifiedAt: Date(timeIntervalSince1970: 0),
+      isPartial: false
+    )
+    let message = ModelsSettingsTab.deleteReferencedModelMessage(
+      row: row,
+      affectedProfiles: [
+        ProfileModelReference(id: "chat", name: "Chat"),
+        ProfileModelReference(id: "fast-think", name: "Fast Think"),
+      ]
+    )
+
+    XCTAssertTrue(message.contains("2 profiles use this model as its default"),
+                  "message must show the affected count; got: \(message)")
+    XCTAssertTrue(message.contains("Chat, Fast Think"),
+                  "message must name affected profiles; got: \(message)")
+    XCTAssertTrue(message.contains("profile defaults will be cleared"),
+                  "message must make the destructive profile cleanup explicit; got: \(message)")
+    XCTAssertTrue(message.contains("Choose/Download actions"),
+                  "message must tell users the cleared profiles enter no-default recovery UI; got: \(message)")
+    XCTAssertTrue(message.contains("running engine is not stopped"),
+                  "message must define behavior when the model is currently loaded/running; got: \(message)")
+  }
+
   // MARK: - F38: emit-gate helper (review v5)
 
   // The drop closure's gate condition lives in

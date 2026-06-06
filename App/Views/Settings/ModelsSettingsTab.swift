@@ -8,6 +8,7 @@ import UniformTypeIdentifiers
 /// every model load is now always confirmed.)
 struct ModelsSettingsTab: View {
   @EnvironmentObject private var downloads: ModelDownloadController
+  @EnvironmentObject private var profileStore: ProfileStore
   @State private var installed: [InstalledModel] = []
   @State private var scanError: String?
   @State private var showAddSheet: Bool = false
@@ -94,14 +95,25 @@ struct ModelsSettingsTab: View {
   }
 
   private func deleteFile(_ row: InstalledModel) {
+    let affected = profileStore.profilesReferencingModel(row.filename)
     let alert = NSAlert()
     alert.messageText = "Delete \(row.displayName)?"
-    alert.informativeText = "The file will be moved to the Trash. This does not affect profiles that reference it."
-    alert.addButton(withTitle: "Delete")
+    if affected.isEmpty {
+      alert.informativeText = "The file will be moved to the Trash."
+    } else {
+      alert.informativeText = Self.deleteReferencedModelMessage(
+        row: row,
+        affectedProfiles: affected
+      )
+    }
+    alert.addButton(withTitle: affected.isEmpty ? "Delete" : "Delete and Clear Defaults")
     alert.addButton(withTitle: "Cancel")
     alert.alertStyle = .warning
     guard alert.runModal() == .alertFirstButtonReturn else { return }
     do {
+      if !affected.isEmpty {
+        try profileStore.clearModelDefaults(referencing: row.filename)
+      }
       try FileManager.default.trashItem(at: row.url, resultingItemURL: nil)
       actionError = nil
     } catch {
@@ -120,6 +132,17 @@ struct ModelsSettingsTab: View {
       at: URL(fileURLWithPath: row.url.path + InstalledModels.unverifiedSuffix),
       resultingItemURL: nil)
     Task { await refresh() }
+  }
+
+  static func deleteReferencedModelMessage(
+    row: InstalledModel,
+    affectedProfiles: [ProfileModelReference]
+  ) -> String {
+    let count = affectedProfiles.count
+    let names = affectedProfiles.map(\.name).joined(separator: ", ")
+    let profileWord = count == 1 ? "profile uses" : "profiles use"
+    let defaultsWord = count == 1 ? "default" : "defaults"
+    return "\(count) \(profileWord) this model as its default: \(names). The file will be moved to the Trash and those profile \(defaultsWord) will be cleared. Profiles with no default will show Choose/Download actions the next time you use them; a running engine is not stopped."
   }
 
   /// Drag-drop handler. Surfaces a per-file aggregate so partial

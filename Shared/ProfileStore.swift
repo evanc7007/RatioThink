@@ -142,6 +142,18 @@ public struct ProfileStoreSnapshot {
   }
 }
 
+/// Minimal profile identity shown when a model delete would clear one
+/// or more profile defaults.
+public struct ProfileModelReference: Equatable, Sendable {
+  public let id: String
+  public let name: String
+
+  public init(id: String, name: String) {
+    self.id = id
+    self.name = name
+  }
+}
+
 /// Watches `~/Library/Application Support/RatioThink/profiles/` (or any
 /// directory passed at init) via `DispatchSource.makeFileSystemObject
 /// Source`. Reloads on change, parses each `*.toml` file, surfaces
@@ -649,7 +661,24 @@ public final class ProfileStore: ObservableObject {
   /// `modelForProfile` in `ProfileSwapCoordinator` is wired to this.
   public func model(forProfileID id: String) -> String? {
     stateLock.withLock {
-      _entries.first { $0.profile?.id == id }?.profile?.model
+      guard let model = _entries.first(where: { $0.profile?.id == id })?.profile?.model,
+            !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+        return nil
+      }
+      return model
+    }
+  }
+
+  /// Valid profiles whose default model is exactly `modelID`, in the
+  /// same stable order as `entries`. Used before deleting an installed
+  /// model so the confirmation can name/count affected profiles.
+  public func profilesReferencingModel(_ modelID: String) -> [ProfileModelReference] {
+    stateLock.withLock {
+      _entries.compactMap { entry in
+        guard let profile = entry.profile,
+              profile.model == modelID else { return nil }
+        return ProfileModelReference(id: profile.id, name: profile.name)
+      }
     }
   }
 
@@ -682,6 +711,38 @@ public final class ProfileStore: ObservableObject {
     var updated = target.profile
     updated.model = model
     try createProfile(updated, filename: target.filename)
+  }
+
+  /// Clear a profile's default model, preserving every other field and
+  /// keeping the profile parseable as an explicit no-default state.
+  public func clearModel(forProfileID id: String) throws {
+    let target: (profile: Profile, filename: String) = try stateLock.withLock {
+      guard let entry = _entries.first(where: { $0.profile?.id == id }),
+            let profile = entry.profile else {
+        throw ProfileStoreError.profileNotFound(id: id)
+      }
+      return (profile, entry.url.lastPathComponent)
+    }
+    var updated = target.profile
+    updated.model = nil
+    try createProfile(updated, filename: target.filename)
+  }
+
+  /// Clear every valid profile whose default references `modelID`.
+  /// Matching is exact; no fallback model is selected.
+  public func clearModelDefaults(referencing modelID: String) throws {
+    let targets: [(profile: Profile, filename: String)] = stateLock.withLock {
+      _entries.compactMap { entry in
+        guard let profile = entry.profile,
+              profile.model == modelID else { return nil }
+        return (profile, entry.url.lastPathComponent)
+      }
+    }
+    for target in targets {
+      var updated = target.profile
+      updated.model = nil
+      try createProfile(updated, filename: target.filename)
+    }
   }
 
   /// Persist `id` as the active profile. Writes atomically to

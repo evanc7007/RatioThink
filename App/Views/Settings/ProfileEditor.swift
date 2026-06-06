@@ -118,7 +118,9 @@ struct ProfileEditor: View {
       }
     } label: {
       HStack(spacing: 4) {
-        Text(ModelDisplayName.leaf(profile.model)).monospaced()
+        Text(profile.model.map(ModelDisplayName.leaf) ?? "No default model")
+          .monospaced()
+          .foregroundStyle(profile.model == nil ? .secondary : .primary)
         Image(systemName: "chevron.up.chevron.down").font(.caption)
       }
     }

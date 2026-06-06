@@ -54,6 +54,38 @@ final class LaunchSpecResolverTests: XCTestCase {
                    "modelPath must join `modelsRoot` with `profile.model` for the downloader's on-disk layout")
   }
 
+  func test_resolve_noDefaultProfile_returns_modelMissing_without_fallback() throws {
+    let profiles = tempDir.appendingPathComponent("profiles-no-default", isDirectory: true)
+    try FileManager.default.createDirectory(at: profiles, withIntermediateDirectories: true)
+    let toml = """
+    id = "chat"
+    name = "Chat"
+    inferlet = "chat-apc"
+    """
+    try toml.write(to: profiles.appendingPathComponent("chat.toml"),
+                   atomically: true, encoding: .utf8)
+    let active = tempDir.appendingPathComponent("active-profile-no-default", isDirectory: false)
+    let store = ProfileStore(directory: profiles, activeProfileURL: active)
+    try store.start()
+    defer { store.stop() }
+
+    let binary = tempDir.appendingPathComponent("pie-fake", isDirectory: false)
+    try touchExecutable(at: binary)
+    let resolver = LaunchSpecResolver(
+      profileStore: store,
+      pieBinary: { binary },
+      modelsRoot: { self.tempDir.appendingPathComponent("models") },
+      inferletsDir: { self.tempDir.appendingPathComponent("inferlets") }
+    )
+
+    guard case .failure(let error) = resolver.resolve(profileID: "chat") else {
+      return XCTFail("no-default profile must not resolve by choosing a hidden fallback")
+    }
+    XCTAssertEqual(error.code, .modelMissing)
+    XCTAssertTrue(error.message.contains("has no default model"),
+                  "error should route the UI to choose/download actions; got: \(error.message)")
+  }
+
   /// Review v2 F7 + v3 F1 regression guard. The resolver mapped
   /// `profile.model` but silently dropped `profile.inferlet` — making
   /// every profile indistinguishable to the engine as soon as a second
