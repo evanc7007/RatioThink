@@ -242,7 +242,8 @@ public final class HelperXPCClient: AppXPCClient, @unchecked Sendable {
   /// reaps the engine (worst case the `LaunchedSession` SIGINT→SIGKILL
   /// grace) before replying. A healthy engine stops in well under a second;
   /// the bound exists only so a wedged engine can't hang the App's quit.
-  private static let quitReplyTimeout: TimeInterval = 6.0
+  static let quitReplyTimeout: TimeInterval =
+    HelperExportedAPI.stopReplyDeadline + HelperExportedAPI.replyTimeoutSlack
 
   public func quitHelper() async throws {
     let connection = ensureConnection()

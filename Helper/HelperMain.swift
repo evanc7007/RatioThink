@@ -1410,7 +1410,15 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
       NSApp.terminate(nil)
       return
     }
-    engineHost.stopAndWait(timeout: 17) {
+    engineHost.stopAndWait(timeout: 17) { [weak engineHost] result in
+      guard result.reachedTerminal else {
+        Log.helper.error("quitHelperLocally: stop/reap timed out with status \(String(describing: result.lastStatus), privacy: .public); waiting for terminal state before terminating helper")
+        engineHost?.stopAndWait(timeout: 0) { laterResult in
+          guard laterResult.reachedTerminal else { return }
+          DispatchQueue.main.async { NSApp.terminate(nil) }
+        }
+        return
+      }
       DispatchQueue.main.async { NSApp.terminate(nil) }
     }
   }

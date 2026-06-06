@@ -42,6 +42,23 @@ public enum EngineLiveness: Equatable, Sendable {
   case gone(reason: String)
 }
 
+public struct StopAndWaitResult: Equatable, Sendable {
+  public enum Completion: Equatable, Sendable {
+    case terminal
+    case timedOut
+  }
+
+  public let completion: Completion
+  public let lastStatus: EngineStatus
+
+  public var reachedTerminal: Bool { completion == .terminal }
+
+  public init(completion: Completion, lastStatus: EngineStatus) {
+    self.completion = completion
+    self.lastStatus = lastStatus
+  }
+}
+
 public final class PieEngineHost: @unchecked Sendable {
 
   // MARK: - LaunchSpec
@@ -321,15 +338,16 @@ public final class PieEngineHost: @unchecked Sendable {
   }
 
   /// #448 quit primitive: `stop()` the engine and invoke `completion`
-  /// exactly once, when the host has reached a terminal state
-  /// (`.stopped`/`.failed`) — which is published only AFTER
-  /// `LaunchedSession.shutdown` (SIGINT → grace → SIGKILL) has reaped the
-  /// `pie` process — or after `timeout` if it never settles. Lets a quit
-  /// path terminate its own process without orphaning the engine. The
-  /// bounded fallback guarantees a wedged engine cannot block quit; a stuck
-  /// pid is then reaped by the OS when the host's process exits. `completion`
-  /// fires on `stateQueue` (terminal path) or a global queue (timeout).
-  public func stopAndWait(timeout: TimeInterval, completion: @escaping @Sendable () -> Void) {
+  /// exactly once with a result that distinguishes a real terminal state
+  /// (`.stopped`/`.failed`) from the timeout fallback. Terminal states are
+  /// published only AFTER `LaunchedSession.shutdown` (SIGINT → grace →
+  /// SIGKILL) has reaped the `pie` process, so callers that promise a
+  /// no-orphan structured quit must require `result.reachedTerminal == true`
+  /// before reporting success. The bounded fallback keeps callers observable
+  /// when the engine wedges instead of silently conflating timeout with reap.
+  /// `completion` fires on `stateQueue` (terminal path) or a global queue
+  /// (timeout).
+  public func stopAndWait(timeout: TimeInterval, completion: @escaping @Sendable (StopAndWaitResult) -> Void) {
     let done = OSAllocatedUnfairLock<Bool>(initialState: false)
     let tokenBox = OSAllocatedUnfairLock<ObservationToken?>(initialState: nil)
     func cancelObserver() {
@@ -338,20 +356,21 @@ public final class PieEngineHost: @unchecked Sendable {
         box = nil
       }
     }
-    func finish() {
+    func finish(_ result: StopAndWaitResult) {
       let already = done.withLock { (d: inout Bool) -> Bool in
         defer { d = true }
         return d
       }
       cancelObserver()
       if already { return }
-      completion()
+      completion(result)
     }
     // observe() dispatches the CURRENT status synchronously on stateQueue, so
     // an already-terminal host fires `finish()` immediately.
     let token = observe { status, _ in
       switch status {
-      case .stopped, .failed: finish()
+      case .stopped, .failed:
+        finish(StopAndWaitResult(completion: .terminal, lastStatus: status))
       case .starting, .running, .stopping: return
       }
     }
@@ -359,7 +378,12 @@ public final class PieEngineHost: @unchecked Sendable {
     if done.withLock({ $0 }) { cancelObserver() }
     stop()
     if timeout > 0 {
-      DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + timeout, execute: finish)
+      DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + timeout) { [weak self] in
+        finish(StopAndWaitResult(completion: .timedOut, lastStatus: self?.status ?? .failed(
+          code: .unknown,
+          message: "PieEngineHost deallocated before stopAndWait timeout sampled status"
+        )))
+      }
     }
   }
 

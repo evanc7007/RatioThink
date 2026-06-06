@@ -71,7 +71,9 @@ final class PieEngineHostTests: XCTestCase {
 
     let done = expectation(description: "stopAndWait completion fires")
     let fireCount = OSAllocatedUnfairLock<Int>(initialState: 0)
-    host.stopAndWait(timeout: 5) {
+    host.stopAndWait(timeout: 5) { result in
+      XCTAssertTrue(result.reachedTerminal, "normal stop must report a terminal reap")
+      XCTAssertEqual(result.lastStatus, .stopped)
       fireCount.withLock { $0 += 1 }
       done.fulfill()
     }
@@ -90,7 +92,36 @@ final class PieEngineHostTests: XCTestCase {
     let host = PieEngineHost(launcher: { _ in (port: EnginePort(1), session: FakeSession()) })
     XCTAssertEqual(host.status, .stopped)
     let done = expectation(description: "completion fires for already-stopped host")
-    host.stopAndWait(timeout: 5) { done.fulfill() }
+    host.stopAndWait(timeout: 5) { result in
+      XCTAssertTrue(result.reachedTerminal)
+      XCTAssertEqual(result.lastStatus, .stopped)
+      done.fulfill()
+    }
+    wait(for: [done], timeout: 2)
+  }
+
+  func test_stopAndWait_timeoutReportsNonTerminalLastStatus() {
+    final class HangingSession: PieEngineHost.EngineSession, @unchecked Sendable {
+      func shutdown() async {
+        try? await Task.sleep(nanoseconds: 5_000_000_000)
+      }
+    }
+
+    let host = PieEngineHost(launcher: { _ in (port: EnginePort(5151), session: HangingSession()) })
+    let running = expectation(description: "host reaches .running")
+    let token = host.observe { status, _ in
+      if case .running = status { running.fulfill() }
+    }
+    _ = host.start(makeSpec())
+    wait(for: [running], timeout: 2)
+    token.cancel()
+
+    let done = expectation(description: "stopAndWait timeout completion fires")
+    host.stopAndWait(timeout: 0.05) { result in
+      XCTAssertFalse(result.reachedTerminal, "timeout must be distinguishable from terminal reap")
+      XCTAssertEqual(result.lastStatus, .stopping)
+      done.fulfill()
+    }
     wait(for: [done], timeout: 2)
   }
 

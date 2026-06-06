@@ -268,6 +268,66 @@ final class StartEngineXPCIntegrationTests: IsolatedTestCase {
     XCTAssertEqual(host.status, .stopped, "quitHelper must reap the engine before terminating")
   }
 
+  func test_quitHelper_overXPC_timeoutReturnsEngineErrorInsteadOfNilSuccess() async throws {
+    final class HangingShutdownSession: PieEngineHost.EngineSession, @unchecked Sendable {
+      func shutdown() async {
+        try? await Task.sleep(nanoseconds: 5_000_000_000)
+      }
+    }
+
+    let store = try makeProfileStoreWithChat()
+    defer { store.stop() }
+
+    let host = PieEngineHost(launcher: { _ in
+      (port: EnginePort(24661), session: HangingShutdownSession())
+    })
+    defer { host.stop() }
+
+    let ignored = try writeCapabilityProbe(portable: true, metal: true)
+    let modelsRoot = tempDir.appendingPathComponent("models", isDirectory: true)
+    try FileManager.default.createDirectory(at: modelsRoot, withIntermediateDirectories: true)
+    try Data("ignored".utf8).write(
+      to: modelsRoot.appendingPathComponent("ignored-by-fake-pie.gguf", isDirectory: false)
+    )
+    let resources = try writeInferletResources(name: "chat-apc", version: "0.1.0")
+    let resolver = LaunchSpecResolver(
+      profileStore: store,
+      pieBinary: { ignored },
+      modelsRoot: { modelsRoot },
+      inferletsDir: { self.tempDir.appendingPathComponent("inferlets") },
+      pieControlResources: { resources },
+      pieHome: { self.tempDir },
+      subprocessEnvironment: { [:] }
+    )
+    let exported = HelperExportedAPI(
+      engineHost: host,
+      launchSpecResolver: resolver.asClosure,
+      replyTimeoutOverride: (start: 8, stop: 0.05)
+    )
+
+    let listenerOwner = HelperXPCListener.startAnonymous(exportedObject: exported)
+    defer { listenerOwner.invalidate() }
+    let connection = NSXPCConnection(listenerEndpoint: listenerOwner.endpoint)
+    connection.remoteObjectInterface = PieHelperXPCInterface.make()
+    connection.resume()
+    defer { connection.invalidate() }
+    let api = try XCTUnwrap(connection.remoteObjectProxyWithErrorHandler { err in
+      XCTFail("XPC proxy error: \(err)")
+    } as? PieHelperXPC, "remote proxy must conform to PieHelperXPC")
+
+    let port = try await callStartEngine(api: api, profileID: "chat", timeout: 8)
+    XCTAssertEqual(port, 24661)
+
+    do {
+      try await callQuitHelper(api: api, timeout: 2)
+      XCTFail("quitHelper timeout must not be reported as nil success")
+    } catch XPCError.engine(let err) {
+      XCTAssertEqual(err.code, .handshakeTimeout)
+      XCTAssertTrue(err.message.contains("quitHelper"))
+      XCTAssertTrue(err.message.contains("0.05"))
+    }
+  }
+
   /// Session whose `checkLiveness()` replays a scripted sequence, then
   /// repeats the final element — models a mid-session engine death for
   /// the XPC engine-gone integration test.

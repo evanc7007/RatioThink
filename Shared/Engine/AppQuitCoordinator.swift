@@ -29,6 +29,8 @@ public final class AppQuitCoordinator {
   private let helperClient: any AppXPCClient
   private let isTestLaunch: Bool
   public private(set) var isQuitting = false
+  private var teardownComplete = false
+  private var pendingDoneCallbacks: [@MainActor () -> Void] = []
   private nonisolated static let log = Logger(subsystem: "com.ratiothink.app", category: "quit")
 
   public init(
@@ -40,12 +42,16 @@ public final class AppQuitCoordinator {
   }
 
   /// Begin the coordinated teardown. `done` is invoked exactly once, on the
-  /// main actor, when the App may terminate. A second call while a teardown
-  /// is already in flight still invokes `done`, so a repeated
-  /// `applicationShouldTerminate` cannot wedge the quit.
+  /// main actor, when the App may terminate. Repeated calls while teardown is
+  /// in flight join the original helper quit and are released only when that
+  /// first teardown completes; calls after completion return immediately.
   public func beginTeardown(done: @escaping @MainActor () -> Void) {
-    if isQuitting {
+    if teardownComplete {
       done()
+      return
+    }
+    pendingDoneCallbacks.append(done)
+    if isQuitting {
       return
     }
     isQuitting = true
@@ -58,7 +64,7 @@ public final class AppQuitCoordinator {
     // GUI teardown on a (possibly absent) helper — stop polling and return.
     if isTestLaunch {
       Diag.app.event("app.quit", [("phase", "test_skip_helper")])
-      done()
+      finishTeardown()
       return
     }
 
@@ -74,7 +80,15 @@ public final class AppQuitCoordinator {
         Diag.app.event("app.quit", [("phase", "helper_quit_err")])
       }
       Diag.app.event("app.quit", [("phase", "done")])
-      done()
+      finishTeardown()
     }
+  }
+
+  private func finishTeardown() {
+    guard !teardownComplete else { return }
+    teardownComplete = true
+    let callbacks = pendingDoneCallbacks
+    pendingDoneCallbacks.removeAll()
+    callbacks.forEach { $0() }
   }
 }

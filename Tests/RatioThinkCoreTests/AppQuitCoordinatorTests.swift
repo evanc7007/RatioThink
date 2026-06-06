@@ -12,12 +12,18 @@ final class AppQuitCoordinatorTests: XCTestCase {
   private final class FakeQuitClient: AppXPCClient, @unchecked Sendable {
     private(set) var quitCount = 0
     var quitError: Error?
+    var suspendQuit = false
+    var quitContinuation: CheckedContinuation<Void, Error>?
     func engineStatus() async throws -> EngineStatus { .stopped }
     func stopEngine() async throws {}
     func startEngine(profileID: String) async throws {}
     func quitHelper() async throws {
       quitCount += 1
       if let quitError { throw quitError }
+      guard suspendQuit else { return }
+      try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+        quitContinuation = continuation
+      }
     }
   }
 
@@ -42,7 +48,7 @@ final class AppQuitCoordinatorTests: XCTestCase {
 
   func test_quitHelperFailure_isBestEffort_stillSignalsDone() async {
     let client = FakeQuitClient()
-    client.quitError = AppXPCClientError.replyTimeout(selector: "quitHelper", timeout: 6)
+    client.quitError = AppXPCClientError.replyTimeout(selector: "quitHelper", timeout: HelperXPCClient.quitReplyTimeout)
     let coord = AppQuitCoordinator(helperClient: client, isTestLaunch: false)
     let done = expectation(description: "done despite helper error")
     coord.beginTeardown { done.fulfill() }
@@ -50,7 +56,7 @@ final class AppQuitCoordinatorTests: XCTestCase {
     XCTAssertEqual(client.quitCount, 1)
   }
 
-  func test_secondTeardown_isIdempotent_doesNotReQuitHelper() async {
+  func test_secondTeardown_afterCompletion_isIdempotent_doesNotReQuitHelper() async {
     let client = FakeQuitClient()
     let coord = AppQuitCoordinator(helperClient: client, isTestLaunch: false)
     let first = expectation(description: "first done")
@@ -60,5 +66,41 @@ final class AppQuitCoordinatorTests: XCTestCase {
     coord.beginTeardown { second.fulfill() }
     await fulfillment(of: [second], timeout: 2)
     XCTAssertEqual(client.quitCount, 1, "a repeated applicationShouldTerminate must not re-quit the helper")
+  }
+
+  func test_secondTeardown_whileHelperQuitInFlight_waitsForOriginalCompletion() async {
+    let client = FakeQuitClient()
+    client.suspendQuit = true
+    let coord = AppQuitCoordinator(helperClient: client, isTestLaunch: false)
+    let firstReleased = expectation(description: "first done after helper completes")
+    var firstDoneEarly = false
+    coord.beginTeardown {
+      firstDoneEarly = true
+      firstReleased.fulfill()
+    }
+
+    for _ in 0..<20 where client.quitContinuation == nil {
+      try? await Task.sleep(nanoseconds: 10_000_000)
+    }
+    XCTAssertEqual(client.quitCount, 1)
+    XCTAssertNotNil(client.quitContinuation, "fake helper quit should be suspended before the second quit request")
+    XCTAssertFalse(firstDoneEarly)
+
+    let secondReleased = expectation(description: "second done after helper completes")
+    var secondDoneEarly = false
+    coord.beginTeardown {
+      secondDoneEarly = true
+      secondReleased.fulfill()
+    }
+    try? await Task.sleep(nanoseconds: 200_000_000)
+    XCTAssertFalse(firstDoneEarly, "first callback must wait for helper quit completion")
+    XCTAssertFalse(secondDoneEarly, "reentrant callback must wait for helper quit completion")
+    XCTAssertEqual(client.quitCount, 1, "reentrant quit must share the in-flight helper quit")
+
+    client.quitContinuation?.resume(returning: ())
+    await fulfillment(of: [firstReleased, secondReleased], timeout: 2)
+    XCTAssertTrue(firstDoneEarly)
+    XCTAssertTrue(secondDoneEarly)
+    XCTAssertEqual(client.quitCount, 1)
   }
 }

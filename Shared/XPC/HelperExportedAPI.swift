@@ -276,7 +276,7 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
   /// the XPC reply-timeout fallback (review v1 F4) fires. Covers
   /// the gap between deadline arrival on the host's state queue
   /// and the observer hopping over to reply.
-  private static let replyTimeoutSlack: TimeInterval = 2
+  static let replyTimeoutSlack: TimeInterval = 2
 
   /// PieControlLauncher's `handshakeTimeout` + WS install upper bound.
   /// `LaunchSpec.handshakeTimeout` defaults to 30s; the WS
@@ -288,7 +288,7 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
 
   /// `LaunchedSession.shutdown` budget: SIGINT(10s) → SIGKILL(5s) =
   /// 15s in the worst case. Add slack.
-  private static let stopReplyDeadline: TimeInterval = 17
+  static let stopReplyDeadline: TimeInterval = 17
 
   /// Spawns the engine for `profileID` via `PieEngineHost`. Returns
   /// `.profileMissing` when the resolver is unwired and
@@ -660,10 +660,23 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
     #else
     let deadline = Self.stopReplyDeadline
     #endif
-    // `stopAndWait` fires the completion exactly once — after `pie` is reaped
-    // (terminal status), or after `deadline` if the engine wedges. Reply then
-    // ask the Helper to terminate cleanly.
-    engineHost.stopAndWait(timeout: deadline) { [onQuitRequested] in
+    // `stopAndWait` fires the completion exactly once and now reports whether
+    // it observed the terminal status that means `pie` was actually reaped.
+    // A timeout is not a successful structured quit: return a diagnostic error
+    // to the App, then keep waiting without a second fallback and terminate the
+    // Helper only after the real terminal/reaped status arrives.
+    engineHost.stopAndWait(timeout: deadline) { [weak engineHost, onQuitRequested] result in
+      guard result.reachedTerminal else {
+        PieHelperXPCWire.replyStopEngine(EngineError(
+          code: .handshakeTimeout,
+          message: "quitHelper stop/reap timeout after \(deadline)s (last status: \(result.lastStatus)); not reporting success until the engine reaches a terminal reaped state"
+        ), via: reply)
+        engineHost?.stopAndWait(timeout: 0) { laterResult in
+          guard laterResult.reachedTerminal else { return }
+          onQuitRequested?()
+        }
+        return
+      }
       PieHelperXPCWire.replyStopEngine(nil, via: reply)
       onQuitRequested?()
     }
