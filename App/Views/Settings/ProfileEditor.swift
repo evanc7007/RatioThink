@@ -117,13 +117,9 @@ struct ProfileEditor: View {
         .disabled((option.isOverLimit || option.unsupportedReason != nil) && !option.isCurrent)
       }
     } label: {
-      HStack(spacing: 4) {
-        Text(ModelDisplayName.leaf(profile.model)).monospaced()
-        Image(systemName: "chevron.up.chevron.down").font(.caption)
-      }
+      ProfileModelPickerLabel(modelID: profile.model)
     }
     .menuStyle(.borderlessButton)
-    .fixedSize()
     .accessibilityIdentifier("ProfileEditorModelPicker")
   }
 
@@ -284,5 +280,42 @@ struct ProfileEditor: View {
       if let v = args[k] { table[k] = v }
     }
     return table.convert()
+  }
+}
+
+/// Bounded selected-model label for the Profile editor's model `Menu`.
+///
+/// Long Hugging Face ids are useful to inspect, but they must not become the
+/// row's ideal width: `SettingsLabeledRow` has neighboring fixed-width labels,
+/// so an unbounded/fixed-size menu label pushes the whole Profile pane wider.
+/// Keep the label flexible, cap its ideal size, and let SwiftUI middle-truncate
+/// inside that cap while exposing the unmodified id through help + a11y.
+struct ProfileModelPickerLabel: View {
+  static let maxLayoutWidth: CGFloat = 360
+
+  let modelID: String
+
+  var body: some View {
+    HStack(spacing: 4) {
+      Text(modelID)
+        .monospaced()
+        .lineLimit(1)
+        .truncationMode(.middle)
+        .frame(maxWidth: .infinity, alignment: .leading)
+
+      Image(systemName: "chevron.up.chevron.down")
+        .font(.caption)
+        .accessibilityHidden(true)
+    }
+    .frame(idealWidth: Self.maxLayoutWidth,
+           maxWidth: Self.maxLayoutWidth,
+           alignment: .leading)
+    .help(modelID)
+    .accessibilityElement(children: .ignore)
+    .accessibilityLabel(Self.accessibilityText(for: modelID))
+  }
+
+  static func accessibilityText(for modelID: String) -> String {
+    "Default model: \(modelID)"
   }
 }
