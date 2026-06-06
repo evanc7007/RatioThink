@@ -8,7 +8,7 @@
 
 ![macOS 14+](https://img.shields.io/badge/macOS-14%2B-black?logo=apple)
 ![Apple Silicon](https://img.shields.io/badge/Apple%20Silicon-arm64-black)
-![Version](https://img.shields.io/badge/version-v0.1.1-blue)
+![Version](https://img.shields.io/badge/version-v0.1.2-blue)
 ![License](https://img.shields.io/badge/license-Apache--2.0-green)
 
 </div>
@@ -19,7 +19,7 @@ local models using specialized _thinking profiles_.
 
 ## Early release
 
-v0.1.1 is an early release, focusing on core functionality and bug fixes.
+v0.1.2 is an early release, focusing on core functionality and bug fixes.
 Since many components are still a work in progress, your feedback is incredibly valuable.
 Feel free to report any issues you find!
 
@@ -102,23 +102,17 @@ metadata only. Flags: `--window <dur>` (Unified Logging look-back, default
 
 ## Known issues
 
-A few known issues in the v0.1.1 release, with workarounds:
+A few known issues in the v0.1.2 release, with workarounds:
 
-- **The "Qwen2.5 7B Instruct" model in the list won't load.** Hugging Face publishes that
-  quant as split files the bundled engine can't assemble yet, so downloading it leaves a
-  model that fails to load. Pick a different model for now —
-  [a fix is in progress](https://github.com/shsym/RatioThink/pull/41).
-- **Cancelling a model download can be unstable.** While a model is downloading the
-  progress can lag, and cancelling may not stop it as cleanly as expected — a partial
-  download can be left behind. If one remains, remove it from the Models list;
-  [a fix is in progress](https://github.com/shsym/RatioThink/pull/43).
-- **The "Starting the engine…" prompt can rarely get stuck.** In an uncommon sequence — a
-  model load waiting on the engine, then a model-list refresh failing — the prompt can stay
-  on "Starting the engine…". Click **Cancel** and try again.
-- **A failed engine start can show a misleading reason.** If the engine crashes the instant
-  it launches, the failure can be reported as a timeout rather than a clear "couldn't start"
-  — the engine-error indicator still appears either way.
-  [Fixed in a later build](https://github.com/shsym/RatioThink/pull/36).
+- **Very large GGUF models can still respond poorly or truncate misleadingly.** Prefer the
+  starter model or smaller curated models until the large-model rendering fixes land
+  ([tracking PR](https://github.com/shsym/RatioThink/pull/64)).
+- **Deleting a model that a profile uses as its default may need a restart to fully settle.**
+  If a deleted model still appears selected, restart RatioThink and choose a new profile model
+  ([tracking PR](https://github.com/shsym/RatioThink/pull/62)).
+- **Some first-install chat polish is still pending.** If the initial prompt or composer layout
+  looks odd, resize the window or start a new chat; the follow-up polish is tracked in
+  [PR #59](https://github.com/shsym/RatioThink/pull/59).
 
 ## Repo layout
 
