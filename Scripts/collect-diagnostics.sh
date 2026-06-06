@@ -203,12 +203,19 @@ classify() {
     add_verdict "APP_CRASHED_LEGACY: a recent legacy RatioThink crash report exists during the rename migration — see crash-reports/"
   fi
 
-  # Helper crashed / degraded: a helper crash report, or a degraded breadcrumb.
+  # Helper crashed / degraded: helper crash reports (current and legacy are
+  # independent during rename migration), or a degraded breadcrumb only when no
+  # helper crash report exists.
+  helper_crash_found=0
   if find "$CRASH_DIR" -maxdepth 1 -type f -name 'RationalHelper-*' -mtime -7 2>/dev/null | grep -q .; then
     add_verdict "HELPER_CRASHED_OR_DEGRADED: a recent Rational Helper crash report exists — see crash-reports/"
-  elif find "$CRASH_DIR" -maxdepth 1 -type f -name 'RatioThinkHelper-*' -mtime -7 2>/dev/null | grep -q .; then
+    helper_crash_found=1
+  fi
+  if find "$CRASH_DIR" -maxdepth 1 -type f -name 'RatioThinkHelper-*' -mtime -7 2>/dev/null | grep -q .; then
     add_verdict "HELPER_CRASHED_OR_DEGRADED_LEGACY: a recent legacy RatioThinkHelper crash report exists during the rename migration — see crash-reports/"
-  elif [ -f "$helper_log" ] && grep -qiE 'helper\.degraded|cannot start' "$helper_log" 2>/dev/null; then
+    helper_crash_found=1
+  fi
+  if [ "$helper_crash_found" -eq 0 ] && [ -f "$helper_log" ] && grep -qiE 'helper\.degraded|cannot start' "$helper_log" 2>/dev/null; then
     add_verdict "HELPER_CRASHED_OR_DEGRADED: helper.log shows a degraded boot — see app-logs/helper.log"
   fi
 

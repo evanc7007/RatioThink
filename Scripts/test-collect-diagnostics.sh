@@ -140,6 +140,18 @@ assert_exists "$bundleCL/crash-reports/RatioThinkHelper-2026-05-30-120001.ips" "
 assert_contains "$bundleCL/report.txt" "APP_CRASHED_LEGACY" "Clegacy: legacy app crash classified explicitly"
 assert_contains "$bundleCL/report.txt" "HELPER_CRASHED_OR_DEGRADED_LEGACY" "Clegacy: legacy helper crash classified explicitly"
 
+echo "case Cmixedhelper: current + legacy helper crash reports both classify during rename migration"
+CMH="$WORK_ROOT/Cmixedhelper"; mkdir -p "$CMH/out" "$CMH/crash" "$CMH/home/logs"
+mini_app "$CMH/app/Rational.app"
+echo "2026-05-30T00:00:00Z helper helper.launch version=1.0" > "$CMH/home/logs/helper.log"
+echo "fake current helper crash" > "$CMH/crash/RationalHelper-2026-05-30-120000.ips"
+echo "fake legacy helper crash" > "$CMH/crash/RatioThinkHelper-2026-05-30-120001.ips"
+RATIOTHINK_APP="$CMH/app/Rational.app" PIE_HOME="$CMH/home" RATIOTHINK_DIAG_CRASH_DIR="$CMH/crash" \
+RATIOTHINK_DIAG_OUT_DIR="$CMH/out" bash "$SCRIPT" --window 1m >/dev/null
+bundleCMH="$(extract_bundle "$CMH/out" "$CMH/x")"
+assert_contains "$bundleCMH/report.txt" "HELPER_CRASHED_OR_DEGRADED: a recent Rational Helper crash report exists" "Cmixedhelper: current helper crash classified"
+assert_contains "$bundleCMH/report.txt" "HELPER_CRASHED_OR_DEGRADED_LEGACY" "Cmixedhelper: legacy helper crash classified alongside current helper"
+
 echo "case D: Bearer base64 token (+/=) fully redacted (F5)"
 D="$WORK_ROOT/D"; mkdir -p "$D/out" "$D/crash" "$D/home/logs"
 echo "2026-05-30T00:00:00Z app chat.send auth=Authorization: Bearer ab+cd/ef= done" > "$D/home/logs/app.log"

@@ -170,13 +170,21 @@ public struct HelperRegistrationReconciler: Sendable {
     if newState == .requiresApproval { return .needsApproval }
     // Give launchd a beat to load the RunAtLoad job — the probe closure
     // owns the retry/backoff window.
-    if (await probeReachable()).isHealthy {
+    let confirmProbe = await probeReachable()
+    var msg: String
+    switch confirmProbe {
+    case .healthy:
       return freshRegistration ? .registered : .repaired
+    case .unreachable:
+      msg = "helper unreachable after register (state=\(newState))"
+    case .identityMismatch(let reason):
+      msg = "helper identity mismatch after register (state=\(newState)): \(reason)"
     }
     // Repair did not recover. If the root unregister() failed, surface it
     // — it is the most likely real cause (signing/plist/SMAppService), not
-    // just "still unreachable" (F3).
-    var msg = "helper unreachable after register (state=\(newState))"
+    // just "still unreachable" (F3). Also preserve identity-mismatch details:
+    // a reachable legacy helper is the rename migration signal operators need,
+    // not an unreachable helper.
     if let unregisterError {
       msg += "; unregister() had failed: \(unregisterError)"
     }

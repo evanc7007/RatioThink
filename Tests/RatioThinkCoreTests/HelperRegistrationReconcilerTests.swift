@@ -151,6 +151,23 @@ final class HelperRegistrationReconcilerTests: XCTestCase {
     }
   }
 
+  func test_registerSucceedsButStillWrongIdentity_reportsIdentityMismatch() async {
+    let h = Harness(probeResults: [.identityMismatch("executable=RatioThinkHelper"),
+                                   .identityMismatch("executable=RatioThinkHelper")],
+                    state: .enabled,
+                    registerResult: .enabled)
+    let outcome = await h.makeReconciler().reconcile()
+    guard case let .repairFailed(msg) = outcome else {
+      return XCTFail("expected .repairFailed, got \(outcome)")
+    }
+    XCTAssertTrue(msg.contains("identity mismatch after register"),
+                  "repair failure must distinguish wrong identity from unreachable; got: \(msg)")
+    XCTAssertTrue(msg.contains("executable=RatioThinkHelper"),
+                  "repair failure must preserve identity evidence; got: \(msg)")
+    XCTAssertFalse(msg.contains("helper unreachable after register"),
+                   "wrong-but-reachable helper must not be reported as unreachable; got: \(msg)")
+  }
+
   func test_registerThrows_reportsRepairFailed() async {
     let h = Harness(probeResults: [.unreachable], state: .notRegistered, registerError: StubError())
     let outcome = await h.makeReconciler().reconcile()
