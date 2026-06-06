@@ -148,10 +148,10 @@ http_port() {
 }
 
 # stale_procs <app_dest> <accept_epoch> -> prints one line per surviving
-# pie/RationalHelper that is NOT from this install.
+# pie/RationalHelper/legacy RatioThinkHelper that is NOT from this install.
 stale_procs() {
   local app_dest="$1" accept_epoch="$2" pid
-  for pid in $(pgrep -x pie 2>/dev/null) $(pgrep -x RationalHelper 2>/dev/null); do
+  for pid in $(pgrep -x pie 2>/dev/null) $(pgrep -x RationalHelper 2>/dev/null) $(pgrep -x RatioThinkHelper 2>/dev/null); do
     proc_is_new_bundle "$pid" "$app_dest" "$accept_epoch" \
       || ps -o pid=,comm=,etimes= -p "$pid" 2>/dev/null
   done

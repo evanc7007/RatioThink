@@ -58,7 +58,7 @@ echo "install: signing identity = $CODE_SIGN_IDENTITY (team $DEVELOPMENT_TEAM)"
 # --- build signed -----------------------------------------------------
 echo "install: regenerating project + building signed Debug app..."
 Scripts/genproject.sh >/dev/null
-xcodebuild -project Rational.xcodeproj -scheme Rational \
+xcodebuild -project RatioThink.xcodeproj -scheme RatioThink \
   -destination 'platform=macOS,arch=arm64' -configuration Debug \
   CODE_SIGN_STYLE=Manual \
   CODE_SIGN_IDENTITY="$CODE_SIGN_IDENTITY" \
@@ -66,7 +66,7 @@ xcodebuild -project Rational.xcodeproj -scheme Rational \
   PROVISIONING_PROFILE_SPECIFIER='' \
   build
 
-DERIVED_APP="$(xcodebuild -project Rational.xcodeproj -scheme Rational \
+DERIVED_APP="$(xcodebuild -project RatioThink.xcodeproj -scheme RatioThink \
   -destination 'platform=macOS,arch=arm64' -configuration Debug \
   -showBuildSettings 2>/dev/null \
   | awk '/ BUILT_PRODUCTS_DIR =/ {print $3; exit}')/Rational.app"
@@ -143,7 +143,9 @@ sleep 2
 pkill -x Rational 2>/dev/null || true
 
 echo "install: stopping stale Helper + engine so the new binary loads..."
-pkill -x RationalHelper 2>/dev/null || true
+for helper_name in RationalHelper RatioThinkHelper; do
+  pkill -x "$helper_name" 2>/dev/null || true
+done
 pkill -x pie 2>/dev/null || true
 sleep 1
 
@@ -161,16 +163,18 @@ echo "install: installed + verified."
 # The agent is disabled (above), so nothing can respawn independently.
 # Reap once more AFTER the bundle is in place and confirm nothing survives.
 echo "install: reaping any respawned stale Helper/engine post-swap..."
-pkill -x RationalHelper 2>/dev/null || true
+for helper_name in RationalHelper RatioThinkHelper; do
+  pkill -x "$helper_name" 2>/dev/null || true
+done
 pkill -x pie 2>/dev/null || true
 sleep 1
-for pid in $(pgrep -x pie 2>/dev/null) $(pgrep -x RationalHelper 2>/dev/null); do
+for pid in $(pgrep -x pie 2>/dev/null) $(pgrep -x RationalHelper 2>/dev/null) $(pgrep -x RatioThinkHelper 2>/dev/null); do
   kill -9 "$pid" 2>/dev/null || true
 done
 sleep 1
-if pgrep -x pie >/dev/null 2>&1 || pgrep -x RationalHelper >/dev/null 2>&1; then
+if pgrep -x pie >/dev/null 2>&1 || pgrep -x RationalHelper >/dev/null 2>&1 || pgrep -x RatioThinkHelper >/dev/null 2>&1; then
   echo "install: FAILED — could not reap stale Helper/engine before launch:" >&2
-  ps -o pid=,comm=,etimes= $(pgrep -x pie; pgrep -x RationalHelper) 2>/dev/null | sed 's/^/install:   /' >&2
+  ps -o pid=,comm=,etimes= $(pgrep -x pie; pgrep -x RationalHelper; pgrep -x RatioThinkHelper) 2>/dev/null | sed 's/^/install:   /' >&2
   echo "install: kill them manually (kill -9 <pid>) and re-run." >&2
   exit 1
 fi
@@ -225,7 +229,7 @@ done
 if [ -z "$PORT" ]; then
   echo "" >&2
   echo "install: FAILED — no engine from the NEW install (${APP_DEST}) served within ${VERIFY_TIMEOUT}s." >&2
-  echo "install: Helper running: $(pgrep -x RationalHelper >/dev/null && echo yes || echo NO)" >&2
+  echo "install: Helper running: $(pgrep -x RationalHelper >/dev/null && echo yes || pgrep -x RatioThinkHelper >/dev/null && echo legacy-RatioThinkHelper || echo NO)" >&2
   echo "install: engine running: $(pgrep -x pie >/dev/null && echo yes || echo NO)" >&2
   STALE="$(stale_procs "$APP_DEST" "$INSTALL_EPOCH")"
   if [ -n "$STALE" ]; then

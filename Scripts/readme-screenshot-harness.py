@@ -37,7 +37,7 @@ class LocalThreadingHTTPServer(ThreadingHTTPServer):
 
 
 DEFAULT_ANSWER = (
-    "Everything runs on your Mac. RatioThink launches a bundled Pie engine "
+    "Everything runs on your Mac. Rational launches a bundled Pie engine "
     "locally, so your prompts and replies never leave the device — and the "
     "same engine is exposed as an OpenAI-compatible endpoint your own scripts "
     "can call."

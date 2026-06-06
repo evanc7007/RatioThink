@@ -126,6 +126,20 @@ bundleC="$(extract_bundle "$C/out" "$C/x")"
 assert_contains "$bundleC/report.txt" "APP_CRASHED" "C: main-app crash classified APP_CRASHED"
 refute_contains "$bundleC/report.txt" "OK: no failure signature" "C: does not print OK when app crashed"
 
+echo "case Clegacy: legacy RatioThink app/helper crash reports collected + classified during rename migration"
+CL="$WORK_ROOT/Clegacy"; mkdir -p "$CL/out" "$CL/crash" "$CL/home/logs"
+mini_app "$CL/app/Rational.app"
+echo "2026-05-30T00:00:00Z helper helper.launch version=1.0" > "$CL/home/logs/helper.log"
+echo "fake legacy app crash" > "$CL/crash/RatioThink-2026-05-30-120000.ips"
+echo "fake legacy helper crash" > "$CL/crash/RatioThinkHelper-2026-05-30-120001.ips"
+RATIOTHINK_APP="$CL/app/Rational.app" PIE_HOME="$CL/home" RATIOTHINK_DIAG_CRASH_DIR="$CL/crash" \
+RATIOTHINK_DIAG_OUT_DIR="$CL/out" bash "$SCRIPT" --window 1m >/dev/null
+bundleCL="$(extract_bundle "$CL/out" "$CL/x")"
+assert_exists "$bundleCL/crash-reports/RatioThink-2026-05-30-120000.ips" "Clegacy: legacy app crash report copied"
+assert_exists "$bundleCL/crash-reports/RatioThinkHelper-2026-05-30-120001.ips" "Clegacy: legacy helper crash report copied"
+assert_contains "$bundleCL/report.txt" "APP_CRASHED_LEGACY" "Clegacy: legacy app crash classified explicitly"
+assert_contains "$bundleCL/report.txt" "HELPER_CRASHED_OR_DEGRADED_LEGACY" "Clegacy: legacy helper crash classified explicitly"
+
 echo "case D: Bearer base64 token (+/=) fully redacted (F5)"
 D="$WORK_ROOT/D"; mkdir -p "$D/out" "$D/crash" "$D/home/logs"
 echo "2026-05-30T00:00:00Z app chat.send auth=Authorization: Bearer ab+cd/ef= done" > "$D/home/logs/app.log"

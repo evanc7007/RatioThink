@@ -148,13 +148,16 @@ section_crash_reports() {
   mkdir -p "$dest"
   if [ -d "$CRASH_DIR" ]; then
     # Case-sensitive, anchored process names only — the engine reports as
-    # `pie` (`pie-<date>.ips`). Deliberately excludes test-harness binaries
-    # (`pie-resolve-probe-*`, `pietest-sleep-*`) and the pre-rename `Pie*`.
+    # `pie` (`pie-<date>.ips`). During the RatioThink → Rational compatibility
+    # window, collect both current and legacy app/helper crash names so upgrade
+    # failures caused by a still-running legacy helper are visible.
     find "$CRASH_DIR" -maxdepth 1 -type f \
-      \( -name 'Rational-*' -o -name 'RationalHelper-*' -o -name 'pie-[0-9]*' \) \
+      \( -name 'Rational-*' -o -name 'RationalHelper-*' \
+         -o -name 'RatioThink-*' -o -name 'RatioThinkHelper-*' \
+         -o -name 'pie-[0-9]*' \) \
       -mtime -7 -exec cp {} "$dest/" \; 2>/dev/null || true
   fi
-  [ -n "$(ls -A "$dest" 2>/dev/null)" ] || echo "(no recent Rational/pie crash reports)" > "$dest/NONE.txt"
+  [ -n "$(ls -A "$dest" 2>/dev/null)" ] || echo "(no recent Rational/RatioThink/pie crash reports)" > "$dest/NONE.txt"
 }
 
 section_app_logs() {
@@ -196,10 +199,15 @@ classify() {
   if find "$CRASH_DIR" -maxdepth 1 -type f -name 'Rational-*' ! -name 'RationalHelper-*' -mtime -7 2>/dev/null | grep -q .; then
     add_verdict "APP_CRASHED: a recent Rational crash report exists — the main app started then crashed; see crash-reports/"
   fi
+  if find "$CRASH_DIR" -maxdepth 1 -type f -name 'RatioThink-*' ! -name 'RatioThinkHelper-*' -mtime -7 2>/dev/null | grep -q .; then
+    add_verdict "APP_CRASHED_LEGACY: a recent legacy RatioThink crash report exists during the rename migration — see crash-reports/"
+  fi
 
   # Helper crashed / degraded: a helper crash report, or a degraded breadcrumb.
   if find "$CRASH_DIR" -maxdepth 1 -type f -name 'RationalHelper-*' -mtime -7 2>/dev/null | grep -q .; then
     add_verdict "HELPER_CRASHED_OR_DEGRADED: a recent Rational Helper crash report exists — see crash-reports/"
+  elif find "$CRASH_DIR" -maxdepth 1 -type f -name 'RatioThinkHelper-*' -mtime -7 2>/dev/null | grep -q .; then
+    add_verdict "HELPER_CRASHED_OR_DEGRADED_LEGACY: a recent legacy RatioThinkHelper crash report exists during the rename migration — see crash-reports/"
   elif [ -f "$helper_log" ] && grep -qiE 'helper\.degraded|cannot start' "$helper_log" 2>/dev/null; then
     add_verdict "HELPER_CRASHED_OR_DEGRADED: helper.log shows a degraded boot — see app-logs/helper.log"
   fi
