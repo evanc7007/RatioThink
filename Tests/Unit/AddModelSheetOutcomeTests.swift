@@ -86,6 +86,59 @@ final class AddModelSheetOutcomeTests: XCTestCase {
                   "message must define behavior when the model is currently loaded/running; got: \(message)")
   }
 
+  func test_delete_installed_model_restores_profile_defaults_when_trash_fails() throws {
+    let temp = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+      .appendingPathComponent("delete-profile-defaults-\(UUID().uuidString)", isDirectory: true)
+    let profiles = temp.appendingPathComponent("profiles", isDirectory: true)
+    let models = temp.appendingPathComponent("models", isDirectory: true)
+    try FileManager.default.createDirectory(at: profiles, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: models, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: temp) }
+
+    let shared = "deleted-model.gguf"
+    for (filename, id, name) in [
+      ("chat.toml", "chat", "Chat"),
+      ("fast.toml", "fast", "Fast Think"),
+    ] {
+      let body = """
+      id = "\(id)"
+      name = "\(name)"
+      model = "\(shared)"
+      inferlet = "chat-apc"
+      """
+      try body.write(to: profiles.appendingPathComponent(filename),
+                     atomically: true,
+                     encoding: .utf8)
+    }
+    let modelURL = models.appendingPathComponent(shared)
+    try Data("model".utf8).write(to: modelURL)
+    let store = ProfileStore(directory: profiles)
+    try store.start()
+    defer { store.stop() }
+    let row = InstalledModel(
+      filename: shared,
+      url: modelURL,
+      sizeBytes: 5,
+      modifiedAt: Date(timeIntervalSince1970: 0),
+      isPartial: false
+    )
+
+    XCTAssertThrowsError(try ModelsSettingsTab.deleteInstalledModel(
+      row: row,
+      profileStore: store,
+      trashModel: { _ in throw DeleteModelProbeError.trashFailed },
+      trashSidecar: { _ in }
+    )) { error in
+      XCTAssertTrue(String(describing: error).contains("restored"),
+                    "delete failure should tell the user profile defaults were restored; got: \(error)")
+    }
+
+    XCTAssertEqual(store.model(forProfileID: "chat"), shared)
+    XCTAssertEqual(store.model(forProfileID: "fast"), shared)
+    XCTAssertTrue(FileManager.default.fileExists(atPath: modelURL.path),
+                  "failed Trash move should leave the installed model in place")
+  }
+
   // MARK: - F38: emit-gate helper (review v5)
 
   // The drop closure's gate condition lives in
@@ -191,4 +244,8 @@ final class AddModelSheetOutcomeTests: XCTestCase {
       XCTFail("expected .imported associated values to pattern-match")
     }
   }
+}
+
+private enum DeleteModelProbeError: Error {
+  case trashFailed
 }

@@ -111,10 +111,7 @@ struct ModelsSettingsTab: View {
     alert.alertStyle = .warning
     guard alert.runModal() == .alertFirstButtonReturn else { return }
     do {
-      if !affected.isEmpty {
-        try profileStore.clearModelDefaults(referencing: row.filename)
-      }
-      try FileManager.default.trashItem(at: row.url, resultingItemURL: nil)
+      try Self.deleteInstalledModel(row: row, profileStore: profileStore)
       actionError = nil
     } catch {
       // Label the failure explicitly so the user knows it was a
@@ -122,16 +119,29 @@ struct ModelsSettingsTab: View {
       actionError = "Delete '\(row.filename)' failed: \(error)"
       return
     }
+    Task { await refresh() }
+  }
+
+  static func deleteInstalledModel(
+    row: InstalledModel,
+    profileStore: ProfileStore,
+    trashModel: (URL) throws -> Void = { url in
+      try FileManager.default.trashItem(at: url, resultingItemURL: nil)
+    },
+    trashSidecar: (URL) throws -> Void = { url in
+      try FileManager.default.trashItem(at: url, resultingItemURL: nil)
+    }
+  ) throws {
+    try profileStore.withClearedModelDefaults(referencing: row.filename) {
+      try trashModel(row.url)
+    }
     //  F10/F12: move the durable `.unverified` sidecar to the Trash
     // ALONGSIDE the GGUF — same recoverable semantics. The GGUF is
     // trashed (recoverable), so the marker must be too: a hard-remove
     // here would let a Trash-restore bring back the file WITHOUT its
     // marker, re-introducing the silent-verified downgrade (F12). A
     // missing sidecar is fine (`try?`).
-    try? FileManager.default.trashItem(
-      at: URL(fileURLWithPath: row.url.path + InstalledModels.unverifiedSuffix),
-      resultingItemURL: nil)
-    Task { await refresh() }
+    try? trashSidecar(URL(fileURLWithPath: row.url.path + InstalledModels.unverifiedSuffix))
   }
 
   static func deleteReferencedModelMessage(

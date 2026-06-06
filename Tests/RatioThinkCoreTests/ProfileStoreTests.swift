@@ -1968,6 +1968,71 @@ final class ProfileStoreTests: XCTestCase {
     }
   }
 
+  func test_withClearedModelDefaults_restores_defaults_when_operation_fails() throws {
+    try withTempProfilesDir { dir in
+      let shared = "deleted-model.gguf"
+      try writeProfile(into: dir, name: "chat.toml", id: "chat", displayName: "Chat", model: shared)
+      try writeProfile(into: dir, name: "fast.toml", id: "fast", displayName: "Fast Think", model: shared)
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+
+      XCTAssertThrowsError(try store.withClearedModelDefaults(referencing: shared) {
+        throw ProfileStoreDefaultsTransactionProbeError.trashFailed
+      }) { error in
+        guard case let transaction as ProfileModelDefaultsTransactionError = error,
+              case .operationFailed(_, _, _, let rollback) = transaction else {
+          return XCTFail("expected operationFailed transaction error, got \(error)")
+        }
+        XCTAssertEqual(rollback, .succeeded,
+                       "failed model trash must report that cleared defaults were restored")
+        XCTAssertTrue(transaction.description.contains("restored"),
+                      "user-visible delete error must distinguish recovered profile defaults; got: \(transaction)")
+      }
+
+      XCTAssertEqual(store.model(forProfileID: "chat"), shared)
+      XCTAssertEqual(store.model(forProfileID: "fast"), shared)
+    }
+  }
+
+  func test_withClearedModelDefaults_rolls_back_previously_cleared_profile_when_later_clear_fails() throws {
+    try withTempProfilesDir { dir in
+      let shared = "deleted-model.gguf"
+      try writeProfile(into: dir, name: "chat.toml", id: "chat", displayName: "Chat", model: shared)
+      try writeProfile(into: dir, name: "fast.toml", id: "fast", displayName: "Fast Think", model: shared)
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+      var operationRan = false
+
+      XCTAssertThrowsError(try store.withClearedModelDefaults(
+        referencing: shared,
+        writeProfile: { profile, filename in
+          if profile.id == "fast", profile.model == nil {
+            throw ProfileStoreDefaultsTransactionProbeError.profileWriteFailed
+          }
+          try store.createProfile(profile, filename: filename)
+        },
+        operation: {
+          operationRan = true
+        }
+      )) { error in
+        guard case let transaction as ProfileModelDefaultsTransactionError = error,
+              case .clearFailed(_, let cleared, _, let rollback) = transaction else {
+          return XCTFail("expected clearFailed transaction error, got \(error)")
+        }
+        XCTAssertEqual(cleared.map(\.id), ["chat"],
+                       "error must report the exact profile defaults that needed rollback")
+        XCTAssertEqual(rollback, .succeeded,
+                       "partial profile clear failure must roll back earlier clears before surfacing")
+      }
+
+      XCTAssertFalse(operationRan, "model trash operation must not run after a partial profile clear failure")
+      XCTAssertEqual(store.model(forProfileID: "chat"), shared)
+      XCTAssertEqual(store.model(forProfileID: "fast"), shared)
+    }
+  }
+
   func test_setModel_throws_for_unknown_profile() throws {
     try withTempProfilesDir { dir in
       try writeProfile(into: dir, name: "chat.toml", id: "chat", displayName: "Chat")
@@ -2158,16 +2223,22 @@ final class ProfileStoreTests: XCTestCase {
     into dir: URL,
     name: String,
     id: String,
-    displayName: String
+    displayName: String,
+    model: String = "m"
   ) throws {
     let body = """
     id = "\(id)"
     name = "\(displayName)"
-    model = "m"
+    model = "\(model)"
     inferlet = "i"
     """
     try body.write(to: dir.appendingPathComponent(name),
                    atomically: true,
                    encoding: .utf8)
   }
+}
+
+private enum ProfileStoreDefaultsTransactionProbeError: Error {
+  case trashFailed
+  case profileWriteFailed
 }
