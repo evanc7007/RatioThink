@@ -297,7 +297,7 @@ struct ProfileModelPickerLabel: View {
 
   var body: some View {
     HStack(spacing: 4) {
-      Text(modelID)
+      Text(displayName)
         .monospaced()
         .lineLimit(1)
         .truncationMode(.middle)
@@ -312,10 +312,20 @@ struct ProfileModelPickerLabel: View {
            alignment: .leading)
     .help(modelID)
     .accessibilityElement(children: .ignore)
-    .accessibilityLabel(Self.accessibilityText(for: modelID))
+    .accessibilityLabel(Self.accessibilityText(for: displayName))
+    .accessibilityHint(modelID)
+    .accessibilityValue(modelID)
   }
 
-  static func accessibilityText(for modelID: String) -> String {
-    "Default model: \(modelID)"
+  private var displayName: String {
+    Self.displayText(for: modelID)
+  }
+
+  static func displayText(for modelID: String) -> String {
+    ModelDisplayName.leaf(modelID)
+  }
+
+  static func accessibilityText(for displayName: String) -> String {
+    "Default model: \(displayName)"
   }
 }
