@@ -3,8 +3,9 @@ import XCTest
 
 final class HelperQuitTeardownTests: XCTestCase {
   private final class HangingSession: PieEngineHost.EngineSession, @unchecked Sendable {
-    func shutdown() async {
+    func shutdown() async -> EngineShutdownResult {
       try? await Task.sleep(nanoseconds: 5_000_000_000)
+      return .unreaped("test session did not reap")
     }
   }
 
@@ -22,7 +23,7 @@ final class HelperQuitTeardownTests: XCTestCase {
     )
   }
 
-  func test_appAbsentLocalQuitPolicy_timeoutTerminatesAfterBoundedSecondStage() {
+  func test_timeoutReportsButDoesNotTerminateHelper() {
     let host = PieEngineHost(launcher: { _ in (port: EnginePort(5152), session: HangingSession()) })
     defer { host.stop() }
 
@@ -35,25 +36,82 @@ final class HelperQuitTeardownTests: XCTestCase {
     token.cancel()
 
     let timeoutReported = expectation(description: "initial timeout is reported")
-    let finalTimeoutReported = expectation(description: "bounded fallback timeout is reported")
-    let terminated = expectation(description: "bounded fallback terminates helper")
+    let terminated = expectation(description: "helper must not terminate while pie may still be alive")
+    terminated.isInverted = true
     HelperQuitTeardown.stopThenTerminate(
       engineHost: host,
       initialTimeout: 0.05,
-      timeoutTerminationGrace: 0.05,
       onTimeout: { result in
         XCTAssertFalse(result.reachedTerminal)
         XCTAssertEqual(result.lastStatus, .stopping)
         timeoutReported.fulfill()
       },
-      onFinalTimeout: { result in
-        XCTAssertFalse(result.reachedTerminal)
-        XCTAssertEqual(result.lastStatus, .stopping)
-        finalTimeoutReported.fulfill()
+      terminate: { terminated.fulfill() }
+    )
+
+    wait(for: [timeoutReported, terminated], timeout: 0.5)
+  }
+
+  func test_terminalBeforeTimeoutTerminatesHelper() {
+    final class FastSession: PieEngineHost.EngineSession, @unchecked Sendable {
+      func shutdown() async -> EngineShutdownResult { .reaped }
+    }
+    let host = PieEngineHost(launcher: { _ in (port: EnginePort(5153), session: FastSession()) })
+    defer { host.stop() }
+
+    let running = expectation(description: "host reaches .running")
+    let token = host.observe { status, _ in
+      if case .running = status { running.fulfill() }
+    }
+    _ = host.start(makeSpec())
+    wait(for: [running], timeout: 2)
+    token.cancel()
+
+    let terminated = expectation(description: "terminal stop terminates helper")
+    HelperQuitTeardown.stopThenTerminate(
+      engineHost: host,
+      initialTimeout: 2,
+      onTerminalBeforeTimeout: { result in
+        XCTAssertTrue(result.reachedTerminal)
       },
       terminate: { terminated.fulfill() }
     )
 
-    wait(for: [timeoutReported, finalTimeoutReported, terminated], timeout: 2)
+    wait(for: [terminated], timeout: 2)
+  }
+
+  func test_terminalFailureReportsButDoesNotTerminateHelper() {
+    final class UnreapedSession: PieEngineHost.EngineSession, @unchecked Sendable {
+      func shutdown() async -> EngineShutdownResult {
+        .unreaped("SIGKILL did not reap")
+      }
+    }
+    let host = PieEngineHost(launcher: { _ in (port: EnginePort(5155), session: UnreapedSession()) })
+    defer { host.stop() }
+
+    let running = expectation(description: "host reaches .running")
+    let token = host.observe { status, _ in
+      if case .running = status { running.fulfill() }
+    }
+    _ = host.start(makeSpec())
+    wait(for: [running], timeout: 2)
+    token.cancel()
+
+    let failureReported = expectation(description: "terminal failure is reported")
+    let terminated = expectation(description: "helper must not terminate after failed reap")
+    terminated.isInverted = true
+    HelperQuitTeardown.stopThenTerminate(
+      engineHost: host,
+      initialTimeout: 2,
+      onTerminalFailure: { result in
+        XCTAssertTrue(result.failedBeforeReap)
+        XCTAssertFalse(result.reachedTerminal)
+        XCTAssertEqual(result.lastStatus, .failed(code: .killRejected, message: "SIGKILL did not reap"))
+        failureReported.fulfill()
+      },
+      terminate: { terminated.fulfill() }
+    )
+
+    wait(for: [failureReported, terminated], timeout: 2)
   }
 }

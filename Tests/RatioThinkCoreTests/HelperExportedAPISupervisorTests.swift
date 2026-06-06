@@ -22,7 +22,10 @@ final class HelperExportedAPISupervisorTests: XCTestCase {
   final class FakeSession: PieEngineHost.EngineSession, @unchecked Sendable {
     private let count = OSAllocatedUnfairLock<Int>(initialState: 0)
     var shutdownCount: Int { count.withLock { $0 } }
-    func shutdown() async { count.withLock { $0 += 1 } }
+    func shutdown() async -> EngineShutdownResult {
+      count.withLock { $0 += 1 }
+      return .reaped
+    }
   }
 
   /// Build a launcher that returns `(port, FakeSession)` after an
@@ -365,10 +368,11 @@ final class HelperExportedAPISupervisorTests: XCTestCase {
     // stopEngine's observer never sees `.stopped`. The fallback
     // deadline (0.3s) wins and the observer-detach path runs.
     final class HangSession: PieEngineHost.EngineSession, @unchecked Sendable {
-      func shutdown() async {
+      func shutdown() async -> EngineShutdownResult {
         while !Task.isCancelled {
           try? await Task.sleep(nanoseconds: 100_000_000)
         }
+        return .unreaped("test hang")
       }
     }
     let host = PieEngineHost(launcher: { _ in

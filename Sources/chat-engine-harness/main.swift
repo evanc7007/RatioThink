@@ -70,9 +70,9 @@ enum EngineHarness {
       print("chat-engine-harness: wrote \(urlFile.path)")
       await waitForSIGTERM()
       print("chat-engine-harness: shutting down")
-      await session.shutdown()
+      _ = await session.shutdown()
     } catch {
-      await session.shutdown()
+      _ = await session.shutdown()
       throw error
     }
   }

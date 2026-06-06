@@ -16,7 +16,10 @@ final class PieEngineHostTests: XCTestCase {
     private let lock = NSLock()
     private var _count = 0
     var shutdownCount: Int { lock.lock(); defer { lock.unlock() }; return _count }
-    func shutdown() async { lock.lock(); _count += 1; lock.unlock() }
+    func shutdown() async -> EngineShutdownResult {
+      lock.lock(); _count += 1; lock.unlock()
+      return .reaped
+    }
   }
 
   private func makeSpec(profileID: String = "chat") -> PieControlLauncher.LaunchSpec {
@@ -102,8 +105,9 @@ final class PieEngineHostTests: XCTestCase {
 
   func test_stopAndWait_timeoutReportsNonTerminalLastStatus() {
     final class HangingSession: PieEngineHost.EngineSession, @unchecked Sendable {
-      func shutdown() async {
+      func shutdown() async -> EngineShutdownResult {
         try? await Task.sleep(nanoseconds: 5_000_000_000)
+        return .unreaped("test session did not reap")
       }
     }
 
@@ -123,6 +127,45 @@ final class PieEngineHostTests: XCTestCase {
       done.fulfill()
     }
     wait(for: [done], timeout: 2)
+  }
+
+  func test_stopAndWait_shutdownFailurePublishesKillRejectedNotReapedTerminal() {
+    final class UnreapedSession: PieEngineHost.EngineSession, @unchecked Sendable {
+      func shutdown() async -> EngineShutdownResult {
+        .unreaped("SIGKILL + 5s waitpid window did not reap pid 4242")
+      }
+    }
+
+    let host = PieEngineHost(launcher: { _ in (port: EnginePort(5154), session: UnreapedSession()) })
+    let running = expectation(description: "host reaches .running")
+    let token = host.observe { status, _ in
+      if case .running = status { running.fulfill() }
+    }
+    _ = host.start(makeSpec())
+    wait(for: [running], timeout: 2)
+    token.cancel()
+
+    let done = expectation(description: "stopAndWait failure completion fires")
+    host.stopAndWait(timeout: 2) { result in
+      XCTAssertFalse(result.reachedTerminal, "unreaped shutdown must not be reported as a proven reap")
+      XCTAssertTrue(result.failedBeforeReap)
+      XCTAssertEqual(
+        result.lastStatus,
+        .failed(
+          code: .killRejected,
+          message: "SIGKILL + 5s waitpid window did not reap pid 4242"
+        )
+      )
+      done.fulfill()
+    }
+    wait(for: [done], timeout: 2)
+    XCTAssertEqual(
+      host.status,
+      .failed(
+        code: .killRejected,
+        message: "SIGKILL + 5s waitpid window did not reap pid 4242"
+      )
+    )
   }
 
   // MARK: - start → failed
@@ -260,7 +303,7 @@ final class PieEngineHostTests: XCTestCase {
     private let script: [EngineLiveness]
     private var idx = 0
     init(_ script: [EngineLiveness]) { self.script = script }
-    func shutdown() async {}
+    func shutdown() async -> EngineShutdownResult { .reaped }
     func checkLiveness() async -> EngineLiveness {
       lock.lock(); defer { lock.unlock() }
       let v = script[min(idx, script.count - 1)]
@@ -277,7 +320,7 @@ final class PieEngineHostTests: XCTestCase {
     private var liveness: EngineLiveness
     init(_ initial: EngineLiveness) { self.liveness = initial }
     func set(_ v: EngineLiveness) { lock.lock(); liveness = v; lock.unlock() }
-    func shutdown() async {}
+    func shutdown() async -> EngineShutdownResult { .reaped }
     func checkLiveness() async -> EngineLiveness {
       lock.lock(); defer { lock.unlock() }
       return liveness
