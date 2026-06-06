@@ -33,6 +33,18 @@ final class ProfileModelPickerLabelTests: XCTestCase {
       "The full resolver slug should remain available through accessibility help even when the visible label is shortened; dump=\(accessibilityDump)")
   }
 
+  func test_visible_selected_label_text_uses_friendly_leaf_not_raw_slug() {
+    let visibleText = visibleTextStrings(in: ProfileModelPickerLabel(modelID: longModelID).body)
+
+    XCTAssertEqual(
+      visibleText,
+      [ModelDisplayName.leaf(longModelID)],
+      "The rendered Text in the selected picker label should use the friendly leaf, not the raw resolver slug")
+    XCTAssertFalse(
+      visibleText.contains(longModelID),
+      "A raw repo/file slug must not be the visible selected picker text")
+  }
+
   private func accessibilityDescriptions(in element: Any) -> [String] {
     guard let object = element as? NSObject else { return [] }
     let label = accessibilityString(object, "accessibilityLabel").map { "label=\($0)" }
@@ -54,5 +66,42 @@ final class ProfileModelPickerLabelTests: XCTestCase {
     let selector = NSSelectorFromString("accessibilityChildren")
     guard object.responds(to: selector) else { return [] }
     return object.perform(selector)?.takeUnretainedValue() as? [Any] ?? []
+  }
+
+  private func visibleTextStrings(in value: Any) -> [String] {
+    let mirror = Mirror(reflecting: value)
+    if String(describing: type(of: value)) == "Text",
+       let text = textString(fromTextMirror: mirror) {
+      return [text]
+    }
+    return mirror.children
+      .filter { child in
+        // Only follow the rendered content tree. SwiftUI stores help and
+        // accessibility metadata in sibling `text`/`modifier` branches; those
+        // are intentionally covered by the accessibility test above and must
+        // not satisfy this visible-label assertion.
+        child.label != "modifier" && child.label != "text"
+      }
+      .flatMap { visibleTextStrings(in: $0.value) }
+  }
+
+  private func textString(fromTextMirror mirror: Mirror) -> String? {
+    guard let storage = mirror.children.first(where: { $0.label == "storage" })?.value else {
+      return nil
+    }
+    return firstString(in: storage)
+  }
+
+  private func firstString(in value: Any) -> String? {
+    if let string = value as? String {
+      return string
+    }
+    let mirror = Mirror(reflecting: value)
+    for child in mirror.children {
+      if let nested = firstString(in: child.value) {
+        return nested
+      }
+    }
+    return nil
   }
 }
