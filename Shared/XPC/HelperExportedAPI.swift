@@ -660,26 +660,24 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
     #else
     let deadline = Self.stopReplyDeadline
     #endif
-    // `stopAndWait` fires the completion exactly once and now reports whether
-    // it observed the terminal status that means `pie` was actually reaped.
-    // A timeout is not a successful structured quit: return a diagnostic error
-    // to the App, then keep waiting without a second fallback and terminate the
-    // Helper only after the real terminal/reaped status arrives.
-    engineHost.stopAndWait(timeout: deadline) { [weak engineHost, onQuitRequested] result in
-      guard result.reachedTerminal else {
+    HelperQuitTeardown.stopThenTerminate(
+      engineHost: engineHost,
+      initialTimeout: deadline,
+      timeoutTerminationGrace: HelperQuitTeardown.timeoutTerminationGrace,
+      onTerminalBeforeTimeout: { _ in
+        PieHelperXPCWire.replyStopEngine(nil, via: reply)
+      },
+      onTimeout: { result in
         PieHelperXPCWire.replyStopEngine(EngineError(
           code: .handshakeTimeout,
-          message: "quitHelper stop/reap timeout after \(deadline)s (last status: \(result.lastStatus)); not reporting success until the engine reaches a terminal reaped state"
+          message: "quitHelper stop/reap timeout after \(deadline)s (last status: \(result.lastStatus)); helper will terminate after bounded \(HelperQuitTeardown.timeoutTerminationGrace)s fallback if reap remains wedged"
         ), via: reply)
-        engineHost?.stopAndWait(timeout: 0) { laterResult in
-          guard laterResult.reachedTerminal else { return }
-          onQuitRequested?()
-        }
-        return
-      }
-      PieHelperXPCWire.replyStopEngine(nil, via: reply)
-      onQuitRequested?()
-    }
+      },
+      onFinalTimeout: { result in
+        Self.log.error("quitHelper: bounded fallback expired with status \(String(describing: result.lastStatus), privacy: .public); terminating helper anyway")
+      },
+      terminate: { [onQuitRequested] in onQuitRequested?() }
+    )
   }
 }
 

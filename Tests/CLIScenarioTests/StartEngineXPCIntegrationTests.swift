@@ -299,10 +299,12 @@ final class StartEngineXPCIntegrationTests: IsolatedTestCase {
       pieHome: { self.tempDir },
       subprocessEnvironment: { [:] }
     )
+    let terminated = expectation(description: "onQuitRequested fires after bounded timeout fallback")
     let exported = HelperExportedAPI(
       engineHost: host,
       launchSpecResolver: resolver.asClosure,
-      replyTimeoutOverride: (start: 8, stop: 0.05)
+      replyTimeoutOverride: (start: 8, stop: 0.05),
+      onQuitRequested: { terminated.fulfill() }
     )
 
     let listenerOwner = HelperXPCListener.startAnonymous(exportedObject: exported)
@@ -325,7 +327,9 @@ final class StartEngineXPCIntegrationTests: IsolatedTestCase {
       XCTAssertEqual(err.code, .handshakeTimeout)
       XCTAssertTrue(err.message.contains("quitHelper"))
       XCTAssertTrue(err.message.contains("0.05"))
+      XCTAssertTrue(err.message.contains("bounded"))
     }
+    await fulfillment(of: [terminated], timeout: 4)
   }
 
   /// Session whose `checkLiveness()` replays a scripted sequence, then
