@@ -24,6 +24,12 @@ struct ContentToolbar: View {
   let availableProfiles: [String]
   let modelOptions: [ToolbarModelOptions.Option]
   let currentModelSummary: ToolbarModelOptions.CurrentSummary?
+  /// Actual loaded engine model identity, distinct from the effective
+  /// display identity (`currentModelSummary`) which can be a pending/explicit
+  /// override. Default-row clear-vs-load decisions must compare against the
+  /// resident engine model so selecting profile default B while resident A is
+  /// still requests the normal load path.
+  let residentModelIDForSelection: String?
   /// Swap coordinator. Required — review v1 F9: defaulting this to a
   /// preview-only `previewDefault()` let a forgotten injection at any
   /// call site silently fall through to an orphan coordinator the
@@ -70,6 +76,7 @@ struct ContentToolbar: View {
     availableProfiles: [String] = ["chat"],
     modelOptions: [ToolbarModelOptions.Option] = [],
     currentModelSummary: ToolbarModelOptions.CurrentSummary? = nil,
+    residentModelIDForSelection: String? = nil,
     swapCoordinator: ProfileSwapCoordinator,
     modelLoadCenter: ModelLoadCenter?,
     engineStatus: EngineStatusStore?,
@@ -82,6 +89,7 @@ struct ContentToolbar: View {
     self.availableProfiles = availableProfiles
     self.modelOptions = modelOptions
     self.currentModelSummary = currentModelSummary
+    self.residentModelIDForSelection = residentModelIDForSelection
     self.swapCoordinator = swapCoordinator
     self.modelLoadCenter = modelLoadCenter
     self.engineStatus = engineStatus
@@ -259,7 +267,7 @@ struct ContentToolbar: View {
 
   private func selectModel(_ option: ToolbarModelOptions.Option) {
     switch ToolbarModelOptions.selectionAction(for: option,
-                                               currentModelID: currentModelSummary?.slug) {
+                                               residentModelID: residentModelIDForSelection) {
     case .unavailable:
       return
     case .clearOverride:

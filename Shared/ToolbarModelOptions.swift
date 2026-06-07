@@ -84,11 +84,11 @@ public enum ToolbarModelOptions {
   }
 
   public static func selectionAction(for option: Option,
-                                     currentModelID: String?) -> SelectionAction {
+                                     residentModelID: String?) -> SelectionAction {
     if let reason = option.unavailableReason {
       return .unavailable(reason: reason)
     }
-    if option.isProfileDefault, normalized(currentModelID) == option.slug {
+    if option.isProfileDefault, normalized(residentModelID) == option.slug {
       return .clearOverride
     }
     return .requestModel(

@@ -83,13 +83,13 @@ final class ToolbarModelOptionsTests: XCTestCase {
       isProfileDefault: true,
       unavailableReason: nil)
 
-    let action = ToolbarModelOptions.selectionAction(for: option, currentModelID: "resident/Loaded.gguf")
+    let action = ToolbarModelOptions.selectionAction(for: option, residentModelID: "resident/Loaded.gguf")
 
     XCTAssertEqual(action, .requestModel(modelID: "profile/Default.gguf", overrideAfterConfirmation: nil),
                    "a concrete default row that differs from the resident model must still request the normal swap/load path, then leave the chat using profile default semantics")
   }
 
-  func test_profile_default_row_same_as_current_only_clears_override() {
+  func test_profile_default_row_matching_effective_override_but_not_resident_requests_swap() {
     let option = ToolbarModelOptions.Option(
       slug: "profile/Default.gguf",
       displayName: "Default.gguf",
@@ -98,7 +98,29 @@ final class ToolbarModelOptionsTests: XCTestCase {
       isProfileDefault: true,
       unavailableReason: nil)
 
-    XCTAssertEqual(ToolbarModelOptions.selectionAction(for: option, currentModelID: "profile/Default.gguf"),
+    let effectiveSummary = ToolbarModelOptions.currentSummary(
+      modelOverride: "profile/Default.gguf",
+      residentModelID: "resident/Loaded.gguf",
+      profileDefaultModelID: "profile/Default.gguf")
+
+    XCTAssertEqual(effectiveSummary?.slug, "profile/Default.gguf",
+                   "the collapsed display can legitimately show the override/default model")
+    XCTAssertEqual(ToolbarModelOptions.selectionAction(for: option,
+                                                       residentModelID: "resident/Loaded.gguf"),
+                   .requestModel(modelID: "profile/Default.gguf", overrideAfterConfirmation: nil),
+                   "clear-vs-load must not use the effective display model; resident A still needs a load for profile default B")
+  }
+
+  func test_profile_default_row_same_as_resident_only_clears_override() {
+    let option = ToolbarModelOptions.Option(
+      slug: "profile/Default.gguf",
+      displayName: "Default.gguf",
+      source: nil,
+      isCurrent: true,
+      isProfileDefault: true,
+      unavailableReason: nil)
+
+    XCTAssertEqual(ToolbarModelOptions.selectionAction(for: option, residentModelID: "profile/Default.gguf"),
                    .clearOverride)
   }
 
@@ -135,7 +157,7 @@ final class ToolbarModelOptionsTests: XCTestCase {
       isProfileDefault: false,
       unavailableReason: "Download in progress")
 
-    XCTAssertEqual(ToolbarModelOptions.selectionAction(for: option, currentModelID: "resident.gguf"),
+    XCTAssertEqual(ToolbarModelOptions.selectionAction(for: option, residentModelID: "resident.gguf"),
                    .unavailable(reason: "Download in progress"))
   }
 }

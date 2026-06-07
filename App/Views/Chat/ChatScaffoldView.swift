@@ -265,6 +265,7 @@ struct ChatScaffoldView: View {
         availableProfiles: selectableProfileIDs,
         modelOptions: toolbarModelOptions,
         currentModelSummary: toolbarCurrentModelSummary,
+        residentModelIDForSelection: toolbarResidentModelIDForDisplay,
         swapCoordinator: swapCoordinator,
         modelLoadCenter: modelLoadCenter,
         engineStatus: engineStatusStore,
