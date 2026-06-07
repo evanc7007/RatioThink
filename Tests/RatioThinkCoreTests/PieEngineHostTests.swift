@@ -15,9 +15,14 @@ final class PieEngineHostTests: XCTestCase {
   final class FakeSession: PieEngineHost.EngineSession, @unchecked Sendable {
     private let lock = NSLock()
     private var _count = 0
+    private let shutdownCalled: XCTestExpectation?
+    init(shutdownCalled: XCTestExpectation? = nil) {
+      self.shutdownCalled = shutdownCalled
+    }
     var shutdownCount: Int { lock.lock(); defer { lock.unlock() }; return _count }
     func shutdown() async -> EngineShutdownResult {
       lock.lock(); _count += 1; lock.unlock()
+      shutdownCalled?.fulfill()
       return .reaped
     }
   }
@@ -627,13 +632,15 @@ final class PieEngineHostTests: XCTestCase {
     host.stop()
   }
 
-  func test_timed_out_launch_success_cleans_session_before_retry_can_start() {
-    let firstSession = FakeSession()
+  func test_stale_launch_success_after_timeout_does_not_overwrite_retry() {
+    let firstSessionShutdown = expectation(description: "timed-out launch #1 shutdown")
+    let firstSession = FakeSession(shutdownCalled: firstSessionShutdown)
     assertRetryStartsOnlyAfterTimedOutLaunchCleanup(
       completeFirstLaunch: { launches in
         launches.succeed(0, port: EnginePort(1001), session: firstSession)
       },
       assertAfterFirstCleanup: {
+        wait(for: [firstSessionShutdown], timeout: 1)
         XCTAssertEqual(firstSession.shutdownCount, 1,
                        "timed-out successful launch must shut down its returned session before retry")
       }
