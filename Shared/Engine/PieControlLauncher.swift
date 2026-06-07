@@ -35,6 +35,13 @@ import Darwin
 /// avoids the Python harness's `_drain_stdout` background task +
 /// `_send_signal_safe` dance.
 public enum PieControlLauncher {
+  /// Keep the app launcher aligned with pie's template/default scheduler
+  /// timeout. Tree-of-thought can run long, and on slower hardware a single
+  /// node/scorer forward-pass may exceed the old app-local 60s cap, closing
+  /// the SSE before a terminal tree frame. The shmem fire_batch path also
+  /// reads `PIE_SHMEM_TIMEOUT_S`, so launch() mirrors this value into the
+  /// child environment instead of relying on TOML alone.
+  static let requestTimeoutSeconds = 120
 
   // MARK: - errors
 
@@ -492,9 +499,11 @@ public enum PieControlLauncher {
       modelConfig: spec.modelConfig, defaultTokenLimit: spec.defaultTokenLimit, in: spec.pieHome
     )
 
-    var env = spec.subprocessEnvironment
-    env["PIE_HOME"] = spec.pieHome.path
-    env["PIE_SHMEM_NAME"] = spec.shmemName
+    let env = renderSubprocessEnvironment(
+      base: spec.subprocessEnvironment,
+      pieHome: spec.pieHome,
+      shmemName: spec.shmemName
+    )
 
     let proc = Process()
     proc.executableURL = spec.pieBinary
@@ -517,6 +526,16 @@ public enum PieControlLauncher {
       throw LaunchError.spawnFailed(underlying: "\(error)")
     }
     spec.pidSink?(proc.processIdentifier)
+    DiagnosticLog.helper.event("engine.launch", [
+      ("pid", String(proc.processIdentifier)),
+      ("profile", spec.profileID),
+      ("binary", DiagnosticLog.redactHome(spec.pieBinary.path)),
+      ("config", DiagnosticLog.redactHome(configURL.path)),
+      ("pieHome", DiagnosticLog.redactHome(spec.pieHome.path)),
+      ("request_timeout_secs", String(requestTimeoutSeconds)),
+      ("PIE_SHMEM_TIMEOUT_S", env["PIE_SHMEM_TIMEOUT_S"] ?? "?"),
+      ("shmem", spec.shmemName),
+    ])
 
     let session = LaunchedSession(process: proc,
                                   stdout: stdout,
@@ -527,7 +546,7 @@ public enum PieControlLauncher {
     do {
       handshake = try await session.awaitHandshake(timeout: spec.handshakeTimeout)
     } catch {
-      await session.shutdown()
+      await session.shutdown(reason: "launch.handshake_failed")
       throw error
     }
 
@@ -548,14 +567,14 @@ public enum PieControlLauncher {
       await client.close()
     } catch {
       await client.close()
-      await session.shutdown()
+      await session.shutdown(reason: "launch.client_error")
       throw LaunchError.clientError(underlying: "\(error)")
     }
 
     do {
       try writePortFile(port: httpPort, in: spec.pieHome)
     } catch {
-      await session.shutdown()
+      await session.shutdown(reason: "launch.port_file_failed")
       throw error
     }
 
@@ -663,7 +682,7 @@ public enum PieControlLauncher {
 
     [model.scheduler]
     batch_policy = "adaptive"
-    request_timeout_secs = 60
+    request_timeout_secs = \(requestTimeoutSeconds)
     default_endowment_pages = 4
     admission_oversubscription_factor = 8.0
     restore_pause_at_utilization = 0.85\(limitLine)
@@ -728,6 +747,23 @@ public enum PieControlLauncher {
       """
       return preamble + model + scheduler + driver
     }
+  }
+
+  /// Child environment projection for `pie serve`. `SpawnEnvSanitizer` removes
+  /// parent `PIE_*` variables before `LaunchSpec` construction; this method
+  /// re-adds the exact app-owned values the child must see. Keep the shmem
+  /// hard timeout in lock-step with the TOML scheduler timeout because
+  /// `fire_batch` enforces `PIE_SHMEM_TIMEOUT_S` independently.
+  static func renderSubprocessEnvironment(
+    base: [String: String],
+    pieHome: URL,
+    shmemName: String
+  ) -> [String: String] {
+    var env = base
+    env["PIE_HOME"] = pieHome.path
+    env["PIE_SHMEM_NAME"] = shmemName
+    env["PIE_SHMEM_TIMEOUT_S"] = String(requestTimeoutSeconds)
+    return env
   }
 
   private static func renderPortableModel(servedID: String,
@@ -826,6 +862,7 @@ public actor LaunchedSession {
 
   public var pid: pid_t { process.processIdentifier }
   public var isRunning: Bool { process.isRunning }
+  public func diagnosticProcessID() async -> pid_t? { process.processIdentifier }
 
   /// Resident memory of the live pie process in bytes, or nil if the
   /// engine is not running or the sample fails. Satisfies
@@ -903,7 +940,7 @@ public actor LaunchedSession {
   ///     death from an inferlet rejection.
   public func checkLiveness() async -> EngineLiveness {
     if !process.isRunning {
-      return .gone(reason: "engine process exited (status \(process.terminationStatus))")
+      return .gone(reason: "engine process exited (\(terminationDescription()))")
     }
     guard let controlWSURL else {
       // Pre-handshake (address not yet recorded): the process is up;
@@ -932,14 +969,36 @@ public actor LaunchedSession {
   /// caller already failed; making cleanup throwable would just
   /// mask the original error.
   public func shutdown() async {
+    await shutdown(reason: "unspecified")
+  }
+
+  public func shutdown(reason: String) async {
     guard !shutdownDone else { return }
     shutdownDone = true
 
+    let pid = process.processIdentifier
+    let wasRunning = process.isRunning
+    DiagnosticLog.helper.event("engine.shutdown", [
+      ("reason", reason),
+      ("pid", String(pid)),
+      ("wasRunning", wasRunning ? "true" : "false"),
+    ])
+
     if process.isRunning {
+      DiagnosticLog.helper.event("engine.signal", [
+        ("reason", reason),
+        ("pid", String(pid)),
+        ("signal", "SIGINT"),
+      ])
       sendSignalQuiet(SIGINT, label: "SIGINT")
       let exited = await waitForExit(timeout: 10)
       if !exited {
         diagnose("SIGINT timed out after 10s; escalating to SIGKILL")
+        DiagnosticLog.helper.event("engine.signal", [
+          ("reason", reason),
+          ("pid", String(pid)),
+          ("signal", "SIGKILL"),
+        ])
         sendSignalQuiet(SIGKILL, label: "SIGKILL")
         let killed = await waitForExit(timeout: 5)
         if !killed {
@@ -947,9 +1006,26 @@ public actor LaunchedSession {
         }
       }
     }
+    if process.isRunning {
+      DiagnosticLog.helper.event("engine.exit", [
+        ("reason", reason),
+        ("pid", String(pid)),
+        ("status", "?"),
+        ("termination", "still_running"),
+      ])
+    } else {
+      DiagnosticLog.helper.event("engine.exit", [
+        ("reason", reason),
+        ("pid", String(pid)),
+        ("status", String(process.terminationStatus)),
+        ("termination", terminationDescription()),
+      ])
+    }
 
     // Close pipe so any reader (awaitHandshake's task, if still
-    // running) sees EOF.
+    // running) sees EOF. Drop the post-handshake discard-drain handler
+    // first so no callback fires into a closing handle.
+    stdout.fileHandleForReading.readabilityHandler = nil
     try? stdout.fileHandleForReading.close()
 
     shmUnlinkQuiet(shmemName)
@@ -1039,6 +1115,18 @@ public actor LaunchedSession {
     process.isRunning ? -1 : process.terminationStatus
   }
 
+  private func terminationDescription() -> String {
+    guard !process.isRunning else { return "running" }
+    switch process.terminationReason {
+    case .exit:
+      return "exit status=\(process.terminationStatus)"
+    case .uncaughtSignal:
+      return "signal status=\(process.terminationStatus)"
+    @unknown default:
+      return "unknown status=\(process.terminationStatus)"
+    }
+  }
+
   /// Confirm a REAL subprocess exit before classifying `engineExitedEarly`.
   /// Foundation's `process.isRunning` is wait4-backed and can momentarily
   /// misread under load (the same class of race as the supervisor handshake
@@ -1074,10 +1162,22 @@ public actor LaunchedSession {
         }
       }
       cont.onTermination = { _ in
-        // Drop the handler so the kernel buffer drains naturally
-        // into close(); we don't want stale callbacks firing into
-        // a finished continuation.
-        fh.readabilityHandler = nil
+        // The handshake line-stream is done, but pie keeps writing to this
+        // merged stdout+stderr pipe under `--debug` for its WHOLE lifetime.
+        // Stopping the reader here (the old `= nil`) was a wedge: the pipe is
+        // NOT closed until `shutdown()`, so an undrained ~64 KiB kernel
+        // buffer fills on a long-running request — a multi-level
+        // tree-of-thought search emits a lot of tracing — and pie BLOCKS on
+        // write, stalling generation with no frames, no terminal, no error
+        // (the engine appears hung). Keep draining and DISCARD; the handler
+        // self-removes at EOF (shutdown() closes the pipe). This is exactly
+        // why launch() merges stderr into this pipe (see the comment there)
+        // — but the merge only helps if we keep reading.
+        fh.readabilityHandler = { handle in
+          if handle.availableData.isEmpty {
+            handle.readabilityHandler = nil
+          }
+        }
       }
     }
   }
