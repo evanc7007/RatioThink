@@ -2,8 +2,9 @@ import XCTest
 @testable import RatioThinkCore
 
 /// #448: the App-side full-product quit coordinator. Pins the teardown
-/// contract — stop polling, ask the helper to quit, always signal `done` so
-/// the App can terminate — without a real helper or AppKit.
+/// contract — stop polling, ask the helper to quit, and only allow the App to
+/// terminate once the helper confirms the engine reached a terminal/reaped
+/// state — without a real helper or AppKit.
 @MainActor
 final class AppQuitCoordinatorTests: XCTestCase {
 
@@ -33,7 +34,10 @@ final class AppQuitCoordinatorTests: XCTestCase {
     let client = FakeQuitClient()
     let coord = AppQuitCoordinator(helperClient: client, isTestLaunch: true)
     let done = expectation(description: "done")
-    coord.beginTeardown { done.fulfill() }
+    coord.beginTeardown { shouldTerminate in
+      XCTAssertTrue(shouldTerminate)
+      done.fulfill()
+    }
     await fulfillment(of: [done], timeout: 2)
     XCTAssertEqual(client.quitCount, 0, "a test/automation launch must NOT quit the real helper")
     XCTAssertTrue(coord.isQuitting)
@@ -43,29 +47,67 @@ final class AppQuitCoordinatorTests: XCTestCase {
     let client = FakeQuitClient()
     let coord = AppQuitCoordinator(helperClient: client, isTestLaunch: false)
     let done = expectation(description: "done")
-    coord.beginTeardown { done.fulfill() }
+    coord.beginTeardown { shouldTerminate in
+      XCTAssertTrue(shouldTerminate)
+      done.fulfill()
+    }
     await fulfillment(of: [done], timeout: 2)
     XCTAssertEqual(client.quitCount, 1, "a real quit must ask the helper to stop the engine + exit")
   }
 
-  func test_quitHelperFailure_isBestEffort_stillSignalsDone() async {
+  func test_transportFailure_isBestEffort_stillSignalsDone() async {
     let client = FakeQuitClient()
-    client.quitError = AppXPCClientError.replyTimeout(selector: "quitHelper", timeout: HelperXPCClient.quitReplyTimeout)
+    client.quitError = AppXPCClientError.proxyTypeMismatch
     let coord = AppQuitCoordinator(helperClient: client, isTestLaunch: false)
     let done = expectation(description: "done despite helper error")
-    coord.beginTeardown { done.fulfill() }
+    coord.beginTeardown { shouldTerminate in
+      XCTAssertTrue(shouldTerminate)
+      done.fulfill()
+    }
     await fulfillment(of: [done], timeout: 2)
     XCTAssertEqual(client.quitCount, 1)
+  }
+
+  func test_quitHelperTimeout_blocksAppTerminationAndAllowsRetry() async {
+    let client = FakeQuitClient()
+    client.quitError = EngineError(
+      code: .handshakeTimeout,
+      message: "quitHelper stop/reap timeout"
+    )
+    let coord = AppQuitCoordinator(helperClient: client, isTestLaunch: false)
+    let blocked = expectation(description: "quit blocked because pie was not reaped")
+    coord.beginTeardown { shouldTerminate in
+      XCTAssertFalse(shouldTerminate)
+      blocked.fulfill()
+    }
+    await fulfillment(of: [blocked], timeout: 2)
+    XCTAssertEqual(client.quitCount, 1)
+    XCTAssertFalse(coord.isQuitting, "blocked quit must reset so the user can retry")
+
+    client.quitError = nil
+    let retry = expectation(description: "retry can terminate after helper succeeds")
+    coord.beginTeardown { shouldTerminate in
+      XCTAssertTrue(shouldTerminate)
+      retry.fulfill()
+    }
+    await fulfillment(of: [retry], timeout: 2)
+    XCTAssertEqual(client.quitCount, 2)
   }
 
   func test_secondTeardown_afterCompletion_isIdempotent_doesNotReQuitHelper() async {
     let client = FakeQuitClient()
     let coord = AppQuitCoordinator(helperClient: client, isTestLaunch: false)
     let first = expectation(description: "first done")
-    coord.beginTeardown { first.fulfill() }
+    coord.beginTeardown { shouldTerminate in
+      XCTAssertTrue(shouldTerminate)
+      first.fulfill()
+    }
     await fulfillment(of: [first], timeout: 2)
     let second = expectation(description: "second done")
-    coord.beginTeardown { second.fulfill() }
+    coord.beginTeardown { shouldTerminate in
+      XCTAssertTrue(shouldTerminate)
+      second.fulfill()
+    }
     await fulfillment(of: [second], timeout: 2)
     XCTAssertEqual(client.quitCount, 1, "a repeated applicationShouldTerminate must not re-quit the helper")
   }
@@ -76,7 +118,8 @@ final class AppQuitCoordinatorTests: XCTestCase {
     let coord = AppQuitCoordinator(helperClient: client, isTestLaunch: false)
     let firstReleased = expectation(description: "first done after helper completes")
     var firstDoneEarly = false
-    coord.beginTeardown {
+    coord.beginTeardown { shouldTerminate in
+      XCTAssertTrue(shouldTerminate)
       firstDoneEarly = true
       firstReleased.fulfill()
     }
@@ -90,7 +133,8 @@ final class AppQuitCoordinatorTests: XCTestCase {
 
     let secondReleased = expectation(description: "second done after helper completes")
     var secondDoneEarly = false
-    coord.beginTeardown {
+    coord.beginTeardown { shouldTerminate in
+      XCTAssertTrue(shouldTerminate)
       secondDoneEarly = true
       secondReleased.fulfill()
     }
