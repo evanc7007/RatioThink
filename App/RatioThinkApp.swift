@@ -4,6 +4,11 @@ import ServiceManagement
 
 @main
 struct RatioThinkApp: App {
+  /// #448: window-close = background, ⌘Q / "Quit" / `ratiothink://quit` =
+  /// coordinated full quit. The delegate owns `applicationShouldTerminate`
+  /// (which SwiftUI's `App` does not expose) and
+  /// `applicationShouldTerminateAfterLastWindowClosed`.
+  @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
   /// One-shot guard so the launch-time Helper registration reconcile
   /// runs once even if a second window opens.
   @MainActor private static var didReconcileHelperRegistration = false
@@ -194,6 +199,10 @@ struct RatioThinkApp: App {
     }
     _helperHealth = StateObject(wrappedValue: helperHealthController)
 
+    // #448: give the full-product quit coordinator the poll loop it must stop
+    // before tearing down, so no late on-demand poll respawns the Helper.
+    AppQuitCoordinator.shared.engineStatusStore = statusStore
+
     // Kick the XPC poll loop. Idempotent + cheap — first reply lands
     // within ~one runloop tick when the helper is registered, longer
     // when launchd has not yet published the mach service.
@@ -214,7 +223,7 @@ struct RatioThinkApp: App {
   /// `EngineStatusStore`, `LaunchSpecResolver`, `PieControlLauncher`,
   /// `pie serve`). It is honored ONLY in a test harness
   /// (`PIE_TEST_MODE=1`) or a DEBUG build — a shipped Release
-  /// `RatioThink.app` MUST use the real Helper→engine path. Refusing it
+  /// `Rational.app` MUST use the real Helper→engine path. Refusing it
   /// in Release closes the parity gap two ways: a shipped app can't be
   /// redirected at a foreign URL, and a "real binary" (Release/packaged)
   /// scenario cannot silently pass on a fake base URL — if the override
@@ -343,7 +352,9 @@ struct RatioThinkApp: App {
     Diag.app.event("app.launch", [
       ("version", info?["CFBundleShortVersionString"] as? String ?? "?"),
       ("build", info?["CFBundleVersion"] as? String ?? "?"),
+      ("pid", String(ProcessInfo.processInfo.processIdentifier)),
       ("bundle", DiagnosticLog.redactHome(bundlePath)),
+      ("executable", DiagnosticLog.redactHome(Bundle.main.executableURL?.path ?? "?")),
       ("quarantine", quarantined ? "present" : "absent"),
     ])
   }
@@ -370,7 +381,7 @@ struct RatioThinkApp: App {
   }
 
   var body: some Scene {
-    WindowGroup("RatioThink") {
+    WindowGroup("Rational") {
       Group {
         if appPreferences.firstLaunchWizardCompleted {
           RootView()
@@ -403,7 +414,7 @@ struct RatioThinkApp: App {
     .defaultSize(width: 1200, height: 800)
     .commands {
       // #411: the MANUAL "Check for Updates…" entry, in the standard macOS
-      // spot (App menu, directly under "About RatioThink"). It always checks
+      // spot (App menu, directly under "About Rational"). It always checks
       // and bypasses the ignore-set, complementing the once-per-launch auto
       // check that surfaces the non-modal UpdateAvailableBanner (RootView /
       // UpdateAvailabilityModel). Both compare the running version to the
@@ -474,11 +485,13 @@ struct RatioThinkApp: App {
 /// only — compiled out of Release alongside the pin itself.
 private struct PinnedRunningXPCClient: AppXPCClient {
   let port: EnginePort
+  func helperProtocolVersion() async throws -> Int { HelperProtocolCompatibility.currentVersion }
   func engineStatus() async throws -> EngineStatus { .running(port: port, profileID: "chat") }
   func stopEngine() async throws {}
   // The pinned harness has no Helper to launch an engine; the engine is
   // already pinned `.running`, so a start is a no-op success (mirrors
   // `stopEngine`).
   func startEngine(profileID: String) async throws {}
+  func restartEngine(profileID: String) async throws {}
 }
 #endif

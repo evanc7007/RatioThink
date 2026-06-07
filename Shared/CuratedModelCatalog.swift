@@ -9,6 +9,12 @@ import Foundation
 /// per family the engine has been smoke-tested with. Entries are
 /// data-only — adding/removing models is a pure source change and
 /// requires no migration since the catalog is not persisted.
+///
+/// Source convention: any future file that contributes entries to
+/// `CuratedModelCatalog.all` must live under
+/// `Shared/Curated*Catalog*.swift` so the PR-time live-HF audit in
+/// `.github/workflows/curated-catalog-audit.yml` still runs when a PR
+/// changes only that split source.
 public struct CuratedModel: Equatable, Identifiable, Sendable {
   /// Stable identifier for SwiftUI list diffing. Mirrors the `model`
   /// field a Profile would carry once installed, so the same string
@@ -162,7 +168,7 @@ public enum CuratedModelCatalog {
       approximateSizeBytes: 639_446_688,
       huggingFaceRepo: "Qwen/Qwen3-0.6B-GGUF",
       huggingFaceFile: "Qwen3-0.6B-Q8_0.gguf",
-      summary: "Recommended starter — same model RatioThink seeds as the default chat profile."
+      summary: "Recommended starter — same model Rational seeds as the default chat profile."
     ),
     CuratedModel(
       id: "llama-3.2-1b-instruct-q4_k_m",
