@@ -111,6 +111,9 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
     Diag.helper.event("helper.launch", [
       ("version", info?["CFBundleShortVersionString"] as? String ?? "?"),
       ("build", info?["CFBundleVersion"] as? String ?? "?"),
+      ("pid", String(ProcessInfo.processInfo.processIdentifier)),
+      ("bundle", DiagnosticLog.redactHome(Bundle.main.bundleURL.path)),
+      ("executable", DiagnosticLog.redactHome(Bundle.main.executableURL?.path ?? "?")),
     ])
     eagerProbePieDirs()
     setupStatusItemIfNeeded()
@@ -148,6 +151,10 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
   ///    which therefore calls `xpcListener.invalidate()` inline
   ///    instead of relying on this hook.
   func applicationWillTerminate(_ note: Notification) {
+    Diag.helper.event("helper.quit", [
+      ("reason", "applicationWillTerminate"),
+      ("pid", String(ProcessInfo.processInfo.processIdentifier)),
+    ])
     // Order matters here (review v1 F1):
     //   1. Cancel the supervisor observer FIRST and nil out the
     //      status item so the `guard` in `applyStatusItemModel`
@@ -177,7 +184,7 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
     // paths reach this hook still apply — SIGKILL/SIGABRT/exit(_:)
     // skip the helper teardown entirely, in which case launchd
     // reaps the child via process-group cleanup.
-    engineHost?.stop()
+    engineHost?.stop(reason: "helper.applicationWillTerminate")
     profileStore?.stop()
     profileStore = nil
     if let xpcListener {
@@ -333,13 +340,13 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
       // degraded status item is already published and must not be
       // overwritten by a misleading "Engine: stopped" render.
       subscribeToEngineHost(host)
-      // Auto-start the engine for the active profile at boot (
-      // follow-up). The App is poll-only and never issues `startEngine`;
-      // before this the engine only started via a manual menu-bar Resume,
-      // so a freshly-booted Helper left the engine `.stopped` and every
-      // model load deferred forever on `engineNotReady`. Firing the same
-      // in-process resume path here yields a ready engine without user
-      // interaction. No active profile selected ⇒ benign no-op.
+      // Boot model-load is intentionally disabled: helper startup publishes
+      // XPC/menu state and leaves the engine `.stopped`. Status delivery is
+      // still poll-based via `engineStatus`, but the app can issue explicit
+      // lifecycle requests through `EngineStatusStore.startEngine` for the
+      // launch prompt/user confirmation, Restart, Local API, and post-download
+      // recovery paths. Engine-crash auto-relaunch remains separate and is
+      // wired through `HelperResumeAction` via `PieEngineHost`'s relauncher.
       autoResumeEngineOnBoot()
       #if DEBUG
       scheduleSmokeAutoDriveIfRequested(engineHost: host)
@@ -475,6 +482,10 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
   private func transitionToDegradedOrTerminate(reason: String) {
     guard transitionToDegraded(reason: reason) else {
       Log.helper.fault("transitionToDegraded had no listener to mutate (reason=\(reason, privacy: .public)) — terminating: a live listener serving .degraded is the only acceptable post-resume failure mode")
+      Diag.helper.event("helper.quit", [
+        ("reason", "degraded_transition_failed"),
+        ("pid", String(ProcessInfo.processInfo.processIdentifier)),
+      ])
       xpcListener?.invalidate()
       xpcListener = nil
       exit(EXIT_FAILURE)
@@ -1118,20 +1129,20 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
   }
   #endif
 
-  /// Boot-time engine auto-start ( follow-up). Mirrors the menu-bar
-  /// Resume path but fires once at launch so a configured profile yields
-  /// a running engine without user interaction — the App's poll-only
-  /// model-load flow then finds a ready engine instead of deferring on
-  /// `engineNotReady`. Skipped in test mode (tests own engine lifecycle).
-  /// `HelperResumeAction.run` is internally nil/`.noActiveProfile`-safe,
-  /// so a degraded boot or unselected profile is a logged no-op.
+  /// Boot-time model-load hook. This is now a disabled/no-op hook: helper
+  /// boot publishes XPC/menu state and leaves the engine stopped while the app
+  /// polls status separately. Starts happen through explicit lifecycle requests
+  /// (`startEngine(profileID:)`) from the launch prompt/user confirmation,
+  /// Restart, Local API, or post-download recovery paths. Skipped in test mode
+  /// because tests own engine lifecycle.
   private func autoResumeEngineOnBoot() {
     // #4: the engine is NO LONGER auto-started on boot. Pre-#4 this
     // resumed the active profile automatically, which (a) loaded a
     // multi-GB model the user may not want this session and (b) made a
     // model-load failure on launch read as an unprompted error. The App
-    // now ALWAYS asks ("Start <model>?") on launch and starts the engine
-    // only on explicit user confirm via the `startEngine` XPC selector.
+    // now starts via explicit lifecycle requests: the launch prompt/user
+    // confirmation, Restart, Local API, or post-download recovery paths call
+    // the `startEngine` XPC selector.
     //
     // Scope: this disables the BOOT model-load only. The engine-CRASH
     // auto-relaunch ladder is a separate mechanism (the `relauncher`
@@ -1139,7 +1150,7 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
     // the liveness monitor on `.failed(.engineGone)` per
     // `RelaunchPolicy`) and is deliberately UNCHANGED — a crashed engine
     // still recovers automatically without a prompt.
-    Log.helper.info("autoResumeEngineOnBoot: boot auto-start disabled (#4) — engine stays stopped; the App prompts the user to start the active profile’s model on launch")
+    Log.helper.info("autoResumeEngineOnBoot: boot auto-start disabled (#4) — engine stays stopped until an explicit app/user start request")
   }
 
   @objc func togglePauseResume(_ sender: NSMenuItem) {
@@ -1162,7 +1173,7 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
         return
       }
       Log.helper.info("togglePauseResume: pause requested")
-      engineHost.stop()
+      engineHost.stop(reason: "menu.pause")
     case .resume:
       // In-process Resume ( follow-up): no XPC round-trip — the
       // menu-bar action runs inside the helper, so we hand the

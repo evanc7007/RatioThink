@@ -21,9 +21,12 @@ struct HelperRegistrationRepair {
   /// cheap and stateless. Injected so tests supply `EnvironmentLoginItemRegistrar`
   /// instead of mutating the real machine's background-item registration.
   private let makeRegistrar: @Sendable () -> LoginItemRegistering
-  /// One bounded reachability probe (a helper `engineStatus()` poll with
+  /// One bounded compatibility probe (a helper protocol-version poll with
   /// retry/backoff plus identity validation). Injected so tests don't open a
-  /// real XPC connection.
+  /// real XPC connection. A merely reachable old helper is not enough after
+  /// app upgrades or the RatioThink → Rational rename: it can answer the
+  /// preserved mach service while lacking required selectors or still running
+  /// the legacy executable.
   private let probeReachable: @Sendable () async -> HelperRegistrationProbeResult
 
   init(
@@ -35,8 +38,9 @@ struct HelperRegistrationRepair {
   }
 
   /// Run one reconcile pass. Probes first; repairs (unregister+register) only
-  /// when the Helper is unreachable, leaving a healthy background service
-  /// untouched. The decision table lives in the pure `HelperRegistrationReconciler`.
+  /// when the Helper is unreachable or protocol-incompatible, leaving a
+  /// healthy/current background service untouched. The decision table lives in
+  /// the pure `HelperRegistrationReconciler`.
   func reconcile() async -> HelperRegistrationReconciler.Outcome {
     let registrar = makeRegistrar()
     let reconciler = HelperRegistrationReconciler(
@@ -63,11 +67,15 @@ struct HelperRegistrationRepair {
     return outcome.helperReachable
   }
 
-  /// Default bounded helper probe: one `engineStatus()` poll retried over ~5s
-  /// so a just-(re)launched on-demand Helper has time to publish its mach
-  /// service, followed by an identity check. The identity check is required
-  /// during the RatioThink → Rational rename: a legacy RatioThinkHelper can be
-  /// reachable on the preserved mach service but still be the wrong helper.
+  /// Default bounded compatibility probe: one `engineStatus()` poll retried
+  /// over ~5s so a just-(re)launched on-demand Helper has time to publish its
+  /// mach service, followed by identity and protocol-version checks. The
+  /// identity check is required during the RatioThink → Rational rename: a
+  /// legacy RatioThinkHelper can be reachable on the preserved mach service but
+  /// still be the wrong helper. The protocol-version check preserves the
+  /// broader upgrade guard: an old-but-reachable helper can answer
+  /// `engineStatus()` while lacking newly-required selectors such as strict
+  /// `restartEngine(profileID:)`.
   /// Defaults come from `HelperReconcileProbeBudget` (RatioThinkCore) so the
   /// probe's wall time and the chat-recovery ceiling that depends on it share
   /// ONE definition and cannot drift (#412 re-F1).
@@ -85,15 +93,20 @@ struct HelperRegistrationRepair {
         }
         continue
       }
+
       do {
         let identity = try await client.helperIdentity()
-        if identity.isExpectedRationalHelper {
-          return .healthy
+        if !identity.isExpectedRationalHelper {
+          return .identityMismatch(identity.mismatchSummary)
         }
-        return .identityMismatch(identity.mismatchSummary)
       } catch {
         return .identityMismatch("identity probe failed after engineStatus: \(error)")
       }
+
+      if await HelperProtocolCompatibility.isCompatible(client: client) {
+        return .healthy
+      }
+      return .identityMismatch("helper protocol version is older than \(HelperProtocolCompatibility.currentVersion)")
     }
     return .unreachable
   }
