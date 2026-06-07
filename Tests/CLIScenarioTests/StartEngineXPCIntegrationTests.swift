@@ -268,10 +268,11 @@ final class StartEngineXPCIntegrationTests: IsolatedTestCase {
     XCTAssertEqual(host.status, .stopped, "quitHelper must reap the engine before terminating")
   }
 
-  func test_quitHelper_overXPC_timeoutReturnsEngineErrorInsteadOfNilSuccess() async throws {
+  func test_quitHelper_overXPC_timeoutReturnsEngineErrorAndDoesNotTerminateHelper() async throws {
     final class HangingShutdownSession: PieEngineHost.EngineSession, @unchecked Sendable {
-      func shutdown() async {
+      func shutdown() async -> EngineShutdownResult {
         try? await Task.sleep(nanoseconds: 5_000_000_000)
+        return .unreaped("test session did not reap")
       }
     }
 
@@ -299,7 +300,8 @@ final class StartEngineXPCIntegrationTests: IsolatedTestCase {
       pieHome: { self.tempDir },
       subprocessEnvironment: { [:] }
     )
-    let terminated = expectation(description: "onQuitRequested fires after bounded timeout fallback")
+    let terminated = expectation(description: "onQuitRequested must not fire while pie may still be alive")
+    terminated.isInverted = true
     let exported = HelperExportedAPI(
       engineHost: host,
       launchSpecResolver: resolver.asClosure,
@@ -327,9 +329,71 @@ final class StartEngineXPCIntegrationTests: IsolatedTestCase {
       XCTAssertEqual(err.code, .handshakeTimeout)
       XCTAssertTrue(err.message.contains("quitHelper"))
       XCTAssertTrue(err.message.contains("0.05"))
-      XCTAssertTrue(err.message.contains("bounded"))
     }
-    await fulfillment(of: [terminated], timeout: 4)
+    await fulfillment(of: [terminated], timeout: 0.5)
+  }
+
+  func test_quitHelper_overXPC_unreapedShutdownReturnsKillRejectedInsteadOfNilSuccess() async throws {
+    final class UnreapedShutdownSession: PieEngineHost.EngineSession, @unchecked Sendable {
+      func shutdown() async -> EngineShutdownResult {
+        .unreaped("SIGKILL + 5s waitpid window did not reap pid 4242")
+      }
+    }
+
+    let store = try makeProfileStoreWithChat()
+    defer { store.stop() }
+
+    let host = PieEngineHost(launcher: { _ in
+      (port: EnginePort(24662), session: UnreapedShutdownSession())
+    })
+    defer { host.stop() }
+
+    let ignored = try writeCapabilityProbe(portable: true, metal: true)
+    let modelsRoot = tempDir.appendingPathComponent("models", isDirectory: true)
+    try FileManager.default.createDirectory(at: modelsRoot, withIntermediateDirectories: true)
+    try Data("ignored".utf8).write(
+      to: modelsRoot.appendingPathComponent("ignored-by-fake-pie.gguf", isDirectory: false)
+    )
+    let resources = try writeInferletResources(name: "chat-apc", version: "0.1.0")
+    let resolver = LaunchSpecResolver(
+      profileStore: store,
+      pieBinary: { ignored },
+      modelsRoot: { modelsRoot },
+      inferletsDir: { self.tempDir.appendingPathComponent("inferlets") },
+      pieControlResources: { resources },
+      pieHome: { self.tempDir },
+      subprocessEnvironment: { [:] }
+    )
+    let terminated = expectation(description: "onQuitRequested must not fire after failed reap")
+    terminated.isInverted = true
+    let exported = HelperExportedAPI(
+      engineHost: host,
+      launchSpecResolver: resolver.asClosure,
+      replyTimeoutOverride: (start: 8, stop: 2),
+      onQuitRequested: { terminated.fulfill() }
+    )
+
+    let listenerOwner = HelperXPCListener.startAnonymous(exportedObject: exported)
+    defer { listenerOwner.invalidate() }
+    let connection = NSXPCConnection(listenerEndpoint: listenerOwner.endpoint)
+    connection.remoteObjectInterface = PieHelperXPCInterface.make()
+    connection.resume()
+    defer { connection.invalidate() }
+    let api = try XCTUnwrap(connection.remoteObjectProxyWithErrorHandler { err in
+      XCTFail("XPC proxy error: \(err)")
+    } as? PieHelperXPC, "remote proxy must conform to PieHelperXPC")
+
+    let port = try await callStartEngine(api: api, profileID: "chat", timeout: 8)
+    XCTAssertEqual(port, 24662)
+
+    do {
+      try await callQuitHelper(api: api, timeout: 2)
+      XCTFail("quitHelper unreaped shutdown must not be reported as nil success")
+    } catch XPCError.engine(let err) {
+      XCTAssertEqual(err.code, .killRejected)
+      XCTAssertTrue(err.message.contains("did not reap pid 4242"))
+    }
+    await fulfillment(of: [terminated], timeout: 0.5)
   }
 
   /// Session whose `checkLiveness()` replays a scripted sequence, then
@@ -340,7 +404,7 @@ final class StartEngineXPCIntegrationTests: IsolatedTestCase {
     private let script: [EngineLiveness]
     private var idx = 0
     init(_ script: [EngineLiveness]) { self.script = script }
-    func shutdown() async {}
+    func shutdown() async -> EngineShutdownResult { .reaped }
     func checkLiveness() async -> EngineLiveness {
       lock.lock(); defer { lock.unlock() }
       let v = script[min(idx, script.count - 1)]
@@ -654,7 +718,7 @@ final class StartEngineXPCIntegrationTests: IsolatedTestCase {
   /// only need the host to reach `.running` and accept `.stop()`
   /// later. `PieEngineHostTests` covers shutdown invocation.
   private final class FakeSession: PieEngineHost.EngineSession, @unchecked Sendable {
-    func shutdown() async {}
+    func shutdown() async -> EngineShutdownResult { .reaped }
   }
 
   /// Async bridge over `startEngine(profileID:reply:)`. Throws

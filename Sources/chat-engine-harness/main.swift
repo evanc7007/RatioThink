@@ -87,16 +87,16 @@ enum EngineHarness {
       // terminal.
       if let question = env["PIE_TEST_TOT_QUESTION"], !question.isEmpty {
         let ok = try await runTreeOfThought(question: question, baseURL: baseURL, env: env)
-        await session.shutdown(reason: "harness.tot_complete")
+        _ = await session.shutdown(reason: "harness.tot_complete")
         exit(ok ? 0 : 1)
       }
       try baseURL.absoluteString.write(to: urlFile, atomically: true, encoding: .utf8)
       print("chat-engine-harness: wrote \(urlFile.path)")
       await waitForSIGTERM()
       print("chat-engine-harness: shutting down")
-      await session.shutdown(reason: "harness.sigterm")
+      _ = await session.shutdown(reason: "harness.sigterm")
     } catch {
-      await session.shutdown(reason: "harness.error")
+      _ = await session.shutdown(reason: "harness.error")
       throw error
     }
   }
