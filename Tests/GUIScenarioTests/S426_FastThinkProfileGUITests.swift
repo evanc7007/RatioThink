@@ -63,8 +63,10 @@ final class S426_FastThinkProfileGUITests: XCTestCase {
     newChat.click()
 
     // Resolve `residentModelID` to the served slug before swapping profiles:
-    // the model menu only renders the seeded leaf once the reconcile has run,
-    // so its appearance is our barrier that the swap below will be silent.
+    // `waitForResidentModelValue` below is the reconciliation barrier because
+    // it waits for the unannotated toolbar accessibility value to equal the
+    // served model id. A seeded-leaf menu row can exist earlier from the
+    // profile-default option, so row appearance alone is not the barrier.
     let modelMenu = app.menuButtons["toolbar.model"]
     XCTAssertTrue(modelMenu.waitForExistence(timeout: 10),
                   "model menu missing after creating chat; app tree: \(app.debugDescription)")
@@ -77,6 +79,8 @@ final class S426_FastThinkProfileGUITests: XCTestCase {
     XCTAssertTrue(waitForResidentModelValue(modelMenu, model, timeout: 15),
                   "toolbar.model never reflected reconciled resident model \(model); title=\(modelMenu.title), value=\(String(describing: modelMenu.value)); app tree: \(app.debugDescription)")
 
+    // With resident reconciliation proven, separately verify the selectable
+    // model row is still present in the menu.
     XCTAssertTrue(waitForModelMenuItem(containingModelLeaf: "Qwen3-0.6B-Q8_0.gguf",
                                        in: app,
                                        openedBy: modelMenu,
