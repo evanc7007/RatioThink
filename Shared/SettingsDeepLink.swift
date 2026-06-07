@@ -21,9 +21,32 @@ public enum SettingsDeepLink {
   /// Host that selects the Settings surface.
   public static let settingsHost = "settings"
 
+  public enum Tab: String, Equatable, Sendable {
+    case general
+    case models
+    case profiles
+    case advanced
+  }
+
+  public enum Route: Equatable, Sendable {
+    case settings(tab: Tab?)
+  }
+
   /// `ratiothink://settings` — open straight to the Settings window.
   public static var settingsURL: URL {
     URL(string: "\(scheme)://\(settingsHost)")!
+  }
+
+  /// `ratiothink://settings?tab=models` — open Settings with the Models tab selected.
+  public static var modelsSettingsURL: URL {
+    URL(string: "\(scheme)://\(settingsHost)?tab=\(Tab.models.rawValue)")!
+  }
+
+  public static func route(for url: URL) -> Route? {
+    guard isSettings(url) else { return nil }
+    let components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+    let tabValue = components?.queryItems?.first { $0.name.lowercased() == "tab" }?.value?.lowercased()
+    return .settings(tab: tabValue.flatMap(Tab.init(rawValue:)))
   }
 
   /// `true` when `url` is the canonical open-Settings deep link

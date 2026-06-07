@@ -14,12 +14,16 @@ import AppKit
 /// a cold or background launch without a private selector.
 struct SettingsURLHandler: ViewModifier {
   @Environment(\.openSettings) private var openSettings
+  @EnvironmentObject private var settingsNavigation: SettingsNavigation
 
   func body(content: Content) -> some View {
     content.onOpenURL { url in
-      guard SettingsDeepLink.isSettings(url) else { return }
+      guard let route = SettingsDeepLink.route(for: url) else { return }
       // Triage breadcrumb: proves the menu-bar "Settings…" deep link
       // reached the app (vs. a LaunchServices/scheme-registration failure).
+      if case let .settings(tab) = route {
+        settingsNavigation.open(tab)
+      }
       Diag.app.event("deeplink.open", [("route", "settings")])
       // Bring the app forward first: a deep link that launches the app
       // from the background otherwise opens Settings behind other windows.

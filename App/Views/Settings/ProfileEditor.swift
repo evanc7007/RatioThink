@@ -12,6 +12,8 @@ struct ProfileEditor: View {
   /// hands back a refreshed `entry`. .
   var onModelChanged: () -> Void = {}
   @EnvironmentObject private var profileStore: ProfileStore
+  @EnvironmentObject private var downloads: ModelDownloadController
+  @EnvironmentObject private var settingsNavigation: SettingsNavigation
   @State private var showAdvanced: Bool = false
   /// Discovered model options (app-managed + HF cache), each carrying
   /// size + over-limit / unsupported state for the model-size guardrail.
@@ -49,7 +51,7 @@ struct ProfileEditor: View {
       .padding(20)
     }
     .accessibilityIdentifier("ProfileEditor")
-    .task { await refreshModelOptions(current: entry.profile?.model ?? "") }
+    .task(id: downloads.completionTick) { await refreshModelOptions(current: entry.profile?.model ?? "") }
   }
 
   // MARK: - Sections
@@ -111,11 +113,21 @@ struct ProfileEditor: View {
           // plus size + over-limit / unsupported reason.
           modelOptionLabel(option)
         }
+        .help(option.slug)
+        .accessibilityValue(option.slug)
         // Block selecting an unloadable model — over-limit (too large for
         // this host) or unsupported (a split GGUF the engine can't load)
         // — but never the current value, which stays a no-op.
         .disabled((option.isOverLimit || option.unsupportedReason != nil) && !option.isCurrent)
       }
+      Divider()
+      Button {
+        settingsNavigation.open(.models)
+      } label: {
+        Label("Manage Models…", systemImage: "gearshape")
+      }
+      .help("Open Settings → Models")
+      .accessibilityIdentifier("ProfileEditorModelPickerManageModels")
     } label: {
       HStack(spacing: 4) {
         Text(ModelDisplayName.leaf(profile.model)).monospaced()
@@ -124,6 +136,8 @@ struct ProfileEditor: View {
     }
     .menuStyle(.borderlessButton)
     .fixedSize()
+    .help(profile.model)
+    .accessibilityValue(profile.model)
     .accessibilityIdentifier("ProfileEditorModelPicker")
   }
 

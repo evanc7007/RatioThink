@@ -55,6 +55,7 @@ struct RatioThinkApp: App {
   /// check (and its single network call) fires once per process; RootView
   /// observes `pending` to render the non-modal update banner.
   @StateObject private var updateAvailability = UpdateAvailabilityModel()
+  @StateObject private var settingsNavigation = SettingsNavigation()
 
   @MainActor
   init() {
@@ -392,6 +393,7 @@ struct RatioThinkApp: App {
         .environmentObject(helperHealth)
         .environmentObject(downloadController)
         .environmentObject(updateAvailability)
+        .environmentObject(settingsNavigation)
         // #420: route the menu-bar Helper's `ratiothink://settings` deep
         // link straight to the Settings scene (not just app-foreground).
         .handlesSettingsDeepLink()
@@ -449,6 +451,7 @@ struct RatioThinkApp: App {
 
     Settings {
       SettingsRoot()
+        .environmentObject(settingsNavigation)
         .environmentObject(modelLoadCenter)
         .environmentObject(appPreferences)
         .environmentObject(profileStore)
