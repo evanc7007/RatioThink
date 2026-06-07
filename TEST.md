@@ -1,4 +1,4 @@
-# RatioThink — Test catalog & pre-PR gate
+# Rational — Test catalog & pre-PR gate
 
 The single source of truth for *what tests exist, where they run, and what to
 confirm before opening a PR*. `make help` lists the runnable targets; this doc
@@ -12,7 +12,7 @@ below in the same change.
 | Target | What it runs | Runs where | Gating |
 |---|---|---|---|
 | `make lint` | helper side-effect invariants (static) | anywhere | — |
-| `make build` | Debug build of RatioThink app + helper | anywhere | — |
+| `make build` | Debug build of Rational app + helper | anywhere | — |
 | `make build-tests` | **Compile-only** smoke of every xcodebuild target + SPM probe (does NOT run the bundles) | anywhere | — (in CI) |
 | `make test-app-unit` | **RatioThinkTests** app-unit bundle (xcodebuild): #420 deep-link/login-item guards, ChatScaffold, ZeroState, snapshots | anywhere (headless, needs Xcode) | local tier — CI only **compiles** it (via `build-tests`) |
 | `make test-xcode-chat-scaffold` | `ChatScaffoldModelSelectionTests` focused slice of the above (one suite) | anywhere | local tier — subset of `test-app-unit` |
@@ -21,6 +21,7 @@ below in the same change.
 | `make test-smoke` | S3 engine subprocess smoke | anywhere | needs built `pie` (`make engine-build`) |
 | `make test-install-guards` | launchd source-closed / agent-reenable / new-bundle acceptance regressions (stubbed) | anywhere | — (in CI) |
 | `make test-collect-diagnostics` | `Scripts/collect-diagnostics.sh` self-test (redacted diagnostics bundle) | anywhere | — (in CI) |
+| `make test-readme-harness` | README screenshot canned-copy branding guard | anywhere | — |
 | `make test-dmg-layout` | DMG drag-install layout verifier regression (hdiutil + codesign) | anywhere | — (in CI) |
 | `make test-release` | real-tool contract tests for `notarize.sh` + `release-preflight.sh` | anywhere | — (in CI) |
 | `make test-stamp` | `Inferlets/chat-apc/_stamp.py` unit tests | anywhere | — |
@@ -31,8 +32,9 @@ below in the same change.
 | `make test-gui` | GUI scenarios (S4, S5, and the rest of `Tests/GUIScenarioTests`) via XCUITest | **seated session** | `Dock` running; Automation/Accessibility TCC |
 | `make test-gui-history` | Deterministic multi-turn history/resume E2E | **seated session** | `PIE_TEST_TCC_GRANTED=1` |
 | `make test-gui-first-launch-package` | Package-backed first-launch E2E (Release `.app`) | **seated session** | built artifact + TCC |
+| `make test-quit-structured` | Live structured-quit acceptance: idle engine persists; `ratiothink://quit` leaves no App/Helper/pie | signed install + running engine | manual/live only |
 | `make test-gui-script` | Fast preflight regressions for the GUI E2E wrapper scripts | anywhere | — |
-| `make test-all` | `test-ssh` + `test-gui` (GUI skips if no seated session) | seated for full | — |
+| `make test-all` | `test-ssh` + `test-app-unit` + `test-gui` (GUI skips if no seated session) | seated for full | — |
 
 The **`RatioThinkTests`** xcodebuild app-unit target (`Tests/Unit/*`, e.g.
 `ZeroStateActionsTests`, `SettingsDeepLinkBundleTests`,
@@ -116,7 +118,7 @@ download), `S327` (engine-status pip), `S360` (Models top-align).
 
 ### GUI temp-home cleanup
 
-A GUI suite that needs the non-sandboxed `RatioThink.app` to write a real
+A GUI suite that needs the non-sandboxed `Rational.app` to write a real
 on-disk store stages its `PIE_HOME` under a real `/tmp` path (S285, S286) —
 never `NSTemporaryDirectory()`, which resolves to the sandboxed runner's
 container the app cannot write. Consequence: the suite **cannot delete that
@@ -332,7 +334,7 @@ Expected pass evidence:
   `What code word did I give you?`,
 - request log entry 2 contains the ordered in-session history:
   user turn 1, assistant turn 1, user turn 2,
-- XCUITest terminates/relaunches RatioThink.app with the same `PIE_HOME`, selects the
+- XCUITest terminates/relaunches Rational.app with the same `PIE_HOME`, selects the
   persisted chat, and sends turn 3:
   `Repeat the code word again.`,
 - request log entry 3 contains the ordered persisted history:
@@ -368,6 +370,6 @@ xcodebuild -project RatioThink.xcodeproj \
 ```
 
 `S258_ComposerSendGUITests` is the first GUI suite to exercise the full
-`RatioThink.app → create/select chat → ComposerView send → HTTPEngineClient →
+`Rational.app → create/select chat → ComposerView send → HTTPEngineClient →
 real engine stream → MessageStreamWriter → persisted assistant message` path
 end to end.

@@ -1,4 +1,4 @@
-# RatioThink.app dev targets. All Xcode invocations use DEVELOPER_DIR override
+# Rational.app dev targets. All Xcode invocations use DEVELOPER_DIR override
 # because `xcode-select -s` requires sudo. Override XCODE if Xcode lives
 # elsewhere: `make XCODE=/Applications/Xcode-beta.app test-all`.
 XCODE ?= /Applications/Xcode.app
@@ -24,7 +24,7 @@ LOGDIR := test-logs
 $(LOGDIR):
 	@mkdir -p $(LOGDIR)
 
-# GUI suites that need a real /tmp PIE_HOME (so the non-sandboxed RatioThink.app
+# GUI suites that need a real /tmp PIE_HOME (so the non-sandboxed Rational.app
 # can write its on-disk store) cannot clean up after themselves: the
 # RatioThinkGUITests-Runner is app-sandboxed (`com.apple.security.app-sandbox`)
 # and its `tearDown` `removeItem` on /private/tmp is silently denied, so each
@@ -32,7 +32,7 @@ $(LOGDIR):
 # recipes below, which run in a non-sandboxed shell after xcodebuild exits
 # (every test app already dead). Add a suite's prefix here if it stages a real
 # /tmp home. See TEST.md "GUI temp-home cleanup".
-GUI_TMP_HOMES := /tmp/pie-s285-* /tmp/pie-s286gate-*
+GUI_TMP_HOMES := /tmp/pie-s285-* /tmp/pie-s286gate-* /tmp/pie-s326dl-* /tmp/pie-s326done-*
 
 # Canned recipe: run a focused set of RatioThinkGUITests suites via xcodebuild
 # with the seated-session warning + the standard log-capture/PIPESTATUS guard
@@ -60,11 +60,11 @@ endef
 
 .PHONY: help genproject build build-tests clean lint \
         verify-app-icon-assets test-app-icon-assets test-dmg-layout test-collect-diagnostics \
-        test-xcode-chat-scaffold test-app-unit \
-        test-unit test-scenario test-smoke test-curated-hf test-install-guards test-e2e-http \
+        test-xcode-chat-scaffold test-app-unit test-xcode-helper \
+        test-unit test-scenario test-smoke test-curated-hf test-install-guards test-readme-harness test-e2e-http \
         test-gui-script test-gui-history test-gui-first-launch-package test-gui test-ssh test-all \
         test-gui-shell test-gui-first-launch test-gui-helper test-gui-chat \
-        test-e2e-engine test-e2e-large-model test-e2e-models test-e2e-load test-e2e-chat test-e2e-full test-helper-respawn \
+        test-e2e-engine test-e2e-large-model test-e2e-models test-e2e-load test-e2e-chat test-e2e-tot test-e2e-full test-helper-respawn test-quit-structured \
         engine-build engine-clean engine-bundle dmg-arm64 dmg-x86_64 \
         release-dmg-arm64 release-dmg-x86_64 release-preflight test-release \
         build-inferlets stamp-inferlets verify-inferlets verify-inferlets-inputs \
@@ -76,7 +76,7 @@ help: ## Show available targets
 genproject: ## Regenerate RatioThink.xcodeproj from project.yml
 	Scripts/genproject.sh
 
-build: genproject ## xcodebuild Debug build of RatioThink app + helper
+build: genproject ## xcodebuild Debug build of Rational app + helper
 	xcodebuild -project RatioThink.xcodeproj -scheme RatioThink \
 	  -destination 'platform=macOS,arch=arm64' \
 	  -configuration Debug ENABLE_CODE_COVERAGE=NO build
@@ -89,6 +89,9 @@ build-tests: genproject ## Compile every xcodebuild target + the SPM probe (revi
 	  -destination 'platform=macOS,arch=arm64' \
 	  -configuration Debug ENABLE_CODE_COVERAGE=NO build-for-testing
 	xcodebuild -project RatioThink.xcodeproj -scheme RatioThinkGUITests \
+	  -destination 'platform=macOS,arch=arm64' \
+	  -configuration Debug ENABLE_CODE_COVERAGE=NO build-for-testing
+	xcodebuild -project RatioThink.xcodeproj -scheme RatioThinkHelperTests \
 	  -destination 'platform=macOS,arch=arm64' \
 	  -configuration Debug ENABLE_CODE_COVERAGE=NO build-for-testing
 	@# pie-resolve-probe is an SPM executable target — xcodebuild
@@ -143,6 +146,27 @@ test-app-unit: genproject $(LOGDIR) ## App-tier unit bundle (xcodebuild RatioThi
 	    exit 1; \
 	  fi
 
+test-xcode-helper: genproject $(LOGDIR) ## Run Helper-executable unit tests (#440 deep-link delivery) with zero-test guard
+	@set +e +o pipefail; \
+	  LOG=$(LOGDIR)/test-$$(date +%Y%m%d-%H%M%S)-xcode-helper.log; \
+	  xcodebuild -project RatioThink.xcodeproj -scheme RatioThinkHelperTests \
+	    -destination 'platform=macOS,arch=arm64' \
+	    -configuration Debug \
+	    -parallel-testing-enabled NO \
+	    ENABLE_CODE_COVERAGE=NO \
+	    test 2>&1 | tee $$LOG | tail -40; \
+	  status=$${PIPESTATUS[0]}; \
+	  echo "log: $$LOG"; \
+	  if [ "$$status" -ne 0 ]; then exit "$$status"; fi; \
+	  if ! grep -Eq "Test Suite 'RatioThinkHelperTests.xctest' passed" $$LOG; then \
+	    echo "FAIL: RatioThinkHelperTests did not execute (host may have booted instead of skipping)"; \
+	    exit 1; \
+	  fi; \
+	  if ! grep -Eq 'Executed [1-9][0-9]* tests, with 0 failures' $$LOG; then \
+	    echo "FAIL: expected XCTest executed-test summary for RatioThinkHelperTests"; \
+	    exit 1; \
+	  fi
+
 engine-build: ## Build pie engine binary (host arch, no triple) — used by test-smoke
 	cd Vendor/pie && PIE_PORTABLE_METAL=1 cargo build -p pie-server --release
 
@@ -169,16 +193,16 @@ export SIGN_IDENTITY DEVELOPMENT_TEAM
 
 dmg-arm64: ARCH := arm64
 dmg-x86_64: ARCH := x86_64
-dmg-arm64 dmg-x86_64: genproject ## Build RatioThink-<arch>.dmg (release; SIGN_IDENTITY/DEVELOPMENT_TEAM team-signs, else auto-detect Apple Development, else ad-hoc)
+dmg-arm64 dmg-x86_64: genproject ## Build Rational-<arch>.dmg (release; SIGN_IDENTITY/DEVELOPMENT_TEAM team-signs, else auto-detect Apple Development, else ad-hoc)
 	Scripts/package-dmg.sh --arch $(ARCH)
 
 release-dmg-arm64: ARCH := arm64
 release-dmg-x86_64: ARCH := x86_64
-release-dmg-arm64 release-dmg-x86_64: genproject ## Signed+notarized+stapled RatioThink-<arch>.dmg (needs Developer ID + notarytool creds; see Scripts/notarize.sh)
+release-dmg-arm64 release-dmg-x86_64: genproject ## Signed+notarized+stapled Rational-<arch>.dmg (needs Developer ID + notarytool creds; see Scripts/notarize.sh)
 	Scripts/package-dmg.sh --arch $(ARCH) --notarize
 
 release-preflight: ## Assess a built artifact for Gatekeeper readiness (ARTIFACT=path/to/.app|.dmg)
-	@test -n "$(ARTIFACT)" || { echo "usage: make release-preflight ARTIFACT=build/dmg/RatioThink-arm64.dmg" >&2; exit 64; }
+	@test -n "$(ARTIFACT)" || { echo "usage: make release-preflight ARTIFACT=build/dmg/Rational-arm64.dmg" >&2; exit 64; }
 	Scripts/release-preflight.sh "$(ARTIFACT)"
 
 test-release: ## Real-tool contract tests for the notarize + preflight scripts (CI-safe)
@@ -262,6 +286,9 @@ test-curated-hf: $(LOGDIR) ## Live-HF existence audit of the curated catalog (PI
 test-install-guards: ## Install-time launchd-safety regression guards (stubbed, deterministic — runs anywhere)
 	Scripts/test-proc-acceptance.sh
 	Scripts/test-source-closed.sh
+
+test-readme-harness: ## README screenshot harness canned copy branding guard
+	Scripts/test-readme-screenshot-harness.sh
 
 test-e2e-http: $(LOGDIR) ## HTTP API stress + tool-call contract E2E (dummy driver; self-bootstraps pie+wasm; needs uv + Qwen3-0.6B config/tokenizer in HF cache)
 	@set +e +o pipefail; \
@@ -350,8 +377,8 @@ render-menubar-icon: ## Render the #424 branded menu-bar icon (4 states x light/
 	@/tmp/render-menubar-icon
 	@open /tmp/menubar-icon-preview.png 2>/dev/null || true
 
-test-gui-chat: genproject $(LOGDIR) ## GUI area: engine-free chat surfaces — model menu, recovery, zero-state, send-gate (S260/S279/S285/S286)
-	$(call gui_suite_run,chat,-only-testing:RatioThinkGUITests/S260_ChatModelMenuGUITests -only-testing:RatioThinkGUITests/S279_LifecycleRecoveryGUITests -only-testing:RatioThinkGUITests/S285_ZeroStateGUITests -only-testing:RatioThinkGUITests/S286_NoModelSendGateGUITests)
+test-gui-chat: genproject $(LOGDIR) ## GUI area: engine-free chat surfaces — model menu, recovery, zero-state, send-gate, composer auto-grow (S260/S279/S285/S286/S446)
+	$(call gui_suite_run,chat,-only-testing:RatioThinkGUITests/S260_ChatModelMenuGUITests -only-testing:RatioThinkGUITests/S279_LifecycleRecoveryGUITests -only-testing:RatioThinkGUITests/S285_ZeroStateGUITests -only-testing:RatioThinkGUITests/S286_NoModelSendGateGUITests -only-testing:RatioThinkGUITests/S446_ComposerAutoGrowGUITests)
 
 # --- E2E wrappers by product area ------------------------------------------
 # Operator-gated (seated session + TCC; real engine/model or deterministic
@@ -378,14 +405,20 @@ test-e2e-396: ## E2E area: #396 failed-load Retry recovery + Dismiss-clears (S39
 test-e2e-chat: ## E2E area: real small-model chat send streams + persists (S258, real Qwen3-0.6B)
 	Scripts/run-chat-gui-e2e.sh
 
+test-e2e-tot: ## E2E area: real-engine tree-of-thought APP path completes (#413 stall guard; depth>1, real Qwen3-0.6B-GGUF)
+	Scripts/run-tot-e2e.sh
+
 test-e2e-full: ## E2E area: 3-layer real-model proof — GUI download → engine boot → chat persist (S204)
 	Scripts/run-full-e2e.sh
 
 test-helper-respawn: ## Acceptance: live launchd Helper auto-respawn (needs signed/registered install)
 	Scripts/verify-helper-respawn.sh
 
-test-helper-recovery: ## Acceptance: App-side runtime helper recovery #412 (needs signed install + RatioThink.app running)
+test-helper-recovery: ## Acceptance: App-side runtime helper recovery #412 (needs signed install + Rational.app running)
 	Scripts/verify-helper-recovery.sh
+
+test-quit-structured: ## Acceptance: #448 structured quit — idle engine persists + ratiothink://quit leaves nothing (needs signed install + engine running)
+	Scripts/verify-structured-quit.sh
 
 test-ssh: test-unit test-scenario test-smoke test-install-guards ## Everything runnable under SSH (no GUI; SPM-only, no xcodebuild app build)
 

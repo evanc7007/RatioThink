@@ -12,6 +12,9 @@ struct ProfileEditor: View {
   /// hands back a refreshed `entry`. .
   var onModelChanged: () -> Void = {}
   @EnvironmentObject private var profileStore: ProfileStore
+  @EnvironmentObject private var downloads: ModelDownloadController
+  @EnvironmentObject private var settingsNavigation: SettingsNavigation
+  @EnvironmentObject private var engineStatusStore: EngineStatusStore
   @State private var showAdvanced: Bool = false
   /// Discovered model options (app-managed + HF cache), each carrying
   /// size + over-limit / unsupported state for the model-size guardrail.
@@ -50,6 +53,9 @@ struct ProfileEditor: View {
     }
     .accessibilityIdentifier("ProfileEditor")
     .task { await refreshModelOptions(current: entry.profile?.model ?? "") }
+    .onChange(of: downloads.completionTick) { _, _ in
+      Task { await refreshModelOptions(current: entry.profile?.model ?? "") }
+    }
   }
 
   // MARK: - Sections
@@ -114,16 +120,25 @@ struct ProfileEditor: View {
         // Block selecting an unloadable model — over-limit (too large for
         // this host) or unsupported (a split GGUF the engine can't load)
         // — but never the current value, which stays a no-op.
+        .help(option.slug)
+        .accessibilityValue(option.slug)
         .disabled((option.isOverLimit || option.unsupportedReason != nil) && !option.isCurrent)
       }
-    } label: {
-      HStack(spacing: 4) {
-        Text(ModelDisplayName.leaf(profile.model)).monospaced()
-        Image(systemName: "chevron.up.chevron.down").font(.caption)
+      Divider()
+      Button {
+        settingsNavigation.open(.models)
+      } label: {
+        Label("Manage Models…", systemImage: "gearshape")
       }
+      .help("Open Settings → Models")
+      .accessibilityIdentifier("ProfileEditorModelPickerManageModels")
+    } label: {
+      ProfileModelPickerLabel(modelID: profile.model)
     }
     .menuStyle(.borderlessButton)
     .fixedSize()
+    .help(profile.model ?? "")
+    .accessibilityValue(profile.model ?? "")
     .accessibilityIdentifier("ProfileEditorModelPicker")
   }
 
@@ -251,8 +266,26 @@ struct ProfileEditor: View {
       try profileStore.setModel(model, forProfileID: profileID)
       modelWriteError = nil
       onModelChanged()
+      Task { await refreshModelOptions(current: model) }
+      restartActiveEngineIfNeeded(profileID: profileID)
     } catch {
       modelWriteError = "Could not set default model: \(error)"
+    }
+  }
+
+  /// If the edited profile is the active engine target, rebuild the
+  /// helper engine after the default-model write so pie's boot-time
+  /// model registry contains the newly selected model. Without this,
+  /// `/v1/models/load` keeps rejecting the fresh slug as
+  /// `model_not_found` until the user restarts the whole product.
+  private func restartActiveEngineIfNeeded(profileID: String) {
+    guard profileStore.activeProfileID == profileID else { return }
+    Task { @MainActor in
+      do {
+        try await engineStatusStore.restartEngine(profileID: profileID)
+      } catch {
+        modelWriteError = "Default saved, but couldn’t reload the engine: \(error)"
+      }
     }
   }
 
@@ -284,5 +317,57 @@ struct ProfileEditor: View {
       if let v = args[k] { table[k] = v }
     }
     return table.convert()
+  }
+}
+
+/// Bounded selected-model label for the Profile editor's model `Menu`.
+///
+/// Long Hugging Face ids are useful to inspect, but they must not become the
+/// row's ideal width: `SettingsLabeledRow` has neighboring fixed-width labels,
+/// so an unbounded/fixed-size menu label pushes the whole Profile pane wider.
+/// Keep the label flexible, cap its ideal size, and let SwiftUI middle-truncate
+/// inside that cap while exposing the unmodified id through help + a11y.
+struct ProfileModelPickerLabel: View {
+  static let maxLayoutWidth: CGFloat = 360
+
+  let modelID: String?
+
+  var body: some View {
+    HStack(spacing: 4) {
+      Text(displayName)
+        .monospaced()
+        .foregroundStyle(modelID == nil ? .secondary : .primary)
+        .lineLimit(1)
+        .truncationMode(.middle)
+        .frame(maxWidth: .infinity, alignment: .leading)
+
+      Image(systemName: "chevron.up.chevron.down")
+        .font(.caption)
+        .accessibilityHidden(true)
+    }
+    .frame(idealWidth: Self.maxLayoutWidth,
+           maxWidth: Self.maxLayoutWidth,
+           alignment: .leading)
+    .help(helpText)
+    .accessibilityElement(children: .ignore)
+    .accessibilityLabel(Self.accessibilityText(for: displayName))
+    .accessibilityHint(helpText)
+    .accessibilityValue(helpText)
+  }
+
+  private var displayName: String {
+    Self.displayText(for: modelID)
+  }
+
+  private var helpText: String {
+    modelID ?? displayName
+  }
+
+  static func displayText(for modelID: String?) -> String {
+    modelID.map(ModelDisplayName.leaf) ?? "No default model"
+  }
+
+  static func accessibilityText(for displayName: String) -> String {
+    "Default model: \(displayName)"
   }
 }
