@@ -53,10 +53,10 @@ public enum S3_EngineSubprocess {
     do {
       try await runSteps(r, port: port, session: session)
       try await r.step("session shutdown clean") {
-        await session.shutdown()
+        _ = await session.shutdown()
       }
     } catch {
-      await session.shutdown()
+      _ = await session.shutdown()
       throw error
     }
   }

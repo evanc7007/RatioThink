@@ -11,10 +11,11 @@ import os
 ///      mach service, so a poll landing after the Helper exits would respawn
 ///      it; stopping the loop first closes that race.
 ///   2. Ask the Helper to stop + reap the engine and terminate itself
-///      (`quitHelper`). Best-effort and bounded by the client's own reply
-///      timeout — a wedged or absent Helper never blocks quit.
-///   3. Signal the caller (the AppDelegate) that it is safe to terminate the
-///      App.
+///      (`quitHelper`).
+///   3. Signal the caller (the AppDelegate) whether it is safe to terminate
+///      the App. Explicit stop/reap timeout blocks normal quit; transport
+///      failures remain best-effort because the Helper may have exited while
+///      flushing the reply.
 ///
 /// Lives in RatioThinkCore (no AppKit) so the sequencing is unit-testable; the
 /// AppDelegate supplies the `done` closure that calls
@@ -30,7 +31,7 @@ public final class AppQuitCoordinator {
   private let isTestLaunch: Bool
   public private(set) var isQuitting = false
   private var teardownComplete = false
-  private var pendingDoneCallbacks: [@MainActor () -> Void] = []
+  private var pendingDoneCallbacks: [@MainActor (Bool) -> Void] = []
   private nonisolated static let log = Logger(subsystem: "com.ratiothink.app", category: "quit")
 
   public init(
@@ -41,13 +42,23 @@ public final class AppQuitCoordinator {
     self.isTestLaunch = isTestLaunch
   }
 
-  /// Begin the coordinated teardown. `done` is invoked exactly once, on the
-  /// main actor, when the App may terminate. Repeated calls while teardown is
-  /// in flight join the original helper quit and are released only when that
-  /// first teardown completes; calls after completion return immediately.
+  /// Backwards-compatible convenience for tests/callers that only care about
+  /// the successful termination path.
   public func beginTeardown(done: @escaping @MainActor () -> Void) {
+    beginTeardown { shouldTerminate in
+      if shouldTerminate { done() }
+    }
+  }
+
+  /// Begin the coordinated teardown. `done` is invoked exactly once, on the
+  /// main actor, with `true` when the App may terminate and `false` when the
+  /// normal quit must be cancelled because the engine was not confirmed reaped.
+  /// Repeated calls while teardown is in flight join the original helper quit
+  /// and are released only when that first teardown completes; calls after
+  /// completion return immediately with `true`.
+  public func beginTeardown(done: @escaping @MainActor (Bool) -> Void) {
     if teardownComplete {
-      done()
+      done(true)
       return
     }
     pendingDoneCallbacks.append(done)
@@ -64,31 +75,54 @@ public final class AppQuitCoordinator {
     // GUI teardown on a (possibly absent) helper — stop polling and return.
     if isTestLaunch {
       Diag.app.event("app.quit", [("phase", "test_skip_helper")])
-      finishTeardown()
+      finishTeardown(shouldTerminate: true)
       return
     }
 
     Task { @MainActor in
+      var shouldTerminate = true
       do {
         try await helperClient.quitHelper()
         Diag.app.event("app.quit", [("phase", "helper_quit_ok")])
       } catch {
-        // Best-effort: a refusal, a transport error, or the helper exiting
-        // before its reply flushes all mean the same thing — proceed to
-        // terminate the App.
-        Self.log.notice("quitHelper failed (proceeding to terminate): \(String(describing: error), privacy: .public)")
-        Diag.app.event("app.quit", [("phase", "helper_quit_err")])
+        if Self.blocksNormalTermination(error) {
+          shouldTerminate = false
+          Self.log.error("quitHelper did not confirm engine reap; cancelling App quit: \(String(describing: error), privacy: .public)")
+          Diag.app.event("app.quit", [("phase", "helper_quit_blocked")])
+        } else {
+          // Best-effort: a transport error may be the Helper exiting before
+          // its clean quit reply flushes. Proceed rather than trapping the
+          // user in a false-negative quit failure.
+          Self.log.notice("quitHelper failed (proceeding to terminate): \(String(describing: error), privacy: .public)")
+          Diag.app.event("app.quit", [("phase", "helper_quit_err")])
+        }
       }
       Diag.app.event("app.quit", [("phase", "done")])
-      finishTeardown()
+      finishTeardown(shouldTerminate: shouldTerminate)
     }
   }
 
-  private func finishTeardown() {
-    guard !teardownComplete else { return }
-    teardownComplete = true
+  private static func blocksNormalTermination(_ error: Error) -> Bool {
+    if error is EngineError {
+      return true
+    }
+    if let clientError = error as? AppXPCClientError,
+       case .replyTimeout(selector: "quitHelper", timeout: _) = clientError {
+      return true
+    }
+    return false
+  }
+
+  private func finishTeardown(shouldTerminate: Bool) {
+    if shouldTerminate {
+      guard !teardownComplete else { return }
+      teardownComplete = true
+    } else {
+      isQuitting = false
+      engineStatusStore?.start()
+    }
     let callbacks = pendingDoneCallbacks
     pendingDoneCallbacks.removeAll()
-    callbacks.forEach { $0() }
+    callbacks.forEach { $0(shouldTerminate) }
   }
 }

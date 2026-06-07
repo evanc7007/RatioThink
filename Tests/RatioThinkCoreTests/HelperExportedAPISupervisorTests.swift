@@ -26,11 +26,12 @@ final class HelperExportedAPISupervisorTests: XCTestCase {
       self.delay = shutdownDelay
     }
     var shutdownCount: Int { count.withLock { $0 } }
-    func shutdown() async {
+    func shutdown() async -> EngineShutdownResult {
       count.withLock { $0 += 1 }
       if delay > 0 {
         try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
       }
+      return .reaped
     }
   }
 
@@ -539,10 +540,11 @@ final class HelperExportedAPISupervisorTests: XCTestCase {
     // stopEngine's observer never sees `.stopped`. The fallback
     // deadline (0.3s) wins and the observer-detach path runs.
     final class HangSession: PieEngineHost.EngineSession, @unchecked Sendable {
-      func shutdown() async {
+      func shutdown() async -> EngineShutdownResult {
         while !Task.isCancelled {
           try? await Task.sleep(nanoseconds: 100_000_000)
         }
+        return .unreaped("test hang")
       }
     }
     let host = PieEngineHost(launcher: { _ in

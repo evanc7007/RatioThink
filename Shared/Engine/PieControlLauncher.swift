@@ -55,6 +55,7 @@ public enum PieControlLauncher {
     case configWriteFailed(path: String, underlying: String)
     case portFileWriteFailed(path: String, underlying: String)
     case clientError(underlying: String)
+    case shutdownFailed(underlying: String, shutdownFailure: String)
     case driverUnsupported(requested: String, binary: String, details: String)
     /// `PIE_HOME` is so deep that the engine's aux Unix-domain control
     /// socket path would overrun the OS `sun_path` limit. Thrown by the
@@ -75,6 +76,8 @@ public enum PieControlLauncher {
       case let .configWriteFailed(path, u): return "PieControlLauncher: cannot write config at \(path): \(u)"
       case let .portFileWriteFailed(path, u): return "PieControlLauncher: cannot write http.port at \(path): \(u)"
       case let .clientError(u): return "PieControlLauncher: WS client error: \(u)"
+      case let .shutdownFailed(underlying, shutdownFailure):
+        return "PieControlLauncher: cleanup after \(underlying) failed to reap pie: \(shutdownFailure)"
       case let .driverUnsupported(requested, binary, details):
         return "PieControlLauncher: driver unsupported: \(requested) by \(binary): \(details)"
       case let .pieHomePathTooLong(pieHome, length, limit):
@@ -546,7 +549,13 @@ public enum PieControlLauncher {
     do {
       handshake = try await session.awaitHandshake(timeout: spec.handshakeTimeout)
     } catch {
-      await session.shutdown(reason: "launch.handshake_failed")
+      let shutdownResult = await session.shutdown(reason: "launch.handshake_failed")
+      if !shutdownResult.reaped {
+        throw LaunchError.shutdownFailed(
+          underlying: "\(error)",
+          shutdownFailure: shutdownResult.message
+        )
+      }
       throw error
     }
 
@@ -567,14 +576,26 @@ public enum PieControlLauncher {
       await client.close()
     } catch {
       await client.close()
-      await session.shutdown(reason: "launch.client_error")
+      let shutdownResult = await session.shutdown(reason: "launch.client_error")
+      if !shutdownResult.reaped {
+        throw LaunchError.shutdownFailed(
+          underlying: "\(error)",
+          shutdownFailure: shutdownResult.message
+        )
+      }
       throw LaunchError.clientError(underlying: "\(error)")
     }
 
     do {
       try writePortFile(port: httpPort, in: spec.pieHome)
     } catch {
-      await session.shutdown(reason: "launch.port_file_failed")
+      let shutdownResult = await session.shutdown(reason: "launch.port_file_failed")
+      if !shutdownResult.reaped {
+        throw LaunchError.shutdownFailed(
+          underlying: "\(error)",
+          shutdownFailure: shutdownResult.message
+        )
+      }
       throw error
     }
 
@@ -828,7 +849,7 @@ public enum PieControlLauncher {
 
 /// Owns the spawned `pie serve` subprocess + its pipes. Idempotent
 /// shutdown is implemented in one place so the launcher's error
-/// paths and the caller's `defer { await session.shutdown() }` both
+/// paths and the caller's `defer { _ = await session.shutdown() }` both
 /// converge here.
 public actor LaunchedSession {
 
@@ -965,17 +986,22 @@ public actor LaunchedSession {
 
   /// Idempotent: SIGINT → wait(10s) → SIGKILL → wait(5s) → shm_unlink.
   /// Mirrors Python `_terminate_subprocess` + `_shm_unlink_quiet`.
-  /// Any error inside is logged to stderr but never re-thrown — the
-  /// caller already failed; making cleanup throwable would just
-  /// mask the original error.
-  public func shutdown() async {
+  /// Signal/wait failures are still logged, but they are also returned so the
+  /// caller can avoid publishing `.stopped` unless the subprocess was actually
+  /// reaped.
+  public func shutdown() async -> EngineShutdownResult {
     await shutdown(reason: "unspecified")
   }
 
-  public func shutdown(reason: String) async {
-    guard !shutdownDone else { return }
+  public func shutdown(reason: String) async -> EngineShutdownResult {
+    guard !shutdownDone else {
+      return process.isRunning
+        ? .unreaped("shutdown was already requested but pid \(process.processIdentifier) is still running")
+        : .reaped
+    }
     shutdownDone = true
 
+    var failures: [String] = []
     let pid = process.processIdentifier
     let wasRunning = process.isRunning
     DiagnosticLog.helper.event("engine.shutdown", [
@@ -990,19 +1016,27 @@ public actor LaunchedSession {
         ("pid", String(pid)),
         ("signal", "SIGINT"),
       ])
-      sendSignalQuiet(SIGINT, label: "SIGINT")
+      if let failure = sendSignalQuiet(SIGINT, label: "SIGINT") {
+        failures.append(failure)
+      }
       let exited = await waitForExit(timeout: 10)
       if !exited {
-        diagnose("SIGINT timed out after 10s; escalating to SIGKILL")
+        let failure = "SIGINT timed out after 10s; escalating to SIGKILL"
+        failures.append(failure)
+        diagnose(failure)
         DiagnosticLog.helper.event("engine.signal", [
           ("reason", reason),
           ("pid", String(pid)),
           ("signal", "SIGKILL"),
         ])
-        sendSignalQuiet(SIGKILL, label: "SIGKILL")
+        if let killFailure = sendSignalQuiet(SIGKILL, label: "SIGKILL") {
+          failures.append(killFailure)
+        }
         let killed = await waitForExit(timeout: 5)
         if !killed {
-          diagnose("SIGKILL + 5s waitpid window did not reap pid \(process.processIdentifier); leaking to process exit")
+          let failure = "SIGKILL + 5s waitpid window did not reap pid \(process.processIdentifier); leaking to process exit"
+          failures.append(failure)
+          diagnose(failure)
         }
       }
     }
@@ -1029,6 +1063,11 @@ public actor LaunchedSession {
     try? stdout.fileHandleForReading.close()
 
     shmUnlinkQuiet(shmemName)
+
+    guard !process.isRunning else {
+      return .unreaped(failures.joined(separator: "; "))
+    }
+    return .reaped
   }
 
   /// Reads stdout until both handshake markers appear or the
@@ -1220,16 +1259,19 @@ public actor LaunchedSession {
     return String(line[r])
   }
 
-  private func sendSignalQuiet(_ sig: Int32, label: String) {
+  private func sendSignalQuiet(_ sig: Int32, label: String) -> String? {
     let rc = kill(process.processIdentifier, sig)
     if rc != 0 {
       let e = errno
       if e == ESRCH {
         diagnose("\(label) raced ESRCH; subprocess already exited")
       } else {
-        diagnose("\(label) failed errno=\(e)")
+        let failure = "\(label) failed errno=\(e)"
+        diagnose(failure)
+        return failure
       }
     }
+    return nil
   }
 
   private func waitForExit(timeout: TimeInterval) async -> Bool {
