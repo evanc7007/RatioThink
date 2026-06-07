@@ -1,4 +1,4 @@
-# RatioThink.app dev targets. All Xcode invocations use DEVELOPER_DIR override
+# Rational.app dev targets. All Xcode invocations use DEVELOPER_DIR override
 # because `xcode-select -s` requires sudo. Override XCODE if Xcode lives
 # elsewhere: `make XCODE=/Applications/Xcode-beta.app test-all`.
 XCODE ?= /Applications/Xcode.app
@@ -24,7 +24,7 @@ LOGDIR := test-logs
 $(LOGDIR):
 	@mkdir -p $(LOGDIR)
 
-# GUI suites that need a real /tmp PIE_HOME (so the non-sandboxed RatioThink.app
+# GUI suites that need a real /tmp PIE_HOME (so the non-sandboxed Rational.app
 # can write its on-disk store) cannot clean up after themselves: the
 # RatioThinkGUITests-Runner is app-sandboxed (`com.apple.security.app-sandbox`)
 # and its `tearDown` `removeItem` on /private/tmp is silently denied, so each
@@ -61,10 +61,10 @@ endef
 .PHONY: help genproject build build-tests clean lint \
         verify-app-icon-assets test-app-icon-assets test-dmg-layout test-collect-diagnostics \
         test-xcode-chat-scaffold test-app-unit test-xcode-helper \
-        test-unit test-scenario test-smoke test-curated-hf test-install-guards test-e2e-http \
+        test-unit test-scenario test-smoke test-curated-hf test-install-guards test-readme-harness test-e2e-http \
         test-gui-script test-gui-history test-gui-first-launch-package test-gui test-ssh test-all \
         test-gui-shell test-gui-first-launch test-gui-helper test-gui-chat \
-        test-e2e-engine test-e2e-models test-e2e-load test-e2e-chat test-e2e-tot test-e2e-full test-helper-respawn \
+        test-e2e-engine test-e2e-models test-e2e-load test-e2e-chat test-e2e-tot test-e2e-full test-helper-respawn test-quit-structured \
         engine-build engine-clean engine-bundle dmg-arm64 dmg-x86_64 \
         release-dmg-arm64 release-dmg-x86_64 release-preflight test-release \
         build-inferlets stamp-inferlets verify-inferlets verify-inferlets-inputs \
@@ -76,7 +76,7 @@ help: ## Show available targets
 genproject: ## Regenerate RatioThink.xcodeproj from project.yml
 	Scripts/genproject.sh
 
-build: genproject ## xcodebuild Debug build of RatioThink app + helper
+build: genproject ## xcodebuild Debug build of Rational app + helper
 	xcodebuild -project RatioThink.xcodeproj -scheme RatioThink \
 	  -destination 'platform=macOS,arch=arm64' \
 	  -configuration Debug ENABLE_CODE_COVERAGE=NO build
@@ -193,16 +193,16 @@ export SIGN_IDENTITY DEVELOPMENT_TEAM
 
 dmg-arm64: ARCH := arm64
 dmg-x86_64: ARCH := x86_64
-dmg-arm64 dmg-x86_64: genproject ## Build RatioThink-<arch>.dmg (release; SIGN_IDENTITY/DEVELOPMENT_TEAM team-signs, else auto-detect Apple Development, else ad-hoc)
+dmg-arm64 dmg-x86_64: genproject ## Build Rational-<arch>.dmg (release; SIGN_IDENTITY/DEVELOPMENT_TEAM team-signs, else auto-detect Apple Development, else ad-hoc)
 	Scripts/package-dmg.sh --arch $(ARCH)
 
 release-dmg-arm64: ARCH := arm64
 release-dmg-x86_64: ARCH := x86_64
-release-dmg-arm64 release-dmg-x86_64: genproject ## Signed+notarized+stapled RatioThink-<arch>.dmg (needs Developer ID + notarytool creds; see Scripts/notarize.sh)
+release-dmg-arm64 release-dmg-x86_64: genproject ## Signed+notarized+stapled Rational-<arch>.dmg (needs Developer ID + notarytool creds; see Scripts/notarize.sh)
 	Scripts/package-dmg.sh --arch $(ARCH) --notarize
 
 release-preflight: ## Assess a built artifact for Gatekeeper readiness (ARTIFACT=path/to/.app|.dmg)
-	@test -n "$(ARTIFACT)" || { echo "usage: make release-preflight ARTIFACT=build/dmg/RatioThink-arm64.dmg" >&2; exit 64; }
+	@test -n "$(ARTIFACT)" || { echo "usage: make release-preflight ARTIFACT=build/dmg/Rational-arm64.dmg" >&2; exit 64; }
 	Scripts/release-preflight.sh "$(ARTIFACT)"
 
 test-release: ## Real-tool contract tests for the notarize + preflight scripts (CI-safe)
@@ -286,6 +286,9 @@ test-curated-hf: $(LOGDIR) ## Live-HF existence audit of the curated catalog (PI
 test-install-guards: ## Install-time launchd-safety regression guards (stubbed, deterministic — runs anywhere)
 	Scripts/test-proc-acceptance.sh
 	Scripts/test-source-closed.sh
+
+test-readme-harness: ## README screenshot harness canned copy branding guard
+	Scripts/test-readme-screenshot-harness.sh
 
 test-e2e-http: $(LOGDIR) ## HTTP API stress + tool-call contract E2E (dummy driver; self-bootstraps pie+wasm; needs uv + Qwen3-0.6B config/tokenizer in HF cache)
 	@set +e +o pipefail; \
@@ -407,7 +410,7 @@ test-e2e-full: ## E2E area: 3-layer real-model proof — GUI download → engine
 test-helper-respawn: ## Acceptance: live launchd Helper auto-respawn (needs signed/registered install)
 	Scripts/verify-helper-respawn.sh
 
-test-helper-recovery: ## Acceptance: App-side runtime helper recovery #412 (needs signed install + RatioThink.app running)
+test-helper-recovery: ## Acceptance: App-side runtime helper recovery #412 (needs signed install + Rational.app running)
 	Scripts/verify-helper-recovery.sh
 
 test-quit-structured: ## Acceptance: #448 structured quit — idle engine persists + ratiothink://quit leaves nothing (needs signed install + engine running)
