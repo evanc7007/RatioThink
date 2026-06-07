@@ -12,12 +12,30 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 DEFAULT_REPO="Qwen/Qwen3-14B-GGUF"
 DEFAULT_FILE="Qwen3-14B-Q4_K_M.gguf"
-DEFAULT_MIN_BYTES="9001752960"
 export PIE_TEST_E2E_REPO="${PIE_TEST_E2E_REPO:-$DEFAULT_REPO}"
 export PIE_TEST_E2E_FILE="${PIE_TEST_E2E_FILE:-$DEFAULT_FILE}"
+
+min_bytes_for_large_model() {
+  case "$1/$2" in
+    "Qwen/Qwen3-14B-GGUF/Qwen3-14B-Q4_K_M.gguf")
+      printf '%s\n' "9001752960"
+      ;;
+    "bartowski/Qwen2.5-Coder-14B-Instruct-GGUF/Qwen2.5-Coder-14B-Instruct-Q4_K_M.gguf")
+      printf '%s\n' "8988111072"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
 if [ -z "${PIE_TEST_E2E_MIN_BYTES:-}" ]; then
-  if [ "$PIE_TEST_E2E_REPO" = "$DEFAULT_REPO" ] && [ "$PIE_TEST_E2E_FILE" = "$DEFAULT_FILE" ]; then
-    export PIE_TEST_E2E_MIN_BYTES="$DEFAULT_MIN_BYTES"
+  if min_bytes="$(min_bytes_for_large_model "$PIE_TEST_E2E_REPO" "$PIE_TEST_E2E_FILE")"; then
+    export PIE_TEST_E2E_MIN_BYTES="$min_bytes"
+  else
+    echo "large-e2e: PIE_TEST_E2E_MIN_BYTES is required for large-model overrides." >&2
+    echo "large-e2e: unknown model = $PIE_TEST_E2E_REPO/$PIE_TEST_E2E_FILE" >&2
+    exit 2
   fi
 fi
 
