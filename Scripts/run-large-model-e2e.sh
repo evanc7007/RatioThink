@@ -29,14 +29,22 @@ min_bytes_for_large_model() {
   esac
 }
 
-if [ -z "${PIE_TEST_E2E_MIN_BYTES:-}" ]; then
-  if min_bytes="$(min_bytes_for_large_model "$PIE_TEST_E2E_REPO" "$PIE_TEST_E2E_FILE")"; then
-    export PIE_TEST_E2E_MIN_BYTES="$min_bytes"
-  else
-    echo "large-e2e: PIE_TEST_E2E_MIN_BYTES is required for large-model overrides." >&2
-    echo "large-e2e: unknown model = $PIE_TEST_E2E_REPO/$PIE_TEST_E2E_FILE" >&2
-    exit 2
+if min_bytes="$(min_bytes_for_large_model "$PIE_TEST_E2E_REPO" "$PIE_TEST_E2E_FILE")"; then
+  if [ -n "${PIE_TEST_E2E_MIN_BYTES:-}" ]; then
+    case "$PIE_TEST_E2E_MIN_BYTES" in
+      *[!0-9]*)
+        echo "large-e2e: PIE_TEST_E2E_MIN_BYTES must be numeric: $PIE_TEST_E2E_MIN_BYTES" >&2
+        exit 2
+        ;;
+    esac
   fi
+  if [ -z "${PIE_TEST_E2E_MIN_BYTES:-}" ] || [ "$PIE_TEST_E2E_MIN_BYTES" -lt "$min_bytes" ]; then
+    export PIE_TEST_E2E_MIN_BYTES="$min_bytes"
+  fi
+elif [ -z "${PIE_TEST_E2E_MIN_BYTES:-}" ]; then
+  echo "large-e2e: PIE_TEST_E2E_MIN_BYTES is required for large-model overrides." >&2
+  echo "large-e2e: unknown model = $PIE_TEST_E2E_REPO/$PIE_TEST_E2E_FILE" >&2
+  exit 2
 fi
 
 find_worktree_pie() {
