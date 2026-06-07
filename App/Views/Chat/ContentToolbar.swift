@@ -180,8 +180,9 @@ struct ContentToolbar: View {
         } label: {
           modelOptionLabel(option)
         }
-        .help(option.slug)
-        .accessibilityValue(option.slug)
+        .help(option.unavailableReason.map { "\(option.slug) — \($0)" } ?? option.slug)
+        .accessibilityValue(option.unavailableReason.map { "\(option.slug), \($0)" } ?? option.slug)
+        .disabled(!option.isSelectable)
       }
       if !modelOptions.isEmpty { Divider() }
       Button {
@@ -207,12 +208,20 @@ struct ContentToolbar: View {
 
   @ViewBuilder
   private func modelOptionLabel(_ option: ToolbarModelOptions.Option) -> some View {
-    let text = option.displayName + (option.isProfileDefault ? " (profile default)" : "")
+    let text = modelOptionText(option)
     if option.isCurrent {
       Label(text, systemImage: "checkmark")
+    } else if option.unavailableReason != nil {
+      Label(text, systemImage: "exclamationmark.triangle")
     } else {
       Text(text)
     }
+  }
+
+  private func modelOptionText(_ option: ToolbarModelOptions.Option) -> String {
+    var text = option.displayName + (option.isProfileDefault ? " (profile default)" : "")
+    if let reason = option.unavailableReason { text += " — \(reason)" }
+    return text
   }
 
   private var modelMenuTitle: String {
@@ -249,14 +258,20 @@ struct ContentToolbar: View {
   }
 
   private func selectModel(_ option: ToolbarModelOptions.Option) {
-    if option.isProfileDefault {
-      viewModel.modelOverride = nil
+    switch ToolbarModelOptions.selectionAction(for: option,
+                                               currentModelID: currentModelSummary?.slug) {
+    case .unavailable:
       return
+    case .clearOverride:
+      viewModel.modelOverride = nil
+    case let .requestModel(modelID, overrideAfterConfirmation):
+      swapCoordinator.requestModelOverride(
+        modelID: modelID,
+        activeProfileID: viewModel.selectedProfileID
+      ) { _ in
+        viewModel.modelOverride = overrideAfterConfirmation
+      }
     }
-    swapCoordinator.requestModelOverride(
-      modelID: option.slug,
-      activeProfileID: viewModel.selectedProfileID
-    ) { viewModel.modelOverride = $0 }
   }
 
   private func openModelsSettings() {

@@ -2,22 +2,30 @@ import XCTest
 @testable import RatioThinkCore
 
 final class ToolbarModelOptionsTests: XCTestCase {
-  private func appModel(_ slug: String, sizeBytes: Int64 = 100) -> InstalledModel {
+  private func appModel(_ slug: String,
+                        sizeBytes: Int64 = 100,
+                        isPartial: Bool = false,
+                        unsupportedReason: String? = nil) -> InstalledModel {
     InstalledModel(filename: slug,
                    url: URL(fileURLWithPath: "/models/\(slug)"),
                    sizeBytes: sizeBytes,
                    modifiedAt: Date(timeIntervalSince1970: 0),
-                   isPartial: false,
-                   source: .appManaged)
+                   isPartial: isPartial,
+                   source: .appManaged,
+                   unsupportedReason: unsupportedReason)
   }
 
-  private func hfModel(_ slug: String, sizeBytes: Int64 = 100) -> InstalledModel {
+  private func hfModel(_ slug: String,
+                       sizeBytes: Int64 = 100,
+                       isPartial: Bool = false,
+                       unsupportedReason: String? = nil) -> InstalledModel {
     InstalledModel(filename: slug,
                    url: URL(fileURLWithPath: "/hf/\(slug)"),
                    sizeBytes: sizeBytes,
                    modifiedAt: Date(timeIntervalSince1970: 0),
-                   isPartial: false,
-                   source: .huggingFaceCache)
+                   isPartial: isPartial,
+                   source: .huggingFaceCache,
+                   unsupportedReason: unsupportedReason)
   }
 
   func test_build_lists_app_hf_served_profile_default_and_current_without_duplicates() {
@@ -64,5 +72,70 @@ final class ToolbarModelOptionsTests: XCTestCase {
     XCTAssertEqual(summary?.slug, "override/Chosen.gguf")
     XCTAssertEqual(summary?.displayName, "Chosen.gguf")
     XCTAssertNil(summary?.annotation)
+  }
+
+  func test_profile_default_row_different_from_current_requests_swap_but_commits_nil_override() {
+    let option = ToolbarModelOptions.Option(
+      slug: "profile/Default.gguf",
+      displayName: "Default.gguf",
+      source: nil,
+      isCurrent: false,
+      isProfileDefault: true,
+      unavailableReason: nil)
+
+    let action = ToolbarModelOptions.selectionAction(for: option, currentModelID: "resident/Loaded.gguf")
+
+    XCTAssertEqual(action, .requestModel(modelID: "profile/Default.gguf", overrideAfterConfirmation: nil),
+                   "a concrete default row that differs from the resident model must still request the normal swap/load path, then leave the chat using profile default semantics")
+  }
+
+  func test_profile_default_row_same_as_current_only_clears_override() {
+    let option = ToolbarModelOptions.Option(
+      slug: "profile/Default.gguf",
+      displayName: "Default.gguf",
+      source: nil,
+      isCurrent: true,
+      isProfileDefault: true,
+      unavailableReason: nil)
+
+    XCTAssertEqual(ToolbarModelOptions.selectionAction(for: option, currentModelID: "profile/Default.gguf"),
+                   .clearOverride)
+  }
+
+  func test_partial_and_unsupported_discovered_models_are_disabled_with_reasons() {
+    let options = ToolbarModelOptions.build(
+      discoveredModels: [
+        appModel("partial.gguf", isPartial: true),
+        hfModel("split/Shard.gguf", unsupportedReason: "Split GGUF: unsupported"),
+        appModel("ok.gguf"),
+      ],
+      servedModelIDs: [],
+      profileDefaultModelID: nil,
+      modelOverride: nil,
+      residentModelID: nil)
+
+    let partial = options.first { $0.slug == "partial.gguf" }
+    XCTAssertEqual(partial?.unavailableReason, "Download in progress")
+    XCTAssertFalse(partial?.isSelectable ?? true)
+
+    let unsupported = options.first { $0.slug == "split/Shard.gguf" }
+    XCTAssertEqual(unsupported?.unavailableReason, "Split GGUF: unsupported")
+    XCTAssertFalse(unsupported?.isSelectable ?? true)
+
+    XCTAssertNil(options.first { $0.slug == "ok.gguf" }?.unavailableReason)
+    XCTAssertTrue(options.first { $0.slug == "ok.gguf" }?.isSelectable ?? false)
+  }
+
+  func test_unavailable_option_selection_never_requests_normal_model_load() {
+    let option = ToolbarModelOptions.Option(
+      slug: "partial.gguf",
+      displayName: "partial.gguf",
+      source: .appManaged,
+      isCurrent: false,
+      isProfileDefault: false,
+      unavailableReason: "Download in progress")
+
+    XCTAssertEqual(ToolbarModelOptions.selectionAction(for: option, currentModelID: "resident.gguf"),
+                   .unavailable(reason: "Download in progress"))
   }
 }

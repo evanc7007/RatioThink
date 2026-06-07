@@ -15,20 +15,37 @@ public enum ToolbarModelOptions {
     public let source: CachedModelSource?
     public let isCurrent: Bool
     public let isProfileDefault: Bool
+    /// Non-nil when the row is visible for context but must not be sent
+    /// through the normal model-load path (partial download, split GGUF, etc.).
+    public let unavailableReason: String?
 
     public var id: String { slug }
+    public var isSelectable: Bool { unavailableReason == nil }
 
     public init(slug: String,
                 displayName: String,
                 source: CachedModelSource?,
                 isCurrent: Bool,
-                isProfileDefault: Bool) {
+                isProfileDefault: Bool,
+                unavailableReason: String? = nil) {
       self.slug = slug
       self.displayName = displayName
       self.source = source
       self.isCurrent = isCurrent
       self.isProfileDefault = isProfileDefault
+      self.unavailableReason = unavailableReason
     }
+  }
+
+  public enum SelectionAction: Equatable, Sendable {
+    /// Row is visible but cannot be selected as a load target.
+    case unavailable(reason: String)
+    /// Current concrete profile-default row: remove any override, no load needed.
+    case clearOverride
+    /// Request the normal coordinator path for `modelID`. `overrideAfterConfirmation`
+    /// is nil for concrete profile-default rows so a confirmed load leaves the chat
+    /// using profile-default semantics rather than persisting a redundant override.
+    case requestModel(modelID: String, overrideAfterConfirmation: String?)
   }
 
   public struct CurrentSummary: Equatable, Sendable {
@@ -66,6 +83,19 @@ public enum ToolbarModelOptions {
     return nil
   }
 
+  public static func selectionAction(for option: Option,
+                                     currentModelID: String?) -> SelectionAction {
+    if let reason = option.unavailableReason {
+      return .unavailable(reason: reason)
+    }
+    if option.isProfileDefault, normalized(currentModelID) == option.slug {
+      return .clearOverride
+    }
+    return .requestModel(
+      modelID: option.slug,
+      overrideAfterConfirmation: option.isProfileDefault ? nil : option.slug)
+  }
+
   public static func build(discoveredModels: [InstalledModel],
                            servedModelIDs: [String],
                            profileDefaultModelID: String?,
@@ -96,8 +126,15 @@ public enum ToolbarModelOptions {
                     displayName: ModelDisplayName.leaf(slug),
                     source: model?.source,
                     isCurrent: slug == currentSlug,
-                    isProfileDefault: slug == profileDefault)
+                    isProfileDefault: slug == profileDefault,
+                    unavailableReason: unavailableReason(for: model))
     }
+  }
+
+  private static func unavailableReason(for model: InstalledModel?) -> String? {
+    guard let model else { return nil }
+    if model.isPartial { return "Download in progress" }
+    return model.unsupportedReason
   }
 
   private static func normalized(_ value: String?) -> String? {
