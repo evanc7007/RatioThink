@@ -57,14 +57,21 @@ final class S260_ChatModelMenuGUITests: XCTestCase {
                   "model menu missing after creating chat; app tree: \(app.debugDescription)")
     modelMenu.click()
 
-    // The served id `Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf` renders as its
-    // leaf. Status is pinned `.running`, so allow time for the reconcile to
-    // fetch `/v1/models` (the menu only resolves to the served id once
-    // `engineModels` is `.known([...])`).
-    let seededModel = app.menuItems["Qwen3-0.6B-Q8_0.gguf"]
+    // The served id `Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf` renders with
+    // its concrete leaf plus any secondary status annotation (for example
+    // "(profile default)"). Status is pinned `.running`, so allow time for the
+    // reconcile to fetch `/v1/models` (the menu only resolves to the served id
+    // once `engineModels` is `.known([...])`).
+    let seededModel = menuItem(containingModelLeaf: "Qwen3-0.6B-Q8_0.gguf", in: app)
     XCTAssertTrue(seededModel.waitForExistence(timeout: 10),
                   "seeded Qwen3 GGUF missing from chat model menu; app tree: \(app.debugDescription)")
     app.typeKey(.escape, modifierFlags: [])
+  }
+
+  private func menuItem(containingModelLeaf leaf: String, in app: XCUIApplication) -> XCUIElement {
+    let predicate = NSPredicate(format: "title CONTAINS[c] %@ OR label CONTAINS[c] %@ OR value CONTAINS[c] %@",
+                                leaf, leaf, leaf)
+    return app.menuItems.matching(predicate).firstMatch
   }
 
   /// `xcodebuild test` does not reliably pass ad-hoc shell env vars through to

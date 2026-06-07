@@ -69,7 +69,7 @@ final class S426_FastThinkProfileGUITests: XCTestCase {
     XCTAssertTrue(modelMenu.waitForExistence(timeout: 10),
                   "model menu missing after creating chat; app tree: \(app.debugDescription)")
     modelMenu.click()
-    let seededModel = app.menuItems["Qwen3-0.6B-Q8_0.gguf"]
+    let seededModel = menuItem(containingModelLeaf: "Qwen3-0.6B-Q8_0.gguf", in: app)
     XCTAssertTrue(seededModel.waitForExistence(timeout: 15),
                   "seeded Qwen3 GGUF missing from chat model menu (reconcile did not land); app tree: \(app.debugDescription)")
     app.typeKey(.escape, modifierFlags: [])
@@ -167,6 +167,12 @@ final class S426_FastThinkProfileGUITests: XCTestCase {
       RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.5))
     }
     return false
+  }
+
+  private func menuItem(containingModelLeaf leaf: String, in app: XCUIApplication) -> XCUIElement {
+    let predicate = NSPredicate(format: "title CONTAINS[c] %@ OR label CONTAINS[c] %@ OR value CONTAINS[c] %@",
+                                leaf, leaf, leaf)
+    return app.menuItems.matching(predicate).firstMatch
   }
 
   /// Shared with S258/S260: `Scripts/run-chat-gui-e2e.sh` writes this fixed
