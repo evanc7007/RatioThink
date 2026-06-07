@@ -45,6 +45,15 @@ final class ProfileModelPickerLabelTests: XCTestCase {
       "A raw repo/file slug must not be the visible selected picker text")
   }
 
+  func test_visible_selected_label_text_handles_missing_default_model() {
+    let visibleText = visibleTextStrings(in: ProfileModelPickerLabel(modelID: nil).body)
+
+    XCTAssertEqual(
+      visibleText,
+      ["No default model"],
+      "A profile with no default model should keep the explicit no-default label after the bounded picker-label merge")
+  }
+
   private func accessibilityDescriptions(in element: Any) -> [String] {
     guard let object = element as? NSObject else { return [] }
     let label = accessibilityString(object, "accessibilityLabel").map { "label=\($0)" }

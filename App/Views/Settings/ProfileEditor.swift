@@ -316,12 +316,13 @@ struct ProfileEditor: View {
 struct ProfileModelPickerLabel: View {
   static let maxLayoutWidth: CGFloat = 360
 
-  let modelID: String
+  let modelID: String?
 
   var body: some View {
     HStack(spacing: 4) {
       Text(displayName)
         .monospaced()
+        .foregroundStyle(modelID == nil ? .secondary : .primary)
         .lineLimit(1)
         .truncationMode(.middle)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -333,19 +334,23 @@ struct ProfileModelPickerLabel: View {
     .frame(idealWidth: Self.maxLayoutWidth,
            maxWidth: Self.maxLayoutWidth,
            alignment: .leading)
-    .help(modelID)
+    .help(helpText)
     .accessibilityElement(children: .ignore)
     .accessibilityLabel(Self.accessibilityText(for: displayName))
-    .accessibilityHint(modelID)
-    .accessibilityValue(modelID)
+    .accessibilityHint(helpText)
+    .accessibilityValue(helpText)
   }
 
   private var displayName: String {
     Self.displayText(for: modelID)
   }
 
-  static func displayText(for modelID: String) -> String {
-    ModelDisplayName.leaf(modelID)
+  private var helpText: String {
+    modelID ?? displayName
+  }
+
+  static func displayText(for modelID: String?) -> String {
+    modelID.map(ModelDisplayName.leaf) ?? "No default model"
   }
 
   static func accessibilityText(for displayName: String) -> String {

@@ -142,6 +142,75 @@ public struct ProfileStoreSnapshot {
   }
 }
 
+/// Minimal profile identity shown when a model delete would clear one
+/// or more profile defaults.
+public struct ProfileModelReference: Equatable, Sendable {
+  public let id: String
+  public let name: String
+
+  public init(id: String, name: String) {
+    self.id = id
+    self.name = name
+  }
+}
+
+public enum ProfileModelDefaultsRollbackState: Equatable, Sendable, CustomStringConvertible {
+  case notNeeded
+  case succeeded
+  case failed(String)
+
+  public var description: String {
+    switch self {
+    case .notNeeded:
+      return "no profile defaults needed restoration"
+    case .succeeded:
+      return "profile defaults were restored"
+    case .failed(let reason):
+      return "profile defaults could not be fully restored: \(reason)"
+    }
+  }
+}
+
+public struct ProfileModelDefaultsOperationResult<Output> {
+  public let affectedProfiles: [ProfileModelReference]
+  public let output: Output
+
+  public init(affectedProfiles: [ProfileModelReference], output: Output) {
+    self.affectedProfiles = affectedProfiles
+    self.output = output
+  }
+}
+
+public enum ProfileModelDefaultsTransactionError: Error, CustomStringConvertible {
+  case clearFailed(
+    modelID: String,
+    cleared: [ProfileModelReference],
+    underlying: String,
+    rollback: ProfileModelDefaultsRollbackState
+  )
+  case operationFailed(
+    modelID: String,
+    cleared: [ProfileModelReference],
+    underlying: String,
+    rollback: ProfileModelDefaultsRollbackState
+  )
+
+  public var description: String {
+    switch self {
+    case .clearFailed(let modelID, let cleared, let underlying, let rollback):
+      return "Clearing profile defaults for \(modelID) failed after \(cleared.count) profile(s) changed: \(underlying); \(rollback)"
+    case .operationFailed(let modelID, let cleared, let underlying, let rollback):
+      return "Model operation for \(modelID) failed after clearing \(cleared.count) profile default(s): \(underlying); \(rollback)"
+    }
+  }
+}
+
+private struct ProfileModelDefaultTarget {
+  let profile: Profile
+  let filename: String
+  let reference: ProfileModelReference
+}
+
 /// Watches `~/Library/Application Support/RatioThink/profiles/` (or any
 /// directory passed at init) via `DispatchSource.makeFileSystemObject
 /// Source`. Reloads on change, parses each `*.toml` file, surfaces
@@ -694,7 +763,24 @@ public final class ProfileStore: ObservableObject {
   /// `modelForProfile` in `ProfileSwapCoordinator` is wired to this.
   public func model(forProfileID id: String) -> String? {
     stateLock.withLock {
-      _entries.first { $0.profile?.id == id }?.profile?.model
+      guard let model = _entries.first(where: { $0.profile?.id == id })?.profile?.model,
+            !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+        return nil
+      }
+      return model
+    }
+  }
+
+  /// Valid profiles whose default model is exactly `modelID`, in the
+  /// same stable order as `entries`. Used before deleting an installed
+  /// model so the confirmation can name/count affected profiles.
+  public func profilesReferencingModel(_ modelID: String) -> [ProfileModelReference] {
+    stateLock.withLock {
+      _entries.compactMap { entry in
+        guard let profile = entry.profile,
+              profile.model == modelID else { return nil }
+        return ProfileModelReference(id: profile.id, name: profile.name)
+      }
     }
   }
 
@@ -738,6 +824,118 @@ public final class ProfileStore: ObservableObject {
     var updated = target.profile
     updated.model = model
     try createProfile(updated, filename: target.filename)
+  }
+
+  /// Clear a profile's default model, preserving every other field and
+  /// keeping the profile parseable as an explicit no-default state.
+  public func clearModel(forProfileID id: String) throws {
+    let target: (profile: Profile, filename: String) = try stateLock.withLock {
+      guard let entry = _entries.first(where: { $0.profile?.id == id }),
+            let profile = entry.profile else {
+        throw ProfileStoreError.profileNotFound(id: id)
+      }
+      return (profile, entry.url.lastPathComponent)
+    }
+    var updated = target.profile
+    updated.model = nil
+    try createProfile(updated, filename: target.filename)
+  }
+
+  /// Clear every valid profile whose default references `modelID`.
+  /// Matching is exact; no fallback model is selected. If any profile
+  /// write fails mid-batch, earlier writes are restored before the
+  /// error is surfaced so callers do not observe silently partial
+  /// no-default state.
+  @discardableResult
+  public func clearModelDefaults(referencing modelID: String) throws -> [ProfileModelReference] {
+    try withClearedModelDefaults(referencing: modelID) { () }.affectedProfiles
+  }
+
+  /// Temporarily clear every default referencing `modelID`, perform a
+  /// caller-supplied operation, and restore the original defaults if
+  /// that operation fails. This lets model deletion treat the profile
+  /// cleanup and Trash move as one recoverable operation: a failed
+  /// Trash move cannot leave profiles silently cleared.
+  @discardableResult
+  public func withClearedModelDefaults<Output>(
+    referencing modelID: String,
+    operation: () throws -> Output
+  ) throws -> ProfileModelDefaultsOperationResult<Output> {
+    try withClearedModelDefaults(
+      referencing: modelID,
+      writeProfile: { [self] profile, filename in
+        try createProfile(profile, filename: filename)
+      },
+      operation: operation
+    )
+  }
+
+  @discardableResult
+  internal func withClearedModelDefaults<Output>(
+    referencing modelID: String,
+    writeProfile: (Profile, String) throws -> Void,
+    operation: () throws -> Output
+  ) throws -> ProfileModelDefaultsOperationResult<Output> {
+    let targets: [ProfileModelDefaultTarget] = stateLock.withLock {
+      _entries.compactMap { entry in
+        guard let profile = entry.profile,
+              profile.model == modelID else { return nil }
+        return ProfileModelDefaultTarget(
+          profile: profile,
+          filename: entry.url.lastPathComponent,
+          reference: ProfileModelReference(id: profile.id, name: profile.name)
+        )
+      }
+    }
+    var cleared: [ProfileModelDefaultTarget] = []
+    do {
+      for target in targets {
+        var updated = target.profile
+        updated.model = nil
+        try writeProfile(updated, target.filename)
+        cleared.append(target)
+      }
+    } catch {
+      let rollback = restoreModelDefaultTargets(cleared, writeProfile: writeProfile)
+      throw ProfileModelDefaultsTransactionError.clearFailed(
+        modelID: modelID,
+        cleared: cleared.map(\.reference),
+        underlying: String(describing: error),
+        rollback: rollback
+      )
+    }
+
+    do {
+      let output = try operation()
+      return ProfileModelDefaultsOperationResult(
+        affectedProfiles: targets.map(\.reference),
+        output: output
+      )
+    } catch {
+      let rollback = restoreModelDefaultTargets(cleared, writeProfile: writeProfile)
+      throw ProfileModelDefaultsTransactionError.operationFailed(
+        modelID: modelID,
+        cleared: cleared.map(\.reference),
+        underlying: String(describing: error),
+        rollback: rollback
+      )
+    }
+  }
+
+  private func restoreModelDefaultTargets(
+    _ targets: [ProfileModelDefaultTarget],
+    writeProfile: (Profile, String) throws -> Void
+  ) -> ProfileModelDefaultsRollbackState {
+    guard !targets.isEmpty else { return .notNeeded }
+    var failures: [String] = []
+    for target in targets.reversed() {
+      do {
+        try writeProfile(target.profile, target.filename)
+      } catch {
+        failures.append("\(target.reference.id): \(error)")
+      }
+    }
+    return failures.isEmpty ? .succeeded : .failed(failures.joined(separator: "; "))
   }
 
   /// Persist `id` as the active profile. Writes atomically to
