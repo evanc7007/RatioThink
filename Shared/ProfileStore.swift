@@ -286,6 +286,38 @@ public final class ProfileStore: ObservableObject {
   /// Filename written by `seedDefaultsIfEmpty()` on first launch.
   public static let defaultChatFilename = "chat.toml"
 
+  /// Example tree-of-thought profile (#413) seeded alongside `chat.toml`
+  /// on first launch so the live tree-search feature is reachable: the
+  /// user just switches to it. Reuses the same default model + the
+  /// `chat-apc` inferlet (ToT is a per-request dispatch mode, not a
+  /// separate wasm); `inferlet_args.mode = "tree-of-thought"` is what
+  /// `Profile.treeOfThought` keys on, and the breadth/depth/beam_width
+  /// are the bounded search shape (server-validated). The profiles editor
+  /// only displays `inferlet_args`, so seeding the file is how a user gets
+  /// a ToT profile without hand-editing TOML.
+  public static let treeOfThoughtFilename = "tree-of-thought.toml"
+  public static let treeOfThoughtTOML: String = """
+  id = "tree-of-thought"
+  name = "Tree of Thought"
+  icon = "point.3.connected.trianglepath.dotted"
+  model = "\(defaultChatModelID)"
+  inferlet = "chat-apc"
+  system_prompt = "You are a helpful assistant."
+
+  [sampling]
+  temperature = 0.7
+  top_p = 0.9
+  max_tokens = 2048
+
+  [inferlet_args]
+  mode = "tree-of-thought"
+  breadth = 3
+  depth = 2
+  beam_width = 2
+  max_tokens_per_node = 256
+
+  """
+
   /// Profile id encoded in `defaultChatTOML`. Also the value written
   /// to the `activeProfileURL` marker on first launch:
   /// without seeding the marker the menu-bar Resume click is a silent
@@ -441,15 +473,23 @@ public final class ProfileStore: ObservableObject {
   public init(
     directory: URL,
     activeProfileURL: URL? = nil,
-    queue: DispatchQueue = DispatchQueue(label: "com.ratiothink.profile-store")
+    queue: DispatchQueue = DispatchQueue(label: "com.ratiothink.profile-store"),
+    seedsExampleProfiles: Bool = true
   ) {
     self.directory = directory
     self.activeProfileURL = activeProfileURL
       ?? directory.deletingLastPathComponent()
         .appendingPathComponent("active-profile", isDirectory: false)
     self.queue = queue
+    self.seedsExampleProfiles = seedsExampleProfiles
     queue.setSpecific(key: queueKey, value: ())
   }
+
+  /// When false, `start()` skips the #413 tree-of-thought example-profile
+  /// backfill. Production defaults to true; scan/lifecycle tests that
+  /// assert exact directory contents pass false to keep their fixture
+  /// hermetic.
+  private let seedsExampleProfiles: Bool
 
   /// Run `work` on `queue` exactly once: inline when the caller is
   /// already on `queue` (listener callback, post-reload work),
@@ -518,6 +558,11 @@ public final class ProfileStore: ObservableObject {
     // directory but does NOT touch the marker.
     queue.sync {
       let seed = self.seedDefaultsIfEmpty()
+      // #413: backfill the example tree-of-thought profile if absent —
+      // runs BEFORE the `reloadLocked()` scan below so the first snapshot
+      // already lists it. Independent of the dir-empty seed, so existing
+      // installs get it too.
+      self.backfillTreeOfThoughtProfile()
       // Ensure the built-in Fast Think profile exists even on installs
       // that already seeded chat.toml (the empty-dir seed above is a no-op
       // there). Runs before `reloadLocked()` below so the initial scan
@@ -739,6 +784,16 @@ public final class ProfileStore: ObservableObject {
     }
   }
 
+  /// The full parsed `Profile` for `id`, or nil when the id is absent or
+  /// its file failed to parse. The chat send path reads this to detect a
+  /// tree-of-thought profile (`Profile.treeOfThought`) and route the turn
+  /// to the ToT dispatch (#413); ordinary callers want `model(forProfileID:)`.
+  public func profile(forProfileID id: String) -> Profile? {
+    stateLock.withLock {
+      _entries.first { $0.profile?.id == id }?.profile
+    }
+  }
+
   /// The speculative-decoding ("Fast Think") settings a profile carries,
   /// or `nil` when the profile has no `[speculation]` section / does not
   /// exist / failed to parse. `ChatScaffoldView.sendAssistantTurn` reads
@@ -750,6 +805,7 @@ public final class ProfileStore: ObservableObject {
       _entries.first { $0.profile?.id == id }?.profile?.speculation
     }
   }
+
 
   /// Persist a new default `model` onto the profile with `id`, leaving
   /// every other field untouched. Writes back to the profile's own
@@ -1174,6 +1230,36 @@ public final class ProfileStore: ObservableObject {
   /// against a populated directory is a no-op for the chat.toml seed,
   /// and the marker seed uses exclusive-create semantics so a
   /// concurrent process's marker always wins (review v1 F3).
+  /// #413: ensure the example tree-of-thought profile exists so the live
+  /// tree-search feature is reachable (the user just switches to it).
+  ///
+  /// Unlike `seedDefaultsIfEmpty` (which writes only when the profiles dir
+  /// is TRULY EMPTY = fresh install), this WRITE-IF-ABSENT backfill runs on
+  /// every `start()`, so an EXISTING install — whose dir already holds
+  /// `chat.toml` from before #413, making the seed a no-op — gets the
+  /// profile too. It never clobbers a user-edited copy (writes only when
+  /// the file is missing). Best-effort: a failure must NOT fail `start()`
+  /// (the user can still chat). The Settings editor only DISPLAYS
+  /// `inferlet_args`, so seeding the file is the only way a user gets a ToT
+  /// profile without hand-writing TOML.
+  ///
+  /// Runs on `queue` (called from `start()` inside `queue.sync`). Does not
+  /// touch the active-profile marker — `chat` stays the default; ToT is
+  /// opt-in via the picker.
+  private func backfillTreeOfThoughtProfile() {
+    guard seedsExampleProfiles else { return }
+    let target = directory.appendingPathComponent(Self.treeOfThoughtFilename)
+    guard !FileManager.default.fileExists(atPath: target.path) else { return }
+    do {
+      try Self.treeOfThoughtTOML.write(to: target, atomically: true, encoding: .utf8)
+      Log.store.info("backfilled tree-of-thought profile at \(target.path, privacy: .public)")
+    } catch {
+      Log.store.error(
+        "backfill tree-of-thought profile failed (non-fatal): \(String(describing: error), privacy: .public)"
+      )
+    }
+  }
+
   private func seedDefaultsIfEmpty() -> SeedResult {
     let existing = (try? FileManager.default.contentsOfDirectory(
       at: directory,
@@ -1200,6 +1286,11 @@ public final class ProfileStore: ObservableObject {
         markerError: nil
       )
     }
+
+    // #413: the example tree-of-thought profile is NOT written here. It is
+    // backfilled by `backfillTreeOfThoughtProfile()` (write-if-absent on
+    // every start), so EXISTING installs — whose profiles dir is non-empty,
+    // making this seed a no-op — get it too, not just fresh installs.
 
     // : pair the chat.toml seed with an active-profile
     // marker so the first-run menu-bar Resume click resolves into a
