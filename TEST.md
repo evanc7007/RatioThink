@@ -25,6 +25,8 @@ below in the same change.
 | `make test-release` | real-tool contract tests for `notarize.sh` + `release-preflight.sh` | anywhere | — (in CI) |
 | `make test-stamp` | `Inferlets/chat-apc/_stamp.py` unit tests | anywhere | — |
 | `make test-e2e-http` | chat-apc HTTP API stress + SSE/concurrency + OpenAI tool-call contract (`e2e_test.py` + `stress_e2e_test.py`) vs the **dummy driver** | anywhere (headless) | self-bootstraps `pie` + wasm; needs `uv` + Qwen3-0.6B `config.json`+`tokenizer.json` in HF cache (no weights/GPU) |
+| `make test-e2e-engine` | Real Helper-hosted engine launch + inference using `RealEngineLaunchE2ETests` and a staged small GGUF | anywhere (headless) | built worktree `pie` + `chat-apc`; downloads/stages small GGUF if needed |
+| `make test-e2e-large-model` | **Manual** real Helper-hosted engine launch + inference for representative curated large GGUF (`Qwen/Qwen3-14B-GGUF/Qwen3-14B-Q4_K_M.gguf`, ~9 GB) | local/operator only | built **worktree** `pie` + `chat-apc`; may download ~9 GB; intentionally not PR CI |
 | `make test-ssh` | `test-unit` + `test-scenario` + `test-smoke` + `test-install-guards` | anywhere (no GUI) | — |
 | `make test-gui` | GUI scenarios (S4, S5, and the rest of `Tests/GUIScenarioTests`) via XCUITest | **seated session** | `Dock` running; Automation/Accessibility TCC |
 | `make test-gui-history` | Deterministic multi-turn history/resume E2E | **seated session** | `PIE_TEST_TCC_GRANTED=1` |
@@ -96,6 +98,7 @@ exact fix command when a human gate is unmet.
 | first launch (wizard) | `make test-gui-first-launch` (S7 fast) | `test-gui` |
 | package / install | `make test-gui-first-launch-package` (S7 packaged `.app`) | — |
 | helper / engine startup | `make test-gui-helper` (S4); `make test-smoke` (S3 subprocess); `make test-e2e-engine` (real launch) | `test-gui` / `test-ssh` |
+| large curated model real-engine proof | `make test-e2e-large-model` (manual/local; representative Qwen3 14B single-file GGUF, override with `PIE_TEST_E2E_REPO`/`PIE_TEST_E2E_FILE`) | — |
 | engine-free chat surfaces | `make test-gui-chat` (S260/S279/S285/S286) | `test-gui` |
 | model discovery / download | `make test-e2e-models` (S204 acquisition + unverified badge + live HF acquire); `Scripts/run-cache-discovery-gui-e2e.sh` (S365 HF-cache → Settings row) | — |
 | model load / status | `make test-e2e-load` (S302 indicator); `make test-e2e-396` (S396 failed-load Retry/Dismiss) | — |
