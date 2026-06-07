@@ -412,7 +412,7 @@ struct RatioThinkApp: App {
     .defaultSize(width: 1200, height: 800)
     .commands {
       // #411: the MANUAL "Check for Updates…" entry, in the standard macOS
-      // spot (App menu, directly under "About RatioThink"). It always checks
+      // spot (App menu, directly under "About Rational"). It always checks
       // and bypasses the ignore-set, complementing the once-per-launch auto
       // check that surfaces the non-modal UpdateAvailableBanner (RootView /
       // UpdateAvailabilityModel). Both compare the running version to the

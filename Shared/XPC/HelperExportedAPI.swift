@@ -820,10 +820,10 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
   /// (wired by `HelperMain` to `NSApp.terminate`) for a clean exit so
   /// launchd's `KeepAlive { SuccessfulExit: false }` does not relaunch it.
   ///
-  /// A bounded fallback fires the termination even if the engine never
-  /// reaches terminal, so a wedged engine cannot block quit; a stuck pid is
-  /// then reaped by launchd when the Helper exits, the same as any unclean
-  /// death. Idempotent via the single-shot `finished` flag.
+  /// If the deadline expires before a terminal/reaped state, `quitHelper`
+  /// replies with a structured timeout and does NOT terminate the Helper. This
+  /// keeps the Helper alive as the owner of the engine session so the App can
+  /// cancel normal quit and offer retry / explicit force-quit recovery.
   public func quitHelper(reply: @escaping (Data?) -> Void) {
     Self.log.info("quitHelper: tearing down engine then terminating helper")
     guard let engineHost else {
@@ -840,18 +840,26 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
     HelperQuitTeardown.stopThenTerminate(
       engineHost: engineHost,
       initialTimeout: deadline,
-      timeoutTerminationGrace: HelperQuitTeardown.timeoutTerminationGrace,
       onTerminalBeforeTimeout: { _ in
         PieHelperXPCWire.replyStopEngine(nil, via: reply)
+      },
+      onTerminalFailure: { result in
+        let error: EngineError
+        if case let .failed(code, message) = result.lastStatus {
+          error = EngineError(code: code, message: message)
+        } else {
+          error = EngineError(
+            code: .unknown,
+            message: "quitHelper stop/reap failed before pie was confirmed reaped (last status: \(result.lastStatus))"
+          )
+        }
+        PieHelperXPCWire.replyStopEngine(error, via: reply)
       },
       onTimeout: { result in
         PieHelperXPCWire.replyStopEngine(EngineError(
           code: .handshakeTimeout,
-          message: "quitHelper stop/reap timeout after \(deadline)s (last status: \(result.lastStatus)); helper will terminate after bounded \(HelperQuitTeardown.timeoutTerminationGrace)s fallback if reap remains wedged"
+          message: "quitHelper stop/reap timeout after \(deadline)s (last status: \(result.lastStatus)); normal quit is blocked until pie reaches a terminal/reaped state"
         ), via: reply)
-      },
-      onFinalTimeout: { result in
-        Self.log.error("quitHelper: bounded fallback expired with status \(String(describing: result.lastStatus), privacy: .public); terminating helper anyway")
       },
       terminate: { [onQuitRequested] in onQuitRequested?() }
     )

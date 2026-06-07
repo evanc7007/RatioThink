@@ -1421,14 +1421,14 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
   }
 
   /// True when an instance of the main RatioThink.app is running. The
-  /// menu-bar "Quit RatioThink" then delegates the coordinated full-product
+  /// menu-bar "Quit Rational" then delegates the coordinated full-product
   /// teardown to the App (the single quit coordinator) so the Helper isn't
   /// quit-then-respawned on-demand.
   private static var isAppRunning: Bool {
     !NSRunningApplication.runningApplications(withBundleIdentifier: "com.ratiothink.app").isEmpty
   }
 
-  /// "Quit RatioThink" (#448): tears down the WHOLE product, not just the
+  /// "Quit Rational" (#448): tears down the WHOLE product, not just the
   /// Helper. The old `NSApp.terminate(nil)` quit only the Helper — the
   /// still-running App then respawned it on-demand within ~1s and the engine
   /// could orphan. Now: if the App is running it owns the quit, so hand it
@@ -1446,11 +1446,11 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
     }
   }
 
-  /// App-absent fallback for "Quit RatioThink": reap the engine before
+  /// App-absent fallback for "Quit Rational": reap the engine before
   /// exiting so the Helper never orphans `pie`. `stopAndWait` fires only
   /// after the terminal status that `LaunchedSession.shutdown` publishes once
-  /// `pie` is gone, and is bounded so a wedged engine still lets the user
-  /// quit.
+  /// `pie` is gone. If that deadline expires, the Helper stays alive so it can
+  /// continue owning the session for retry or an explicit force-quit path.
   private func quitHelperLocally() {
     guard let engineHost else {
       NSApp.terminate(nil)
@@ -1459,12 +1459,11 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
     HelperQuitTeardown.stopThenTerminate(
       engineHost: engineHost,
       initialTimeout: HelperExportedAPI.stopReplyDeadline,
-      timeoutTerminationGrace: HelperQuitTeardown.timeoutTerminationGrace,
-      onTimeout: { result in
-        Log.helper.error("quitHelperLocally: stop/reap timed out with status \(String(describing: result.lastStatus), privacy: .public); terminating after bounded fallback if reap remains wedged")
+      onTerminalFailure: { result in
+        Log.helper.error("quitHelperLocally: stop/reap failed with status \(String(describing: result.lastStatus), privacy: .public); keeping helper alive for retry or explicit force quit")
       },
-      onFinalTimeout: { result in
-        Log.helper.error("quitHelperLocally: bounded fallback expired with status \(String(describing: result.lastStatus), privacy: .public); terminating helper anyway")
+      onTimeout: { result in
+        Log.helper.error("quitHelperLocally: stop/reap timed out with status \(String(describing: result.lastStatus), privacy: .public); keeping helper alive for retry or explicit force quit")
       },
       terminate: { DispatchQueue.main.async { NSApp.terminate(nil) } }
     )
