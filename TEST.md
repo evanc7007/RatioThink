@@ -15,7 +15,7 @@ below in the same change.
 | `make build-static` | Xcode Debug compile/type check of the Rational app + helper with `PIE_SKIP_ENGINE_BUILD=1` so the Rust engine long pole is not built | local + optional manual GitHub workflow | Lightweight compile/type check in `ci-pr` |
 | `make local-pre-merge` | `ci-pr` plus `build-tests`, app-unit, scenario/smoke, HTTP E2E, real-pie driver contract, gmake recipe canary | local operator machine | **Mandatory before merge** for non-doc changes; carries runtime coverage kept local |
 | `make local-gui-gate` | GUI wrapper script regressions + full `RatioThinkGUITests` matrix | seated local session | **Mandatory before merge** for GUI/UI changes |
-| `make local-e2e-gate` | Real-engine/model/signing/helper E2E wrappers (`test-e2e-*`, GUI history/package, helper respawn/recovery, structured quit) | local/operator only | **Mandatory before merge/release** for affected engine/model/install paths |
+| `make local-e2e-gate` | Standard real-engine/model/signing/helper E2E wrappers (`test-e2e-engine`, `test-e2e-models`, `test-e2e-load`, `test-e2e-396`, `test-e2e-chat`, `test-e2e-tot`, `test-e2e-full`, GUI history/package, helper respawn/recovery, structured quit); excludes the separate ~9 GB `test-e2e-large-model` proof | local/operator only | **Mandatory before merge/release** for affected engine/model/install paths |
 | `make release-gate` | `local-pre-merge` + live-HF curated audit + DMG layout + artifact preflight | local/operator + release machine | **Mandatory before release**; also run `make release-preflight ARTIFACT=…` on the built artifact |
 | `make lint` | helper side-effect invariants (static) | anywhere | Local/manual via `ci-pr` |
 | `make build` | Debug build of the Rational app + helper, including real Rust engine bundle build | local | Local packaging/runtime verification |
@@ -41,6 +41,8 @@ below in the same change.
 | `make build-inferlets` / `make stamp-inferlets` / `make verify-inferlets-inputs` | Rebuild/restamp wasm and check rebuilt-tree inputs | local | Local pre-merge/release when inferlet source, WIT/vendor pin, or prebuilt wasm changes |
 | `make test-curated-hf` | Live-HF existence audit of the curated catalog (`PIE_TEST_REAL_HF=1`; network) | scheduled/targeted PR workflow + local | `curated-catalog-audit` for catalog edits/nightly; release gate via `release-gate` |
 | `make test-e2e-http` | chat-apc HTTP API stress + SSE/concurrency + OpenAI tool-call contract (`e2e_test.py` + `stress_e2e_test.py`) vs the **dummy driver** | local (headless) | Local pre-merge via `local-pre-merge`; needs `uv` + Qwen3-0.6B config/tokenizer HF cache |
+| `make test-e2e-engine` | Real Helper-hosted engine launch + inference using `RealEngineLaunchE2ETests` and a staged small GGUF | anywhere (headless) | built worktree `pie` + `chat-apc`; downloads/stages small GGUF if needed |
+| `make test-e2e-large-model` | **Manual** real Helper-hosted engine launch + inference for representative curated large GGUF (`Qwen/Qwen3-14B-GGUF/Qwen3-14B-Q4_K_M.gguf`, ~9 GB) | local/operator only | built **worktree** `pie` + `chat-apc`; may download ~9 GB; intentionally not PR CI |
 | `make test-ssh` | `test-unit` + `test-scenario` + `test-smoke` + `test-install-guards` | local (no GUI) | Convenience local subset; not part of `ci-pr` |
 | `make test-gui` | GUI scenarios (S4, S5, and the rest of `Tests/GUIScenarioTests`) via XCUITest | **seated session** | Local GUI gate via `local-gui-gate` |
 | `make test-gui-history` | Deterministic multi-turn history/resume E2E | **seated session** | Local E2E gate |
@@ -115,6 +117,7 @@ exact fix command when a human gate is unmet.
 | first launch (wizard) | `make test-gui-first-launch` (S7 fast) | `test-gui` |
 | package / install | `make test-gui-first-launch-package` (S7 packaged `.app`) | — |
 | helper / engine startup | `make test-gui-helper` (S4); `make test-smoke` (S3 subprocess); `make test-e2e-engine` (real launch) | `test-gui` / `test-ssh` |
+| large curated model real-engine proof | `make test-e2e-large-model` (manual/local; representative Qwen3 14B single-file GGUF, override with `PIE_TEST_E2E_REPO`/`PIE_TEST_E2E_FILE`) | — |
 | engine-free chat surfaces | `make test-gui-chat` (S260/S279/S285/S286) | `test-gui` |
 | model discovery / download | `make test-e2e-models` (S204 acquisition + unverified badge + live HF acquire); `Scripts/run-cache-discovery-gui-e2e.sh` (S365 HF-cache → Settings row) | — |
 | model load / status | `make test-e2e-load` (S302 indicator); `make test-e2e-396` (S396 failed-load Retry/Dismiss) | — |
@@ -198,7 +201,7 @@ Every suite/job kept out of `make ci-pr` or the manual lightweight workflow maps
 | Inferlet wasm rebuild/restamp (`make build-inferlets`) | local-required-before-merge for inferlet changes | `make stamp-inferlets` then `make verify-inferlets-inputs`; cheap `make test-stamp test-inferlets verify-inferlets` remains available in the conditional manual workflow | When `Inferlets/**`, `Vendor/pie`, WIT/vendor pin, or prebuilt wasm changes |
 | HTTP API E2E | local-required-before-merge | `make test-e2e-http` or aggregate `make local-pre-merge` | chat-apc HTTP/SSE/tool-call changes |
 | GUI/XCUITest suites | local-required-before-merge for UI | `make local-gui-gate` or focused `make test-gui-*` targets | SwiftUI/layout/copy/a11y/menu/wizard/model UI changes; requires seated session + TCC |
-| Real-engine/model/signing/helper E2E wrappers | local-required-before-merge/release for affected paths | `make local-e2e-gate` or focused `make test-e2e-*`, `make test-gui-history`, `make test-gui-first-launch-package`, `make test-helper-respawn`, `make test-helper-recovery` | Engine/model/download/chat persistence/install/helper lifecycle changes; before release for affected areas |
+| Real-engine/model/signing/helper E2E wrappers | local-required-before-merge/release for affected paths | `make local-e2e-gate` or focused standard targets: `make test-e2e-engine`, `make test-e2e-models`, `make test-e2e-load`, `make test-e2e-396`, `make test-e2e-chat`, `make test-e2e-tot`, `make test-e2e-full`, `make test-gui-history`, `make test-gui-first-launch-package`, `make test-helper-respawn`, `make test-helper-recovery` | Engine/model/download/chat persistence/install/helper lifecycle changes; before release for affected areas. The ~9 GB `make test-e2e-large-model` proof is a separate manual/operator target invoked directly, not part of `local-e2e-gate`, `release-gate`, or PR CI. |
 | Packaging/notarization artifact assessment | local-required-before-release | `make release-preflight ARTIFACT=path/to/RatioThink.app` or `make release-preflight ARTIFACT=path/to/RatioThink-<arch>.dmg` after packaging/notarization | Every release candidate artifact |
 
 ### Confirm-before-PR by change type

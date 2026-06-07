@@ -199,22 +199,35 @@ private struct CuratedRow: View {
       VStack(alignment: .leading, spacing: 2) {
         HStack(spacing: 6) {
           Text(model.displayName).font(.headline)
-          if model.id == CuratedModelCatalog.recommendedModelID {
-            Text("Recommended")
+          if let badge = model.installIntent.badgeText {
+            Text(badge)
               .font(.caption.bold())
               .padding(.horizontal, 6)
               .padding(.vertical, 2)
               .background(Capsule().fill(Color.accentColor.opacity(0.15)))
-              .accessibilityIdentifier("CuratedRecommended-\(model.id)")
+              .accessibilityIdentifier(model.installIntent == .defaultRecommended
+                                       ? "CuratedRecommended-\(model.id)"
+                                       : "CuratedIntent-\(model.id)")
           }
         }
         Text("\(model.publisher) · \(formattedParams) · \(model.quantization)")
           .font(.callout)
           .foregroundStyle(.secondary)
+        if let memory = model.recommendedSystemMemoryBytes {
+          Text("Recommended memory: \(InstalledModels.formattedSize(memory))")
+            .font(.callout)
+            .foregroundStyle(.secondary)
+        }
         Text(model.summary)
           .font(.callout)
           .foregroundStyle(.secondary)
           .fixedSize(horizontal: false, vertical: true)
+        if !model.pieSupportNotes.isEmpty {
+          Text(model.pieSupportNotes)
+            .font(.caption)
+            .foregroundStyle(.tertiary)
+            .fixedSize(horizontal: false, vertical: true)
+        }
       }
       Spacer()
       VStack(alignment: .trailing, spacing: 6) {

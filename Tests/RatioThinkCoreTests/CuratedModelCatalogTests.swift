@@ -162,6 +162,42 @@ final class CuratedModelCatalogTests: XCTestCase {
                       "the Qwen official repo ships this quant only as split shards — do not revert")
   }
 
+  /// Larger Pie-runnable options must be explicit about their
+  /// operator posture. They are real single-file GGUF downloads in the
+  /// curated UI, but they are NOT starter/default models and their real
+  /// engine proof stays manual/local because each artifact is ~9 GB.
+  func test_large_manual_models_are_present_with_memory_and_support_metadata() {
+    let qwen3 = CuratedModelCatalog.model(withID: "qwen3-14b-q4_k_m")
+    let coder = CuratedModelCatalog.model(withID: "qwen2.5-coder-14b-instruct-q4_k_m")
+
+    XCTAssertEqual(qwen3?.huggingFaceRepo, "Qwen/Qwen3-14B-GGUF")
+    XCTAssertEqual(qwen3?.huggingFaceFile, "Qwen3-14B-Q4_K_M.gguf")
+    XCTAssertEqual(qwen3?.approximateSizeBytes, 9_001_752_960)
+
+    XCTAssertEqual(coder?.huggingFaceRepo, "bartowski/Qwen2.5-Coder-14B-Instruct-GGUF")
+    XCTAssertEqual(coder?.huggingFaceFile, "Qwen2.5-Coder-14B-Instruct-Q4_K_M.gguf")
+    XCTAssertEqual(coder?.approximateSizeBytes, 8_988_111_072)
+
+    for id in ["qwen3-14b-q4_k_m", "qwen2.5-coder-14b-instruct-q4_k_m"] {
+      let model = CuratedModelCatalog.model(withID: id)
+      XCTAssertEqual(model?.installIntent, .manualOnly,
+                     "\(id) must stay manual-only: no default seeding or PR-CI large download")
+      XCTAssertGreaterThan(model?.recommendedSystemMemoryBytes ?? 0,
+                           24 * 1024 * 1024 * 1024,
+                           "\(id) must record the expected host-memory footprint")
+      XCTAssertFalse(model?.pieSupportNotes.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true,
+                     "\(id) must document Pie support constraints")
+    }
+  }
+
+  func test_large_e2e_representative_is_a_manual_large_catalog_model() {
+    let model = CuratedModelCatalog.model(withID: CuratedModelCatalog.largeE2ERepresentativeModelID)
+    XCTAssertNotNil(model, "large E2E representative must resolve to a catalog model")
+    XCTAssertEqual(model?.installIntent, .manualOnly)
+    XCTAssertGreaterThanOrEqual(model?.parameterCountBillions ?? 0, 14.0)
+    XCTAssertGreaterThan(model?.approximateSizeBytes ?? 0, 8_000_000_000)
+  }
+
   /// The PR-time live-HF audit is intentionally path-gated so unrelated
   /// PRs do not hit the network. Keep that gate broad enough for future
   /// catalog splits: if `CuratedModelCatalog.all` starts aggregating

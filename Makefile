@@ -64,7 +64,7 @@ endef
         test-unit test-scenario test-smoke test-curated-hf test-install-guards test-readme-harness test-e2e-http \
         test-gui-script test-gui-history test-gui-first-launch-package test-gui test-ssh test-all \
         test-gui-shell test-gui-first-launch test-gui-helper test-gui-chat \
-        test-e2e-engine test-e2e-models test-e2e-load test-e2e-396 test-e2e-chat test-e2e-tot test-e2e-full test-helper-respawn test-helper-recovery test-quit-structured \
+        test-e2e-engine test-e2e-large-model test-e2e-models test-e2e-load test-e2e-396 test-e2e-chat test-e2e-tot test-e2e-full test-helper-respawn test-helper-recovery test-quit-structured \
         test-real-pie-driver-contract test-sanitizer-canary test-gmake-recipe-canary \
         engine-build engine-clean engine-bundle dmg-arm64 dmg-x86_64 \
         release-dmg-arm64 release-dmg-x86_64 release-preflight test-release \
@@ -390,6 +390,7 @@ test-e2e-http: $(LOGDIR) ## HTTP API stress + tool-call contract E2E (dummy driv
 test-gui-script: ## Fast preflight regressions for GUI E2E wrappers
 	Scripts/test-run-stage-test-model.sh
 	Scripts/test-run-chat-gui-e2e.sh
+	Scripts/test-run-large-model-e2e.sh
 	Scripts/test-run-resume-gui-history-e2e.sh
 	Scripts/test-run-first-launch-package-e2e.sh
 
@@ -475,6 +476,9 @@ test-gui-chat: genproject $(LOGDIR) ## GUI area: engine-free chat surfaces — m
 # `make help` instead of rotting as undocumented orphan scripts (GUI/E2E audit).
 test-e2e-engine: ## E2E area: real Helper-hosted engine launch + inference (RealEngineLaunchE2ETests)
 	Scripts/run-engine-e2e.sh
+
+test-e2e-large-model: ## E2E area: manual real Helper-hosted launch + inference for representative ~9GB curated large GGUF (not PR CI)
+	Scripts/run-large-model-e2e.sh
 
 test-e2e-models: ## E2E area: model discovery/download/verify + unverified badge (S204 acquisition/badge, live HF)
 	Scripts/run-gui-e2e.sh
