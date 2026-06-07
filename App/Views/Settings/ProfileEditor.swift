@@ -13,6 +13,7 @@ struct ProfileEditor: View {
   var onModelChanged: () -> Void = {}
   @EnvironmentObject private var profileStore: ProfileStore
   @EnvironmentObject private var downloads: ModelDownloadController
+  @EnvironmentObject private var settingsNavigation: SettingsNavigation
   @EnvironmentObject private var engineStatusStore: EngineStatusStore
   @State private var showAdvanced: Bool = false
   /// Discovered model options (app-managed + HF cache), each carrying
@@ -119,12 +120,25 @@ struct ProfileEditor: View {
         // Block selecting an unloadable model — over-limit (too large for
         // this host) or unsupported (a split GGUF the engine can't load)
         // — but never the current value, which stays a no-op.
+        .help(option.slug)
+        .accessibilityValue(option.slug)
         .disabled((option.isOverLimit || option.unsupportedReason != nil) && !option.isCurrent)
       }
+      Divider()
+      Button {
+        settingsNavigation.open(.models)
+      } label: {
+        Label("Manage Models…", systemImage: "gearshape")
+      }
+      .help("Open Settings → Models")
+      .accessibilityIdentifier("ProfileEditorModelPickerManageModels")
     } label: {
       ProfileModelPickerLabel(modelID: profile.model)
     }
     .menuStyle(.borderlessButton)
+    .fixedSize()
+    .help(profile.model ?? "")
+    .accessibilityValue(profile.model ?? "")
     .accessibilityIdentifier("ProfileEditorModelPicker")
   }
 

@@ -22,7 +22,14 @@ import SwiftUI
 struct ContentToolbar: View {
   @ObservedObject var viewModel: ChatTranscriptViewModel
   let availableProfiles: [String]
-  let availableModels: [String]
+  let modelOptions: [ToolbarModelOptions.Option]
+  let currentModelSummary: ToolbarModelOptions.CurrentSummary?
+  /// Actual loaded engine model identity, distinct from the effective
+  /// display identity (`currentModelSummary`) which can be a pending/explicit
+  /// override. Default-row clear-vs-load decisions must compare against the
+  /// resident engine model so selecting profile default B while resident A is
+  /// still requests the normal load path.
+  let residentModelIDForSelection: String?
   /// Swap coordinator. Required — review v1 F9: defaulting this to a
   /// preview-only `previewDefault()` let a forgotten injection at any
   /// call site silently fall through to an orphan coordinator the
@@ -58,13 +65,18 @@ struct ContentToolbar: View {
   /// engine" action.
   let onStartEngine: () -> Void
 
+  @Environment(\.openSettings) private var openSettings
+  @EnvironmentObject private var settingsNavigation: SettingsNavigation
+
   @State private var showParamsPopover = false
   @State private var showSystemPopover = false
 
   init(
     viewModel: ChatTranscriptViewModel,
     availableProfiles: [String] = ["chat"],
-    availableModels: [String] = ChatTranscriptViewModel.placeholderModels,
+    modelOptions: [ToolbarModelOptions.Option] = [],
+    currentModelSummary: ToolbarModelOptions.CurrentSummary? = nil,
+    residentModelIDForSelection: String? = nil,
     swapCoordinator: ProfileSwapCoordinator,
     modelLoadCenter: ModelLoadCenter?,
     engineStatus: EngineStatusStore?,
@@ -75,7 +87,9 @@ struct ContentToolbar: View {
   ) {
     self.viewModel = viewModel
     self.availableProfiles = availableProfiles
-    self.availableModels = availableModels
+    self.modelOptions = modelOptions
+    self.currentModelSummary = currentModelSummary
+    self.residentModelIDForSelection = residentModelIDForSelection
     self.swapCoordinator = swapCoordinator
     self.modelLoadCenter = modelLoadCenter
     self.engineStatus = engineStatus
@@ -168,31 +182,78 @@ struct ContentToolbar: View {
 
   private var modelMenu: some View {
     Menu {
-      Button("Use profile default") { viewModel.modelOverride = nil }
-      Divider()
-      ForEach(availableModels, id: \.self) { id in
-        // Stored id is the resolvable `<repo>/<file>` slug; show the
-        // friendly leaf.
-        Button(ModelDisplayName.leaf(id)) {
-          // : route through the confirm gate. Picking a model that
-          // differs from the resident model publishes a swap confirm
-          // (with "Set as default for this profile"); picking the
-          // already-resident model just sets the override, no load.
-          swapCoordinator.requestModelOverride(
-            modelID: id,
-            activeProfileID: viewModel.selectedProfileID
-          ) { viewModel.modelOverride = $0 }
+      ForEach(modelOptions) { option in
+        Button {
+          selectModel(option)
+        } label: {
+          modelOptionLabel(option)
         }
+        .help(option.unavailableReason.map { "\(option.slug) — \($0)" } ?? option.slug)
+        .accessibilityValue(option.unavailableReason.map { "\(option.slug), \($0)" } ?? option.slug)
+        .disabled(!option.isSelectable)
       }
+      if !modelOptions.isEmpty { Divider() }
+      Button {
+        openModelsSettings()
+      } label: {
+        Label("Manage Models…", systemImage: "gearshape")
+      }
+      .help("Open Settings → Models")
+      .accessibilityIdentifier("toolbar.model.manageModels")
     } label: {
       HStack(spacing: 4) {
         Image(systemName: "shippingbox")
-        Text("Model: \(viewModel.modelOverride.map(ModelDisplayName.leaf) ?? "Profile default")")
+        Text("Model: \(modelMenuTitle)")
       }
     }
     .menuStyle(.borderlessButton)
     .fixedSize()
+    .help(modelMenuHelp)
     .accessibilityIdentifier("toolbar.model")
+    .accessibilityLabel("Model")
+    .accessibilityValue(modelMenuAccessibilityValue)
+  }
+
+  @ViewBuilder
+  private func modelOptionLabel(_ option: ToolbarModelOptions.Option) -> some View {
+    let text = modelOptionText(option)
+    if option.isCurrent {
+      Label(text, systemImage: "checkmark")
+    } else if option.unavailableReason != nil {
+      Label(text, systemImage: "exclamationmark.triangle")
+    } else {
+      Text(text)
+    }
+  }
+
+  private func modelOptionText(_ option: ToolbarModelOptions.Option) -> String {
+    var text = option.displayName + (option.isProfileDefault ? " (profile default)" : "")
+    if let reason = option.unavailableReason { text += " — \(reason)" }
+    return text
+  }
+
+  private var modelMenuTitle: String {
+    guard let currentModelSummary else { return "Choose model" }
+    if currentModelSummary.annotation != nil {
+      return "\(currentModelSummary.displayName) (Default)"
+    }
+    return currentModelSummary.displayName
+  }
+
+  private var modelMenuHelp: String {
+    guard let currentModelSummary else { return "Choose a model" }
+    if let annotation = currentModelSummary.annotation {
+      return "\(annotation): \(currentModelSummary.slug)"
+    }
+    return currentModelSummary.slug
+  }
+
+  private var modelMenuAccessibilityValue: String {
+    guard let currentModelSummary else { return "No model selected" }
+    if let annotation = currentModelSummary.annotation {
+      return "\(currentModelSummary.slug), \(annotation)"
+    }
+    return currentModelSummary.slug
   }
 
   // MARK: - swap helpers
@@ -202,6 +263,28 @@ struct ContentToolbar: View {
       toProfileID: id,
       commit: { committed in viewModel.selectedProfileID = committed }
     )
+  }
+
+  private func selectModel(_ option: ToolbarModelOptions.Option) {
+    switch ToolbarModelOptions.selectionAction(for: option,
+                                               residentModelID: residentModelIDForSelection) {
+    case .unavailable:
+      return
+    case .clearOverride:
+      viewModel.modelOverride = nil
+    case let .requestModel(modelID, overrideAfterConfirmation):
+      swapCoordinator.requestModelOverride(
+        modelID: modelID,
+        activeProfileID: viewModel.selectedProfileID
+      ) { _ in
+        viewModel.modelOverride = overrideAfterConfirmation
+      }
+    }
+  }
+
+  private func openModelsSettings() {
+    settingsNavigation.open(.models)
+    openSettings()
   }
 
   /// `Binding<Bool>` derived from the coordinator's optional pending

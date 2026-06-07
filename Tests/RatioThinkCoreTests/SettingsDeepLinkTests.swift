@@ -25,6 +25,16 @@ final class SettingsDeepLinkTests: XCTestCase {
     XCTAssertTrue(SettingsDeepLink.isSettings(URL(string: "ratiothink://Settings")!))
   }
 
+  func test_models_settings_url_selects_models_tab() {
+    let route = SettingsDeepLink.route(for: SettingsDeepLink.modelsSettingsURL)
+    XCTAssertEqual(SettingsDeepLink.modelsSettingsURL.absoluteString, "ratiothink://settings?tab=models")
+    XCTAssertEqual(route, .settings(tab: .models))
+  }
+
+  func test_plain_settings_url_has_no_requested_tab() {
+    XCTAssertEqual(SettingsDeepLink.route(for: SettingsDeepLink.settingsURL), .settings(tab: nil))
+  }
+
   func test_other_scheme_does_not_match() {
     XCTAssertFalse(SettingsDeepLink.isSettings(URL(string: "https://settings")!))
     XCTAssertFalse(SettingsDeepLink.isSettings(URL(string: "ratiothinkx://settings")!))

@@ -27,6 +27,7 @@ struct ChatScaffoldView: View {
   /// #412: background-helper health, forwarded to the toolbar pip's outer ring.
   @EnvironmentObject private var helperHealth: HelperHealthController
   @EnvironmentObject private var profileStore: ProfileStore
+  @EnvironmentObject private var downloadController: ModelDownloadController
   /// The reconciled engine-lifecycle fold, forwarded to the toolbar pip +
   /// popover so they derive the resident/offline distinction from the single
   /// published `indicator`.
@@ -47,6 +48,8 @@ struct ChatScaffoldView: View {
   /// verified empty/not-running/unreachable engine never re-surfaces
   /// placeholder models the engine would reject ( F2).
   @State private var engineModels: ToolbarModelList = .unknown
+  @State private var toolbarDiscoveredModels: [InstalledModel] = []
+  @State private var didScanToolbarModels = false
   /// PR#15 F2/F3: a thrown engine start/stop error (transport failure, a
   /// stop that left the engine running) that the status poll won't
   /// reflect. Surfaced via the in-chat engine-failure banner — NOT the
@@ -208,22 +211,51 @@ struct ChatScaffoldView: View {
       hasDownloadTarget: hasDownloadTarget)
   }
 
-  /// Profile ids offered by the toolbar switcher. Derived live from
-  /// `profileStore` (the source of truth — includes the seeded "Fast
-  /// Think" profile, #426) so every defined profile is selectable in
+  /// Model ids offered by the toolbar switcher. Merges the engine's served
+  /// ids with discovered app/HF-cache files so selectable rows include
+  /// installed and cached models without falling back to stale placeholders.
+  private var toolbarServedModelIDs: [String] {
+    switch engineModels {
+    case .unknown:
+      // First paint/previews keep the injected list only until either the
+      // engine reconcile or the filesystem scan has supplied real choices.
+      return didScanToolbarModels ? [] : availableModels
+    case .known(let ids):
+      return ids
+    }
+  }
+
+  private var toolbarResidentModelIDForDisplay: String? {
+    if case .running = engineStatusStore.status {
+      return modelLoadCenter.residentModelID
+    }
+    return nil
+  }
+
+  private var toolbarCurrentModelSummary: ToolbarModelOptions.CurrentSummary? {
+    ToolbarModelOptions.currentSummary(
+      modelOverride: viewModel.modelOverride,
+      residentModelID: toolbarResidentModelIDForDisplay,
+      profileDefaultModelID: selectedProfileDefault)
+  }
+
+  private var toolbarModelOptions: [ToolbarModelOptions.Option] {
+    ToolbarModelOptions.build(
+      discoveredModels: toolbarDiscoveredModels,
+      servedModelIDs: toolbarServedModelIDs,
+      profileDefaultModelID: selectedProfileDefault,
+      modelOverride: viewModel.modelOverride,
+      residentModelID: toolbarResidentModelIDForDisplay)
+  }
+
   private func scaffold(for chat: Chat) -> some View {
     VStack(spacing: 0) {
       ContentToolbar(
         viewModel: viewModel,
         availableProfiles: pickerProfileIDs,
-        // Reflect the models the engine ACTUALLY serves (from
-        // `/v1/models`) rather than the static placeholder list — pie
-        // serves only its single registered model and rejects a
-        // `/v1/models/load` for anything else with `model_not_found`, so
-        // offering unavailable names guarantees a failed "Switch model"
-        // ( follow-up). Falls back to the injected list only until
-        // the first reconcile lands (previews/tests/first paint).
-        availableModels: engineModels.resolved(fallback: availableModels),
+        modelOptions: toolbarModelOptions,
+        currentModelSummary: toolbarCurrentModelSummary,
+        residentModelIDForSelection: toolbarResidentModelIDForDisplay,
         swapCoordinator: swapCoordinator,
         modelLoadCenter: modelLoadCenter,
         engineStatus: engineStatusStore,
@@ -383,6 +415,9 @@ struct ChatScaffoldView: View {
     .onDisappear {
       sendController.cancel()
     }
+    .task(id: downloadController.completionTick) {
+      await refreshToolbarModelOptions()
+    }
     // Reflect a model the engine already has resident (e.g. after the launch
     // prompt/user-confirm path, explicit Restart, Local API start,
     // post-download startEngine, or crash auto-relaunch) so the composer
@@ -390,6 +425,16 @@ struct ChatScaffoldView: View {
     // engine ( follow-up). Re-runs whenever the engine status flips.
     .task(id: engineStatusStore.status) {
       await reconcileEngineResidentModel()
+    }
+  }
+
+  @MainActor
+  private func refreshToolbarModelOptions() async {
+    let scan = await CachedModelScan.run()
+    toolbarDiscoveredModels = scan.appManaged + scan.huggingFaceCache
+    didScanToolbarModels = true
+    if let appError = scan.appError {
+      NSLog("ChatScaffold: model picker scan warning: \(appError)")
     }
   }
 

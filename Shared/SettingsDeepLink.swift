@@ -4,7 +4,7 @@ import Foundation
 /// (a separate process) ask the running — or launching — Rational.app to
 /// open a specific surface.
 ///
-/// Today the only route is Settings: the menu-bar "Settings…" item opens
+/// Today the primary route is Settings: the menu-bar "Settings…" item opens
 /// `ratiothink://settings`, and the App's `onOpenURL` handler routes it to
 /// the Settings scene instead of merely foregrounding the main window
 /// (the prior behavior, which left the user to find ⌘, themselves).
@@ -28,14 +28,39 @@ public enum SettingsDeepLink {
   /// polling and respawns it on-demand.
   public static let quitHost = "quit"
 
+  public enum Tab: String, Equatable, Sendable {
+    case general
+    case models
+    case profiles
+    case advanced
+  }
+
+  public enum Route: Equatable, Sendable {
+    case settings(tab: Tab?)
+    case quit
+  }
+
   /// `ratiothink://settings` — open straight to the Settings window.
   public static var settingsURL: URL {
     URL(string: "\(scheme)://\(settingsHost)")!
   }
 
+  /// `ratiothink://settings?tab=models` — open Settings with the Models tab selected.
+  public static var modelsSettingsURL: URL {
+    URL(string: "\(scheme)://\(settingsHost)?tab=\(Tab.models.rawValue)")!
+  }
+
   /// `ratiothink://quit` — ask the running App to perform a full-product quit.
   public static var quitURL: URL {
     URL(string: "\(scheme)://\(quitHost)")!
+  }
+
+  public static func route(for url: URL) -> Route? {
+    if isQuit(url) { return .quit }
+    guard isSettings(url) else { return nil }
+    let components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+    let tabValue = components?.queryItems?.first { $0.name.lowercased() == "tab" }?.value?.lowercased()
+    return .settings(tab: tabValue.flatMap(Tab.init(rawValue:)))
   }
 
   /// `true` when `url` is the canonical open-Settings deep link
