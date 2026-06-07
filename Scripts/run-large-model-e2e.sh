@@ -12,8 +12,14 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 DEFAULT_REPO="Qwen/Qwen3-14B-GGUF"
 DEFAULT_FILE="Qwen3-14B-Q4_K_M.gguf"
+DEFAULT_MIN_BYTES="9001752960"
 export PIE_TEST_E2E_REPO="${PIE_TEST_E2E_REPO:-$DEFAULT_REPO}"
 export PIE_TEST_E2E_FILE="${PIE_TEST_E2E_FILE:-$DEFAULT_FILE}"
+if [ -z "${PIE_TEST_E2E_MIN_BYTES:-}" ]; then
+  if [ "$PIE_TEST_E2E_REPO" = "$DEFAULT_REPO" ] && [ "$PIE_TEST_E2E_FILE" = "$DEFAULT_FILE" ]; then
+    export PIE_TEST_E2E_MIN_BYTES="$DEFAULT_MIN_BYTES"
+  fi
+fi
 
 find_worktree_pie() {
   local p
@@ -63,6 +69,9 @@ fi
 
 echo "large-e2e: manual/local large-model real-engine E2E"
 echo "large-e2e: model = $PIE_TEST_E2E_REPO/$PIE_TEST_E2E_FILE"
+if [ -n "${PIE_TEST_E2E_MIN_BYTES:-}" ]; then
+  echo "large-e2e: minimum staged size = $PIE_TEST_E2E_MIN_BYTES bytes"
+fi
 echo "large-e2e: pie engine = $PIE_BIN"
 echo "large-e2e: this may download ~9 GB and is intentionally not part of PR CI"
 
