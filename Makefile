@@ -64,12 +64,12 @@ endef
         test-unit test-scenario test-smoke test-curated-hf test-install-guards test-readme-harness test-e2e-http \
         test-gui-script test-gui-history test-gui-first-launch-package test-gui test-ssh test-all \
         test-gui-shell test-gui-first-launch test-gui-helper test-gui-chat \
-        test-e2e-engine test-e2e-large-model test-e2e-models test-e2e-load test-e2e-396 test-e2e-chat test-e2e-tot test-e2e-full test-helper-respawn test-helper-recovery test-quit-structured \
+        test-e2e-engine test-e2e-large-model test-e2e-models test-e2e-load test-e2e-396 test-e2e-chat test-e2e-tot test-e2e-tot-batched bench-tot test-e2e-full test-helper-respawn test-helper-recovery test-quit-structured \
         test-real-pie-driver-contract test-sanitizer-canary test-gmake-recipe-canary \
         engine-build engine-clean engine-bundle dmg-arm64 dmg-x86_64 \
         release-dmg-arm64 release-dmg-x86_64 release-preflight test-release \
         build-inferlets stamp-inferlets verify-inferlets verify-inferlets-inputs \
-        test-stamp test-inferlets
+        test-stamp test-inferlets test-inferlets-gated
 
 help: ## Show available targets
 	@awk 'BEGIN {FS = ":.*##"} /^[a-zA-Z0-9_-]+:.*##/ {printf "  %-18s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -240,8 +240,11 @@ verify-inferlets-inputs: ## Verify only the input-side stamp fields (post-build 
 test-stamp: ## Unit tests for Inferlets/chat-apc/_stamp.py (review v1 follow-ups)
 	python3 Inferlets/chat-apc/_stamp_test.py
 
-test-inferlets: ## Run chat-apc Rust unit tests (native cargo test --lib)
+test-inferlets: ## Run chat-apc Rust unit tests (native cargo test --lib; production gate)
 	cd Inferlets/chat-apc && cargo test --lib
+
+test-inferlets-gated: ## chat-apc Rust unit tests with the #458 exec-strategies feature (gated path)
+	cd Inferlets/chat-apc && cargo test --lib --features exec-strategies
 
 test-unit: $(LOGDIR) ## Unit tests (XCTest) via xcrun swift test
 	@set +e +o pipefail; \
@@ -496,6 +499,12 @@ test-e2e-chat: ## E2E area: real small-model chat send streams + persists (S258,
 
 test-e2e-tot: ## E2E area: real-engine tree-of-thought APP path completes (#413 stall guard; depth>1, real Qwen3-0.6B-GGUF)
 	Scripts/run-tot-e2e.sh
+
+test-e2e-tot-batched: ## E2E area: real-engine BATCHED ToT (exec=phased_concurrent) tree shape/status (#458; real Qwen3-0.6B-GGUF)
+	Scripts/run-tot-batched-e2e.sh
+
+bench-tot: ## Benchmark: ToT batched-vs-sequential strategies on real portable Metal — wall-clock + tok/s (#458)
+	Scripts/run-tot-bench.sh
 
 test-e2e-full: ## E2E area: 3-layer real-model proof — GUI download → engine boot → chat persist (S204)
 	Scripts/run-full-e2e.sh
