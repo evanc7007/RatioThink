@@ -303,6 +303,16 @@ private struct ComposerTextEditor: NSViewRepresentable {
     }
 
     let custom = SubmitNSTextView(frame: frame, textContainer: container)
+    // `init(frame:textContainer:)` does NOT replicate the geometry contract
+    // that `NSTextView.scrollableTextView()` applies to its own documentView:
+    // it leaves `isVerticallyResizable == false` and clamps `min/maxSize` to
+    // the seed frame height (measured ~14pt, whatever scrollableTextView()
+    // vends). Frozen below the ~16pt line height, the
+    // bottom of every line — descenders (q/g/p/y/j) and underline/marked
+    // decorations — is clipped (#463). Restore the resizable contract so the
+    // view grows to the full laid-out line height. (#446 auto-grow is the
+    // SwiftUI frame envelope; this is the AppKit-side per-line layout.)
+    applyResizableTextViewGeometry(to: custom)
     custom.delegate = coordinator
     custom.isEditable = true
     custom.isRichText = false
@@ -375,7 +385,24 @@ private struct ComposerTextEditor: NSViewRepresentable {
   }
 }
 
-private final class SubmitNSTextView: NSTextView {
+/// Reapplies the vertically-resizable geometry that
+/// `NSTextView.scrollableTextView()` gives its documentView but
+/// `init(frame:textContainer:)` drops. Without it the text view is frozen at
+/// its seed-frame height (measured ~14pt, whatever scrollableTextView()
+/// vends) — shorter than the line height — so the bottom of each line
+/// (descenders + underlines) is clipped (#463). Internal so the
+/// descender-clip regression can be unit-tested.
+func applyResizableTextViewGeometry(to textView: NSTextView) {
+  textView.isVerticallyResizable = true
+  textView.isHorizontallyResizable = false
+  textView.minSize = NSSize(width: 0, height: 0)
+  textView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude,
+                            height: CGFloat.greatestFiniteMagnitude)
+}
+
+/// Internal (not `private`) so the #463 descender-clip regression test can
+/// install one as the scroll view's documentView and exercise the real seam.
+final class SubmitNSTextView: NSTextView {
   var onSubmit: (() -> Void)?
 
   override func keyDown(with event: NSEvent) {
