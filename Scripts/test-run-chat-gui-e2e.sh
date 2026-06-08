@@ -94,9 +94,9 @@ test_missing_gguf_fixture_is_not_accepted() {
   trap 'rm -rf "$tmp"' RETURN
 
   # Fake a seated session and a runnable pie so the flow reaches the GGUF
-  # fixture gate. Stage only a *bare* GGUF hub dir — the partial/aborted-
-  # download shape that must not be accepted as a resolved fixture — and
-  # assert the wrapper fails loudly before starting Xcode/engine work.
+  # fixture gate, then stage only a *bare* hub dir — the partial/aborted-download
+  # shape that must not be accepted as a usable model. With autoprep off the
+  # gate must report the missing GGUF fixture and exit, not proceed.
   mkdir -p "$tmp/bin" "$tmp/hf/hub/models--Qwen--Qwen3-0.6B-GGUF"
   cat >"$tmp/bin/pgrep" <<'FAKE_PGREP'
 #!/bin/bash
@@ -127,7 +127,7 @@ FAKE_PGREP
     printf '%s\n' "$output" >&2
     exit 1
   fi
-  require_contains "$output" "model fixture NOT staged"
+  require_contains "$output" "stage-test-model: model fixture NOT staged"
   require_contains "$output" "GGUF fixture unavailable"
   if [[ "$output" == *"starting portable GGUF engine harness"* ]]; then
     echo "FAIL: bare GGUF cache wrongly accepted as a staged fixture — engine harness started" >&2
