@@ -65,14 +65,17 @@ final class EngineStatusStoreTests: XCTestCase {
     // #326: capture startEngine calls + let tests inject a result.
     private(set) var startCalls = 0
     private(set) var lastStartProfileID: String?
+    // #459: capture the explicit per-start model override threaded through.
+    private(set) var lastStartModelOverride: String?
     private var startResult: Result<Void, Error> = .success(())
     func setStartResult(_ result: Result<Void, Error>) {
       lock.withLock { startResult = result }
     }
-    func startEngine(profileID: String) async throws {
+    func startEngine(profileID: String, modelOverride: String?) async throws {
       let result: Result<Void, Error> = lock.withLock {
         startCalls += 1
         lastStartProfileID = profileID
+        lastStartModelOverride = modelOverride
         return startResult
       }
       try result.get()
@@ -128,6 +131,21 @@ final class EngineStatusStoreTests: XCTestCase {
     XCTAssertEqual(client.startCalls, 1,
                    "startEngine must forward to the helper XPC client")
     XCTAssertEqual(client.lastStartProfileID, "chat")
+    XCTAssertNil(client.lastStartModelOverride,
+                 "no override given → nil so the helper boots the profile default")
+  }
+
+  /// #459 repro 1: the explicit toolbar / model-list pick must reach the
+  /// helper as `modelOverride` so a no-default profile boots the chosen
+  /// model instead of failing with `has no default model`.
+  func test_startEngine_forwards_explicit_modelOverride() async throws {
+    let client = StubXPCClient()
+    let store = EngineStatusStore(client: client)
+    try await store.startEngine(profileID: "tree-of-thought",
+                                modelOverride: "Org/New-GGUF/new.gguf")
+    XCTAssertEqual(client.lastStartProfileID, "tree-of-thought")
+    XCTAssertEqual(client.lastStartModelOverride, "Org/New-GGUF/new.gguf",
+                   "the explicit pick must be threaded through to the helper start call")
   }
 
   func test_startEngine_propagates_real_failure() async {
@@ -305,6 +323,43 @@ final class EngineStatusStoreTests: XCTestCase {
                      "the helper-side restart selector owns real helper state")
       XCTAssertEqual(client.startCalls, 0,
                      "generic start would swallow .alreadyRunning and silently skip the rebuild")
+    } catch {
+      XCTFail("unexpected: \(error)")
+    }
+  }
+
+  /// #459 repro 2: a rebuild whose cold boot outlasts the App reply window
+  /// is in flight, not a failed reload. `restartEngine` must swallow
+  /// `.replyTimeout` so a slow large-model reload is never reported to the
+  /// caller (ProfileEditor) as a reload failure; the status poll surfaces the
+  /// real outcome.
+  func test_restartEngine_swallows_reply_timeout_as_in_flight() async throws {
+    let client = StubXPCClient()
+    client.setRestartResult(.failure(
+      AppXPCClientError.replyTimeout(selector: "restartEngine", timeout: 85.0)))
+    let store = EngineStatusStore(
+      client: client,
+      initialStatus: .running(port: 51234, profileID: "chat")
+    )
+    try await store.restartEngine(profileID: "chat")  // must NOT throw
+    XCTAssertEqual(client.restartCalls, 1)
+  }
+
+  /// A real helper `EngineError` (resolver rejected, modelMissing, …) still
+  /// propagates so ProfileEditor can surface the reason in its banner.
+  func test_restartEngine_propagates_real_failure() async {
+    let client = StubXPCClient()
+    client.setRestartResult(.failure(
+      EngineError(code: .modelMissing, message: "still missing")))
+    let store = EngineStatusStore(
+      client: client,
+      initialStatus: .running(port: 51234, profileID: "chat")
+    )
+    do {
+      try await store.restartEngine(profileID: "chat")
+      XCTFail("a real restart failure must throw so the UI can surface the reason")
+    } catch let e as EngineError {
+      XCTAssertEqual(e.code, .modelMissing)
     } catch {
       XCTFail("unexpected: \(error)")
     }

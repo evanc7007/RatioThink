@@ -231,7 +231,22 @@ public final class EngineStatusStore: ObservableObject {
   /// profile; any `.alreadyRunning` that escapes that contract is a
   /// failed rebuild and must surface to the caller.
   public func restartEngine(profileID: String) async throws {
-    try await client.restartEngine(profileID: profileID)
+    do {
+      try await client.restartEngine(profileID: profileID)
+    } catch let error as AppXPCClientError {
+      // The helper only replies after the rebuild's cold-boot handshake.
+      // A boot slower than the App reply window is NOT a reload failure —
+      // the restart is in flight and the status poll surfaces the real
+      // `.running`/`.failed` outcome (#459 repro 2). Mirror `startEngine`'s
+      // in-flight swallow so a slow large-model reload is never reported to
+      // the caller as a failed reload. A real helper `EngineError`
+      // (resolver rejected, modelMissing, …) still propagates.
+      if case .replyTimeout = error {
+        Self.log.notice("restartEngine(profileID=\(profileID, privacy: .public)) reply timed out — rebuild in flight; status poll will surface the outcome")
+        return
+      }
+      throw error
+    }
   }
 
   /// Test seam: invoked with the human-readable cause whenever a
@@ -311,9 +326,14 @@ public final class EngineStatusStore: ObservableObject {
   /// is in flight — so `.replyTimeout` is swallowed. A real helper
   /// `EngineError` (resolver rejected, still `.modelMissing`, etc.)
   /// propagates so the UI can surface the reason.
-  public func startEngine(profileID: String) async throws {
+  ///
+  /// `modelOverride` is the explicit per-start model selection (chat
+  /// toolbar / model-list pick). Non-nil boots that model regardless of the
+  /// profile's persisted default, so a no-default profile starts cleanly
+  /// from an explicit pick (#459 repro 1).
+  public func startEngine(profileID: String, modelOverride: String? = nil) async throws {
     do {
-      try await client.startEngine(profileID: profileID)
+      try await client.startEngine(profileID: profileID, modelOverride: modelOverride)
     } catch let error as AppXPCClientError {
       if case .replyTimeout = error {
         Self.log.notice("startEngine(profileID=\(profileID, privacy: .public)) reply timed out — start in flight; status poll will surface the outcome")

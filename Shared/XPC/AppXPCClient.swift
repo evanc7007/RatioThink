@@ -41,7 +41,13 @@ public protocol AppXPCClient: Sendable {
   /// when the start is rejected (e.g. `.modelMissing`, `.profileMissing`),
   /// or an `AppXPCClientError` on transport failure. Driven by #326's
   /// fresh-install auto-start.
-  func startEngine(profileID: String) async throws
+  ///
+  /// `modelOverride` is the explicit per-start model selection (the chat
+  /// toolbar / model-list pick). Non-nil boots that model, overriding the
+  /// profile default so a no-default profile starts cleanly from an explicit
+  /// pick (#459 repro 1); `nil` boots the profile default. Callers with no
+  /// override use the `startEngine(profileID:)` convenience below.
+  func startEngine(profileID: String, modelOverride: String?) async throws
   /// Strict restart for active-profile default-model changes. Unlike
   /// `startEngine(profileID:)`, `.alreadyRunning` is a failure signal:
   /// the helper did not complete a stop→start registry rebuild.
@@ -57,6 +63,13 @@ public protocol AppXPCClient: Sendable {
 }
 
 public extension AppXPCClient {
+  /// Convenience for the common no-override start (boot the profile
+  /// default). Keeps existing call sites unchanged after `startEngine`
+  /// gained the `modelOverride` parameter (#459).
+  func startEngine(profileID: String) async throws {
+    try await startEngine(profileID: profileID, modelOverride: nil)
+  }
+
   /// Default: memory unavailable. Test stubs that don't model the
   /// engineMemory selector inherit nil and need no change.
   func engineMemory() async throws -> EngineMemorySample? { nil }
@@ -70,8 +83,19 @@ public extension AppXPCClient {
 public enum HelperProtocolCompatibility {
   /// Version 1: pre-capability helpers. Version 2: helper exports the
   /// strict `restartEngine(profileID:)` selector required by active
-  /// default-model changes.
-  public static let currentVersion = 2
+  /// default-model changes. Version 3: helper exports
+  /// `startEngine(profileID:modelOverride:)` (#459) — the App now invokes
+  /// the new `startEngineWithProfileID:modelOverride:reply:` selector for
+  /// every engine start, so a stale v2 helper (which only exports the old
+  /// `startEngineWithProfileID:reply:`) must be unregistered+reregistered by
+  /// the `>= currentVersion` repair gate before any start path runs;
+  /// otherwise the call dies into `.replyTimeout` (swallowed as
+  /// "start in flight") and the engine silently never boots.
+  ///
+  /// BUMP THIS whenever a new REQUIRED selector is added to `PieHelperXPC`,
+  /// or an in-place upgrade leaves a running old helper that passes the
+  /// reachability gate yet cannot service the new call.
+  public static let currentVersion = 3
 
   public static func isCompatible(client: any AppXPCClient) async -> Bool {
     do {
@@ -129,9 +153,28 @@ public final class HelperXPCClient: AppXPCClient, @unchecked Sendable {
   private let connectionLock = OSAllocatedUnfairLock<NSXPCConnection?>(initialState: nil)
   private static let log = Logger(subsystem: "com.ratiothink.app", category: "xpc.client")
 
+  // Restart = the helper's SERIAL stop phase + a full cold-boot start phase
+  // (HelperExportedAPI.restartEngine). Derive the App wait from those helper
+  // deadlines so it always dominates the serial budget and cannot drift when
+  // either deadline changes (#459 review F2): a hand-picked margin
+  // (coldStart + 30 = 150s) was 2s SHORT of the worst case
+  // (stopReplyDeadline 17 + startReplyDeadline 135 = 152s), violating the
+  // PR's own "App reply deadline sits strictly above the engine lease"
+  // invariant. `EngineStatusStore.restartEngine` also treats `.replyTimeout`
+  // as "in flight" so an even slower boot degrades to the status poll rather
+  // than a false reload failure.
+  /// App-side restart wait, derived from the helper's serial stop+start
+  /// deadlines plus slack so it always dominates the helper's worst-case
+  /// reply (#459 review F2). Named so the timeout-ladder test asserts the
+  /// real value the init uses.
+  public static let defaultRestartReplyTimeout: TimeInterval =
+    HelperExportedAPI.startReplyDeadline
+    + HelperExportedAPI.stopReplyDeadline
+    + HelperExportedAPI.replyTimeoutSlack
+
   public init(endpoint: Endpoint,
               replyTimeout: TimeInterval = 2.0,
-              restartReplyTimeout: TimeInterval = 85.0) {
+              restartReplyTimeout: TimeInterval = HelperXPCClient.defaultRestartReplyTimeout) {
     self.endpoint = endpoint
     self.interface = PieHelperXPCInterface.make()
     self.replyTimeout = replyTimeout
@@ -443,10 +486,10 @@ public final class HelperXPCClient: AppXPCClient, @unchecked Sendable {
     }
   }
 
-  public func startEngine(profileID: String) async throws {
+  public func startEngine(profileID: String, modelOverride: String?) async throws {
     let connection = ensureConnection()
     do {
-      try await startEngine(profileID: profileID, on: connection)
+      try await startEngine(profileID: profileID, modelOverride: modelOverride, on: connection)
     } catch let error as AppXPCClientError {
       if case .replyTimeout = error {
         invalidateIfCurrent(connection)
@@ -455,7 +498,9 @@ public final class HelperXPCClient: AppXPCClient, @unchecked Sendable {
     }
   }
 
-  private func startEngine(profileID: String, on connection: NSXPCConnection) async throws {
+  private func startEngine(profileID: String,
+                           modelOverride: String?,
+                           on connection: NSXPCConnection) async throws {
     let timeout = replyTimeout
     try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
       let resumed = OSAllocatedUnfairLock<Bool>(initialState: false)
@@ -486,7 +531,7 @@ public final class HelperXPCClient: AppXPCClient, @unchecked Sendable {
         resumeOnce(.failure(AppXPCClientError.proxyTypeMismatch))
         return
       }
-      api.startEngine(profileID: profileID) { successData, errorData in
+      api.startEngine(profileID: profileID, modelOverride: modelOverride) { successData, errorData in
         // Contract (PieHelperXPC): exactly one of (successData=EnginePort,
         // errorData=EngineError) is non-nil. We discard the port — the
         // caller relies on the engine-status poll for the live `.running`

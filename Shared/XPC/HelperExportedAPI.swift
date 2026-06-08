@@ -33,7 +33,13 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
   /// `PieSupervisor.LaunchSpec` (whose argv + handshake parser no
   /// longer match the `pie` binary). `LaunchSpecResolver
   /// .asClosure` is the canonical adapter.
-  public typealias LaunchSpecResolver = (String) -> Result<PieControlLauncher.LaunchSpec, EngineError>
+  ///
+  /// Second argument is the optional per-start `explicitModel` (#459 repro
+  /// 1) — the chat toolbar / model-list selection that overrides the
+  /// profile's persisted default for this boot. `nil` uses the profile
+  /// default. `startEngine` threads it; `restartEngine` passes `nil` (its
+  /// route always boots the freshly-saved profile default).
+  public typealias LaunchSpecResolver = (String, String?) -> Result<PieControlLauncher.LaunchSpec, EngineError>
 
   /// Pre-encoded `EngineStatus.stopped` reply. Encoded at type
   /// initialization so `engineStatus`'s success path is provably
@@ -296,19 +302,31 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
   /// the XPC reply-timeout fallback (review v1 F4) fires. Covers
   /// the gap between deadline arrival on the host's state queue
   /// and the observer hopping over to reply.
-  static let replyTimeoutSlack: TimeInterval = 2
+  ///
+  /// Public so `AppXPCClient.restartReplyTimeout` derives its budget from
+  /// these helper deadlines rather than a hand-picked margin (#459 review
+  /// F2) — the App restart wait must always dominate the helper's serial
+  /// stop+start budget.
+  public static let replyTimeoutSlack: TimeInterval = 2
 
-  /// PieControlLauncher's `handshakeTimeout` + WS install upper bound.
-  /// `LaunchSpec.handshakeTimeout` defaults to 30s; the WS
-  /// `installProgram` + `launchDaemon` rounds add at most a few
-  /// seconds on cold boot. 60s + slack is the safety net for the
-  /// XPC reply — the host itself will surface a real failure long
-  /// before this fires.
-  private static let startReplyDeadline: TimeInterval = 60
+  /// XPC reply safety net for start / restart. Must sit ABOVE the engine's
+  /// own process-lifetime lease (`LaunchSpec.handshakeTimeout` +
+  /// `PieEngineHost.launchTimeoutSlack`) so this fallback never reports a
+  /// premature `handshakeTimeout` for an engine that is still legitimately
+  /// cold-booting a large model (#459). The production resolver sets the boot
+  /// handshake to `PieControlLauncher.coldStartHandshakeTimeout` (120s); 15s
+  /// of headroom covers the host slack + WS `installProgram`/`launchDaemon`
+  /// rounds. The host surfaces a real `.failed` (or `.running`) via the
+  /// observer long before this fires; tests inject a short
+  /// `replyTimeoutOverride`. Public so the App-side restart wait derives
+  /// from it (#459 review F2).
+  public static let startReplyDeadline: TimeInterval =
+    PieControlLauncher.coldStartHandshakeTimeout + 15
 
   /// `LaunchedSession.shutdown` budget: SIGINT(10s) → SIGKILL(5s) =
-  /// 15s in the worst case. Add slack.
-  static let stopReplyDeadline: TimeInterval = 17
+  /// 15s in the worst case. Add slack. Public so the App-side restart wait
+  /// derives from it (#459 review F2).
+  public static let stopReplyDeadline: TimeInterval = 17
 
   /// Spawns the engine for `profileID` via `PieEngineHost`. Returns
   /// `.profileMissing` when the resolver is unwired and
@@ -327,6 +345,7 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
   /// is self-cancelling via the token argument from
   /// `PieEngineHost.observe` (review v1 F3) — no tokenBox race.
   public func startEngine(profileID: String,
+                          modelOverride: String?,
                           reply: @escaping (Data?, Data?) -> Void) {
     guard let engineHost else {
       Self.log.error("startEngine: no engineHost wired (early boot or unit test)")
@@ -334,6 +353,7 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
       return
     }
     guard let spec = resolveLaunchSpec(profileID: profileID,
+                                       explicitModel: modelOverride,
                                        engineHost: engineHost,
                                        operation: "startEngine",
                                        reply: reply) else {
@@ -445,6 +465,7 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
 
   private func resolveLaunchSpec(
     profileID: String,
+    explicitModel: String? = nil,
     engineHost: PieEngineHost,
     operation: String,
     reply: @escaping (Data?, Data?) -> Void
@@ -458,7 +479,7 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
       )
       return nil
     }
-    switch launchSpecResolver(profileID) {
+    switch launchSpecResolver(profileID, explicitModel) {
     case .success(let spec):
       return spec
     case .failure(let err):
@@ -947,6 +968,7 @@ public final class DegradedHelperAPI: NSObject, PieHelperXPC {
   }
 
   public func startEngine(profileID: String,
+                          modelOverride: String?,
                           reply: @escaping (Data?, Data?) -> Void) {
     Self.log.error("startEngine refused in degraded mode (profileID=\(profileID, privacy: .public))")
     reply(nil, degradedErrorData)
