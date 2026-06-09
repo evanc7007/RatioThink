@@ -22,10 +22,8 @@ final class XPCProtocolTests: XCTestCase {
       "helperProtocolVersionWithReply:",
       "engineStatusWithReply:",
       "startEngineWithProfileID:modelOverride:reply:",
-      "restartEngineWithProfileID:reply:",
+      "restartEngineWithProfileID:modelOverride:reply:",
       "stopEngineWithReply:",
-      "loadModelWithModelID:reply:",
-      "cancelLoadWithHandle:reply:",
       "downloadModelWithRepo:file:reply:",
       "cancelDownloadWithHandle:reply:",
       "listProfilesWithReply:",
@@ -132,11 +130,6 @@ final class XPCProtocolTests: XCTestCase {
   func test_downloadHandle_roundtrip() throws {
     let h = DownloadHandle(repo: "bartowski/Llama-3.2-3B-Instruct-GGUF",
                            file: "Q4_K_M.gguf")
-    assertRoundTrip(h)
-  }
-
-  func test_loadHandle_roundtrip() throws {
-    let h = LoadHandle(modelID: "bartowski/Llama-3.2-3B-Instruct-GGUF:Q4_K_M.gguf")
     assertRoundTrip(h)
   }
 
@@ -278,7 +271,7 @@ final class XPCProtocolTests: XCTestCase {
     }
   }
 
-  // MARK: - Optional-error reply convention (cancelLoad/cancelDownload/reloadProfiles)
+  // MARK: - Optional-error reply convention (cancelDownload/reloadProfiles)
 
   func test_decodeOptionalError_nil_returns_nil() throws {
     XCTAssertNil(try PieHelperXPCWire.decodeOptionalError(nil))
@@ -544,15 +537,16 @@ final class XPCProtocolTests: XCTestCase {
     func engineStatus() async throws -> EngineStatus { .stopped }
     func stopEngine() async throws {}
     func startEngine(profileID: String, modelOverride: String?) async throws {}
-    func restartEngine(profileID: String) async throws {}
+    func restartEngine(profileID: String, modelOverride: String?) async throws {}
   }
 
   func test_currentVersion_bumped_for_modelOverride_selector() {
     // The protocol exports `startEngineWithProfileID:modelOverride:reply:`
-    // (asserted in the selector list above) and the App requires it for every
-    // start. Pin the version so a future required-selector addition fails
-    // here until `currentVersion` is bumped.
-    XCTAssertEqual(HelperProtocolCompatibility.currentVersion, 3,
+    // (#459) and `restartEngineWithProfileID:modelOverride:reply:` (#469) —
+    // both asserted in the selector list above — and the App requires them
+    // for every start / model-switch restart. Pin the version so a future
+    // required-selector addition fails here until `currentVersion` is bumped.
+    XCTAssertEqual(HelperProtocolCompatibility.currentVersion, 4,
                    "bump currentVersion whenever a new REQUIRED PieHelperXPC selector is added")
   }
 

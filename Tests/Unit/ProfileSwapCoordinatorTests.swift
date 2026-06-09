@@ -45,38 +45,26 @@ final class ProfileSwapCoordinatorTests: XCTestCase {
 
   private struct StubWriteError: Error {}
 
-  /// `MockEngineClient` whose `sleep` seam is a no-op (see prior note):
-  /// removes the cooperative hops that would race the consumer's
-  /// @MainActor for-await against the producer in tests.
-  private func makeFastEngine() -> MockEngineClient {
-    MockEngineClient(
-      config: .init(
-        loadStepInterval: .milliseconds(0),
-        chatStepInterval: .milliseconds(0),
-        loadSteps: 1,
-        totalBytes: 100
-      ),
-      sleep: { _ in }
-    )
-  }
-
   private func makeCoordinator(
     map: [String: String?],
     resident: String? = nil,
     setDefaultModelError: Error? = nil
   ) -> (ProfileSwapCoordinator, ModelLoadCenter, DefaultWriteSpy) {
     let center = ModelLoadCenter(initialResident: resident)
-    let engine = makeFastEngine()
     let spy = DefaultWriteSpy()
     spy.errorToThrow = setDefaultModelError
     let coord = ProfileSwapCoordinator(
       center: center,
-      engine: engine,
       modelForProfile: { map[$0] ?? nil },
       setDefaultModel: { profileID, model in
         spy.writes.append((profileID: profileID, model: model))
         if let error = spy.errorToThrow { throw error }
-      }
+      },
+      // #469: a confirmed pick routes through the engine (re)launch executor.
+      // Simulate the engine coming up serving the picked model by reconciling
+      // residency, so `center.residentModelID` reflects the load the way the
+      // production status-aware executor does.
+      serveModel: { modelID, _ in center.reconcileEngineResident(modelID) }
     )
     return (coord, center, spy)
   }
@@ -118,7 +106,8 @@ final class ProfileSwapCoordinatorTests: XCTestCase {
     XCTAssertEqual(spy.pinnedModel, "m1",
                    "no-default swap must PIN the current model so it survives the switch")
     XCTAssertNil(coord.pending)
-    XCTAssertEqual(center.state, .ready(modelID: "m1"),
+    // #469: merged ModelLoadCenter is residency-only (no `.state`).
+    XCTAssertEqual(center.residentModelID, "m1",
                    "no-default swap: pin only, no load fires — current model stays put")
   }
 
@@ -144,7 +133,7 @@ final class ProfileSwapCoordinatorTests: XCTestCase {
     XCTAssertEqual(spy.swappedProfile, "next")
     XCTAssertNil(spy.pinnedModel)
     XCTAssertNil(coord.pending)
-    XCTAssertEqual(center.state, .ready(modelID: "m1"), "same model: load must not fire")
+    XCTAssertEqual(center.residentModelID, "m1", "same model: load must not fire")
   }
 
   ///  inferlet-only invariant: a profile whose default equals the current
@@ -154,7 +143,7 @@ final class ProfileSwapCoordinatorTests: XCTestCase {
     let (coord, center, _) = makeCoordinator(map: ["docs": "m1"], resident: "m1")
     coord.requestSwap(toProfileID: "docs", fromModel: "m1") { _, _ in true }
     XCTAssertNil(coord.pending, "an inferlet-only change (same model) must not raise the confirm")
-    XCTAssertEqual(center.state, .ready(modelID: "m1"), "an inferlet-only change must not load")
+    XCTAssertEqual(center.residentModelID, "m1", "an inferlet-only change must not load")
   }
 
   func test_no_current_model_commits_silently_no_popover() {
@@ -166,7 +155,8 @@ final class ProfileSwapCoordinatorTests: XCTestCase {
     XCTAssertEqual(spy.swappedProfile, "next")
     XCTAssertNil(spy.pinnedModel)
     XCTAssertNil(coord.pending, "no current model → silent swap, no confirm popover")
-    XCTAssertEqual(center.state, .idle, "no current model: no load fires")
+    // #469: residency-only center (no `.state`/`.idle`); nothing resident.
+    XCTAssertNil(center.residentModelID, "no current model: no load fires")
   }
 
   // MARK: - AC2: different-target-default swap PROMPTS
@@ -209,10 +199,9 @@ final class ProfileSwapCoordinatorTests: XCTestCase {
     XCTAssertNil(coord.pending)
 
     await waitUntil(timeout: 2.0) {
-      if case .ready = center.state { return true }
-      return false
+      return center.residentModelID == "m2"
     }
-    XCTAssertEqual(center.state, .ready(modelID: "m2"))
+    XCTAssertEqual(center.residentModelID, "m2")
     XCTAssertEqual(center.residentModelID, "m2")
   }
 
@@ -225,7 +214,8 @@ final class ProfileSwapCoordinatorTests: XCTestCase {
     cancelCurrent(coord)
     XCTAssertNil(coord.pending)
     XCTAssertEqual(spy.swapCommitCount, 0, "decline must not commit the swap")
-    XCTAssertEqual(center.state, .ready(modelID: "m1"), "decline keeps the current model — no load")
+    // #469: merged ModelLoadCenter is residency-only (no `.state`).
+    XCTAssertEqual(center.residentModelID, "m1", "decline keeps the current model — no load")
   }
 
   // MARK: - review F2: a failed commit (pin save) must skip the load
@@ -243,12 +233,14 @@ final class ProfileSwapCoordinatorTests: XCTestCase {
     XCTAssertEqual(spy.swapCommitCount, 1, "the commit IS invoked on confirm")
     XCTAssertNil(coord.pending)
     // Give any (erroneously) started load a chance to surface, then assert
-    // the resident model never changed and the center is not mid-load.
+    // the resident model never changed. #469: a failed commit skips the
+    // `serveModel` call, so the residency-only center is the single observable
+    // — there is no separate `isLoading`/`.state`. The makeCoordinator's
+    // `serveModel` reconciles residency to the picked model, so residency
+    // staying at "m1" proves no load fired.
     try? await Task.sleep(nanoseconds: 50_000_000)
-    XCTAssertFalse(center.isLoading, "a failed commit must not start a load")
-    XCTAssertEqual(center.state, .ready(modelID: "m1"),
-                   "a failed commit leaves the prior resident model untouched")
-    XCTAssertEqual(center.residentModelID, "m1")
+    XCTAssertEqual(center.residentModelID, "m1",
+                   "a failed commit must not start a load — prior resident untouched")
   }
 
   func test_confirm_with_succeeding_commit_loads() async throws {
@@ -258,9 +250,10 @@ final class ProfileSwapCoordinatorTests: XCTestCase {
     spy.commitResult = true
     coord.requestSwap(toProfileID: "next", fromModel: "m1", commit: swapCommit(spy))
     confirmCurrent(coord)
+    // #469: the merged `serveModel` reconciles residency to the picked model,
+    // so a succeeding commit lands as `residentModelID == "m2"` (no `.state`).
     await waitUntil(timeout: 2.0) {
-      if case .ready = center.state { return true }
-      return false
+      center.residentModelID == "m2"
     }
     XCTAssertEqual(center.residentModelID, "m2", "a succeeding commit loads the new model")
   }
@@ -284,7 +277,8 @@ final class ProfileSwapCoordinatorTests: XCTestCase {
     coord.requestModelOverride(modelID: "m1", activeProfileID: "chat", fromModel: "m1") { committed = $0; return true }
     XCTAssertEqual(committed, "m1", "picking the already-selected model just pins it")
     XCTAssertNil(coord.pending)
-    XCTAssertEqual(center.state, .ready(modelID: "m1"), "no reload for the already-selected model")
+    // #469: merged ModelLoadCenter is residency-only (no `.state`).
+    XCTAssertEqual(center.residentModelID, "m1", "no reload for the already-selected model")
   }
 
   func test_confirm_override_with_set_as_default_persists_model_onto_profile() async throws {
@@ -298,8 +292,7 @@ final class ProfileSwapCoordinatorTests: XCTestCase {
     XCTAssertEqual(spy.writes.first?.profileID, "chat")
     XCTAssertEqual(spy.writes.first?.model, "m2")
     await waitUntil(timeout: 2.0) {
-      if case .ready = center.state { return true }
-      return false
+      return center.residentModelID == "m2"
     }
     XCTAssertEqual(center.residentModelID, "m2", "confirm always loads the chosen model")
   }
@@ -311,8 +304,7 @@ final class ProfileSwapCoordinatorTests: XCTestCase {
 
     XCTAssertTrue(spy.writes.isEmpty, "unchecked 'set as default' must not persist a profile default")
     await waitUntil(timeout: 2.0) {
-      if case .ready = center.state { return true }
-      return false
+      return center.residentModelID == "m2"
     }
     XCTAssertEqual(center.residentModelID, "m2", "the load still happens even without set-as-default")
   }
@@ -326,8 +318,7 @@ final class ProfileSwapCoordinatorTests: XCTestCase {
     XCTAssertNotNil(coord.defaultModelWriteError,
                     "a failed set-as-default write must be surfaced, not swallowed (review F2)")
     await waitUntil(timeout: 2.0) {
-      if case .ready = center.state { return true }
-      return false
+      return center.residentModelID == "m2"
     }
     XCTAssertEqual(center.residentModelID, "m2",
                    "the chosen model still loads even when the default-persist failed")
@@ -342,7 +333,7 @@ final class ProfileSwapCoordinatorTests: XCTestCase {
 
     // loadDirect (user picks a model) must clear the stale error even on
     // the already-resident short-circuit (review F2 — no lingering red).
-    coord.loadDirect(modelID: "m1")
+    coord.loadDirect(modelID: "m1", profileID: "chat")
     XCTAssertNil(coord.defaultModelWriteError,
                  "a stale set-as-default error must not persist after the user moves on")
   }
@@ -511,19 +502,18 @@ final class ProfileSwapCoordinatorTests: XCTestCase {
 
   func test_loadDirect_short_circuits_when_model_already_resident() {
     let (coord, center, _) = makeCoordinator(map: [:], resident: "m1")
-    let stateBefore = center.state
-    coord.loadDirect(modelID: "m1")
-    XCTAssertEqual(center.state, stateBefore, "loadDirect on resident model must be a no-op — no flash")
+    coord.loadDirect(modelID: "m1", profileID: "chat")
+    XCTAssertEqual(center.residentModelID, "m1",
+                   "loadDirect on the resident model must be a no-op — resident unchanged")
   }
 
   func test_loadDirect_fires_load_when_model_differs() async throws {
     let (coord, center, _) = makeCoordinator(map: [:], resident: "m1")
-    coord.loadDirect(modelID: "m2")
+    coord.loadDirect(modelID: "m2", profileID: "chat")
     await waitUntil(timeout: 2.0) {
-      if case .ready = center.state { return true }
-      return false
+      return center.residentModelID == "m2"
     }
-    XCTAssertEqual(center.state, .ready(modelID: "m2"))
+    XCTAssertEqual(center.residentModelID, "m2")
   }
 
   // MARK: - review v1 F8: confirm/cancel without pending no-ops
@@ -542,10 +532,94 @@ final class ProfileSwapCoordinatorTests: XCTestCase {
     coord.dismissCurrentPending()
     XCTAssertNil(coord.pending)
     await waitUntil(timeout: 2.0) {
-      if case .ready = center.state { return true }
-      return false
+      return center.residentModelID == "m2"
     }
-    XCTAssertEqual(center.state, .ready(modelID: "m2"))
+    XCTAssertEqual(center.residentModelID, "m2")
+  }
+
+  // MARK: - #469: a confirmed pick routes through the engine (re)launch executor
+
+  /// Records `serveModel(modelID, profileID)` calls so the #469 routing is
+  /// observable without an `EngineStatusStore`. `errorToThrow` simulates a
+  /// resolver-reject the status poll won't reflect (→ `serveModelError`).
+  private final class ServeSpy: @unchecked Sendable {
+    var calls: [(modelID: String, profileID: String)] = []
+    var errorToThrow: Error?
+  }
+
+  private func makeServeRoutingCoordinator(
+    map: [String: String?],
+    resident: String? = nil
+  ) -> (ProfileSwapCoordinator, ServeSpy) {
+    let center = ModelLoadCenter(initialResident: resident)
+    let spy = ServeSpy()
+    let coord = ProfileSwapCoordinator(
+      center: center,
+      modelForProfile: { map[$0] ?? nil },
+      serveModel: { modelID, profileID in
+        spy.calls.append((modelID: modelID, profileID: profileID))
+        if let error = spy.errorToThrow { throw error }
+      }
+    )
+    return (coord, spy)
+  }
+
+  func test_confirmedPick_routesThroughServeModel_withProfile() async {
+    // A toolbar pick of a different model, once confirmed, must (re)launch the
+    // engine on the active profile via the executor — NOT a `/v1/models/load`.
+    let (coord, spy) = makeServeRoutingCoordinator(map: [:], resident: "m1")
+    // #460: the override keys on the chat's current model (`fromModel`); picking
+    // a different one (m2 ≠ m1) raises the confirm. The commit returns Bool.
+    coord.requestModelOverride(modelID: "m2", activeProfileID: "fast-think", fromModel: "m1") { _ in true }
+    confirmCurrent(coord)
+    await waitUntil(timeout: 2.0) { !spy.calls.isEmpty }
+    XCTAssertEqual(spy.calls.count, 1)
+    XCTAssertEqual(spy.calls.first?.modelID, "m2")
+    XCTAssertEqual(spy.calls.first?.profileID, "fast-think",
+                   "the pick must (re)launch on the pending's active profile")
+  }
+
+  func test_loadDirect_routesThroughServeModel_whenModelDiffers() async {
+    let (coord, spy) = makeServeRoutingCoordinator(map: [:], resident: "m1")
+    coord.loadDirect(modelID: "m2", profileID: "chat")
+    await waitUntil(timeout: 2.0) { !spy.calls.isEmpty }
+    XCTAssertEqual(spy.calls.map(\.modelID), ["m2"])
+    XCTAssertEqual(spy.calls.first?.profileID, "chat")
+  }
+
+  func test_loadDirect_shortCircuit_doesNotInvokeServeModel() async {
+    let (coord, spy) = makeServeRoutingCoordinator(map: [:], resident: "m1")
+    coord.loadDirect(modelID: "m1", profileID: "chat")   // already resident
+    // Give any erroneous async serve a chance to fire before asserting absence.
+    try? await Task.sleep(nanoseconds: 50_000_000)
+    XCTAssertTrue(spy.calls.isEmpty, "an already-resident pick must not (re)launch the engine")
+  }
+
+  func test_serveModelFailure_surfacesServeModelError() async {
+    let (coord, spy) = makeServeRoutingCoordinator(map: [:], resident: "m1")
+    spy.errorToThrow = StubWriteError()
+    coord.loadDirect(modelID: "m2", profileID: "chat")
+    await waitUntil(timeout: 2.0) { coord.serveModelError != nil }
+    XCTAssertNotNil(coord.serveModelError,
+                    "a resolver-reject the status poll won't reflect must be surfaced")
+  }
+
+  func test_secondPick_clearsPriorServeModelError_synchronously() async {
+    // review v2 F2: the error dismissal must run SYNCHRONOUSLY at the pick,
+    // not inside the async serve `Task` — otherwise two rapid picks race over
+    // the surfaced error. Surface an error from pick 1, then issue pick 2 and
+    // assert the prior error is gone the instant `loadDirect` returns. Pick 2
+    // keeps failing, so the ONLY way the error can be nil at this point is the
+    // synchronous clear (the async catch would re-set it, never clear it).
+    let (coord, spy) = makeServeRoutingCoordinator(map: [:], resident: "m1")
+    spy.errorToThrow = StubWriteError()
+    coord.loadDirect(modelID: "m2", profileID: "chat")
+    await waitUntil(timeout: 2.0) { coord.serveModelError != nil }
+    XCTAssertNotNil(coord.serveModelError, "precondition: pick 1 surfaced an error")
+
+    coord.loadDirect(modelID: "m3", profileID: "chat")
+    XCTAssertNil(coord.serveModelError,
+                 "pick 2 must clear the prior error synchronously, before its Task runs")
   }
 
   // MARK: - helpers

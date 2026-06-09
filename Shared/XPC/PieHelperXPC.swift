@@ -48,7 +48,7 @@ public struct HelperIdentity: Codable, Equatable, Sendable {
 ///
 /// The selectors are `@objc` because `NSXPCConnection` builds proxies via
 /// the Objective-C runtime. Every Codable payload (`EngineStatus`,
-/// `LoadHandle`, `DownloadHandle`, `EngineError`, `[Profile]`-as-TOML…)
+/// `DownloadHandle`, `EngineError`, `[Profile]`-as-TOML…)
 /// crosses the boundary as a `Data` blob produced by `XPCPayload`. The
 /// blob-only wire keeps the protocol free of NSSecureCoding subclass
 /// gymnastics: only `Data`, `String`, and `FileHandle` traverse the
@@ -116,7 +116,14 @@ public protocol PieHelperXPC {
   /// engine to reach helper-confirmed terminal stop before starting
   /// `profileID`, and it does not treat `.alreadyRunning` as an
   /// idempotent success.
+  ///
+  /// `modelOverride` mirrors `startEngine`'s (#469): a model-switch on a
+  /// running engine rebuilds it bound to the explicit pick (v1 pie binds the
+  /// served model at boot, so `/v1/models/load` cannot swap it). `nil` boots
+  /// the freshly-saved profile default — the existing default-model-change
+  /// restart path (set-as-default, post-download).
   func restartEngine(profileID: String,
+                     modelOverride: String?,
                      reply: @escaping (_ successData: Data?, _ errorData: Data?) -> Void)
 
   /// Reply is `XPCPayload.encode(EngineError)` when the stop request
@@ -126,27 +133,15 @@ public protocol PieHelperXPC {
   /// real stop (review v1 F7).
   func stopEngine(reply: @escaping (_ errorData: Data?) -> Void)
 
-  /// On success `successData` decodes to `LoadHandle`; on rejection
-  /// `errorData` decodes to `EngineError`. Exactly one is non-nil.
-  /// Reshaped from `(Data) -> Void` because the prior shape forced
-  /// stubs to synthesize a handle that referenced nothing, leaving the
-  /// GUI polling a non-existent load forever (review v1 F8).
-  func loadModel(modelID: String,
-                 reply: @escaping (_ successData: Data?, _ errorData: Data?) -> Void)
-
-  /// `handle` is `XPCPayload.encode(LoadHandle)`. Reply is
-  /// `XPCPayload.encode(EngineError)` on rejection (decode failure,
-  /// unknown handle, helper busy) or nil on acceptance — review F4.
-  func cancelLoad(handle: Data, reply: @escaping (_ errorData: Data?) -> Void)
-
   /// On success `successData` decodes to `DownloadHandle`; on rejection
-  /// `errorData` decodes to `EngineError`. Reshape rationale matches
-  /// `loadModel` — review v1 F8.
+  /// `errorData` decodes to `EngineError`. Reshape rationale: the prior
+  /// `(Data) -> Void` shape forced stubs to synthesize a handle that
+  /// referenced nothing (review v1 F8).
   func downloadModel(repo: String, file: String,
                      reply: @escaping (_ successData: Data?, _ errorData: Data?) -> Void)
 
-  /// `handle` is `XPCPayload.encode(DownloadHandle)`. Reply mirrors
-  /// `cancelLoad` — review F4.
+  /// `handle` is `XPCPayload.encode(DownloadHandle)`. Reply is the
+  /// optional-error convention (nil = accepted, else `EngineError`).
   func cancelDownload(handle: Data, reply: @escaping (_ errorData: Data?) -> Void)
 
   /// Reply data is `XPCPayload.encode([String])` where each element is
@@ -365,35 +360,6 @@ public enum PieHelperXPCWire {
     }
   }
 
-  // MARK: - loadModel (handle-or-error)
-
-  /// Reply-block helper for `loadModel`. Mirrors `replyStartEngine`
-  /// shape and failure handling — review v1 F8.
-  public static func replyLoadModel(
-    _ result: Result<LoadHandle, EngineError>,
-    via reply: (Data?, Data?) -> Void
-  ) {
-    _replyHandleOrError(
-      result, via: reply,
-      encode: defaultEncode,
-      onEncodeFailure: { PieHelperXPCLog.encodeFailure($0, site: "replyLoadModel") }
-    )
-  }
-
-  /// Decode a `loadModel` reply tuple. Wire-contract discipline matches
-  /// `decodeStartEngineReply`.
-  public static func decodeLoadModelReply(
-    successData: Data?,
-    errorData: Data?
-  ) throws -> Result<LoadHandle, EngineError> {
-    try decodeHandleOrErrorReply(
-      LoadHandle.self,
-      successData: successData,
-      errorData: errorData,
-      slot: "loadModel"
-    )
-  }
-
   // MARK: - downloadModel (handle-or-error)
 
   /// Reply-block helper for `downloadModel`. Mirrors `replyStartEngine`
@@ -457,7 +423,7 @@ public enum PieHelperXPCWire {
     )
   }
 
-  /// Decode an optional-error reply (`cancelLoad`, `cancelDownload`,
+  /// Decode an optional-error reply (`cancelDownload`,
   /// `reloadProfiles`). Returns nil when the helper accepted the
   /// request, the decoded `EngineError` otherwise. Malformed non-nil
   /// bytes throw `.wireContractViolation` rather than leaking a raw
@@ -474,8 +440,8 @@ public enum PieHelperXPCWire {
 
   /// Generic helper for any `(Data?, Data?)` reply that encodes a
   /// Codable success type or an `EngineError`. Used by
-  /// `replyLoadModel` and `replyDownloadModel` so the F4 + F8 control
-  /// flow lives in one place.
+  /// `replyDownloadModel` so the F8 reply-reshape control flow lives in
+  /// one place.
   @usableFromInline
   internal static func _replyHandleOrError<T: Encodable>(
     _ result: Result<T, EngineError>,

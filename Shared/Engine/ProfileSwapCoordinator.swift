@@ -147,8 +147,24 @@ public final class ProfileSwapCoordinator: ObservableObject {
   /// skipped) confirm.
   @Published public private(set) var defaultModelWriteError: String?
 
+  ///  review F2: non-nil when a confirmed model pick could not be routed
+  /// through the engine (re)launch (#469): a thrown `startEngine` /
+  /// `restartEngine` failure that the engine-status poll won't reflect on its
+  /// own (a resolver reject — `modelMissing` / `profileMissing` — that the
+  /// helper does not publish as `.failed`). `ContentToolbar` renders it next
+  /// to `defaultModelWriteError` so a pick that silently failed to take is
+  /// never invisible. Cleared at the start of the next serve.
+  @Published public private(set) var serveModelError: String?
+
   private let center: ModelLoadCenter
-  private let engine: EngineClient
+  /// #469: status-aware executor that makes the engine actually SERVE a
+  /// picked model — start it (stopped), restart it (running a different
+  /// model), or no-op (already resident) per `ActiveModelLaunchPolicy`. v1
+  /// pie binds the served model at boot, so a served-model change is an
+  /// engine LIFECYCLE event (start/restart), not a `/v1/models/load` — which
+  /// is why there is no longer a direct-load fallback. Required: production
+  /// wires the real executor; tests/previews inject a no-op or spy.
+  private let serveModel: @MainActor (_ modelID: String, _ profileID: String) async throws -> Void
   private let modelForProfile: (String) -> String?
   /// Persists a confirmed "Set as default" model onto a profile.
   /// Wired to `ProfileStore.setModel` in production; a no-op default
@@ -161,14 +177,14 @@ public final class ProfileSwapCoordinator: ObservableObject {
 
   public init(
     center: ModelLoadCenter,
-    engine: EngineClient,
     modelForProfile: @escaping (String) -> String? = { _ in nil },
-    setDefaultModel: @escaping (_ profileID: String, _ model: String) throws -> Void = { _, _ in }
+    setDefaultModel: @escaping (_ profileID: String, _ model: String) throws -> Void = { _, _ in },
+    serveModel: @escaping @MainActor (_ modelID: String, _ profileID: String) async throws -> Void
   ) {
     self.center = center
-    self.engine = engine
     self.modelForProfile = modelForProfile
     self.setDefaultModel = setDefaultModel
+    self.serveModel = serveModel
   }
 
   /// Production wiring. Derives `modelForProfile` from a live
@@ -181,18 +197,20 @@ public final class ProfileSwapCoordinator: ObservableObject {
   /// crash.
   public convenience init(
     center: ModelLoadCenter,
-    engine: EngineClient,
-    profileStore: ProfileStore
+    profileStore: ProfileStore,
+    serveModel: @escaping @MainActor (_ modelID: String, _ profileID: String) async throws -> Void
   ) {
     self.init(
       center: center,
-      engine: engine,
       modelForProfile: { [weak profileStore] in profileStore?.model(forProfileID: $0) },
       setDefaultModel: { [weak profileStore] profileID, model in
         // Propagate the throw so `confirm` surfaces it via
         // `defaultModelWriteError` (review F2) rather than logging only.
         try profileStore?.setModel(model, forProfileID: profileID)
-      }
+      },
+      // #469: the production status-aware engine (re)launch executor, built
+      // by `RatioThinkApp` from the live `EngineStatusStore` + `ModelLoadCenter`.
+      serveModel: serveModel
     )
   }
 
@@ -375,14 +393,20 @@ public final class ProfileSwapCoordinator: ObservableObject {
       defaultModelWriteError = nil
     }
     let toModel = p.toModelID
+    let toProfile = p.toProfileID
     let commit = p.commit
     pendingState = nil
-    // Review F2: only load once the caller durably applied the swap. A
+    // Review F2 (#460): only load once the caller durably applied the swap. A
     // failed model-pin save returns false → skip the load so the engine is
     // not driven to a model the chat did not actually adopt (which would
     // leave the toolbar label and the served model disagreeing).
     guard commit() else { return }
-    startLoad(modelID: toModel)
+    // #469: route the confirmed pick through the engine (re)launch on the
+    // pending's profile — start a stopped engine bound to the pick, or
+    // rebuild a running engine onto it — instead of a `/v1/models/load` that
+    // a stopped engine no-ops and a running engine only acks for its boot
+    // model.
+    startLoad(modelID: toModel, profileID: toProfile)
   }
 
   /// Cancel the swap whose `PendingSwap.id` matches `token`. Idempotent
@@ -464,21 +488,41 @@ public final class ProfileSwapCoordinator: ObservableObject {
   /// Short-circuits when the target is already resident and no load
   /// is in flight (review v1 F5) so picking the current model from
   /// the menu does not flash the indicator for a no-op reload.
-  public func loadDirect(modelID: String) {
+  ///
+  /// `profileID` is the active chat profile the engine (re)launch binds the
+  /// model to (#469); the pre-#469 `/v1/models/load` path did not need it.
+  public func loadDirect(modelID: String, profileID: String) {
     // User moved on to an explicit load — clear any stale set-as-default
     // error (review F2).
     defaultModelWriteError = nil
-    if !center.isLoading, center.residentModelID == modelID {
+    if center.residentModelID == modelID {
       Self.log.debug("loadDirect short-circuit: model already resident id=\(modelID, privacy: .public)")
       return
     }
-    startLoad(modelID: modelID)
+    startLoad(modelID: modelID, profileID: profileID)
   }
 
-  private func startLoad(modelID: String) {
-    let engine = self.engine
-    center.load(modelID: modelID) {
-      engine.loadModel(modelID)
+  /// Make the engine serve `modelID` (#469): route through the status-aware
+  /// engine (re)launch executor — start a stopped engine, restart a running
+  /// one onto a different model, or no-op when already resident — because v1
+  /// pie binds the served model at boot and `/v1/models/load` cannot swap it
+  /// (the endpoint is gone). A thrown executor failure the status poll won't
+  /// reflect (a resolver reject) surfaces via `serveModelError`.
+  private func startLoad(modelID: String, profileID: String) {
+    // Clear synchronously BEFORE spawning the Task (review v2 F2): if the clear
+    // rode inside the async Task, two rapid picks could interleave — pick 2's
+    // clear wiping pick 1's surfaced error, or pick 1's late failure
+    // resurrecting after pick 2 already succeeded. A synchronous clear at the
+    // call point makes the dismissal deterministic; only the failure assignment
+    // stays inside the Task.
+    serveModelError = nil
+    Task { @MainActor in
+      do {
+        try await serveModel(modelID, profileID)
+      } catch {
+        serveModelError = "Couldn’t load \(modelID): \(error)"
+        Self.log.error("serveModel failed model=\(modelID, privacy: .public) profile=\(profileID, privacy: .public): \(String(describing: error), privacy: .public)")
+      }
     }
   }
 
@@ -499,7 +543,7 @@ public final class ProfileSwapCoordinator: ObservableObject {
   public static func previewDefault() -> ProfileSwapCoordinator {
     ProfileSwapCoordinator(
       center: ModelLoadCenter(),
-      engine: MockEngineClient()
+      serveModel: { _, _ in }
     )
   }
   #endif

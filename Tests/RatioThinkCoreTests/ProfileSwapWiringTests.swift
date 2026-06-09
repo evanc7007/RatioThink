@@ -37,9 +37,11 @@ final class ProfileSwapWiringTests: XCTestCase {
   func test_profileStore_backed_coordinator_fires_popover_on_model_changing_swap() throws {
     try withTwoProfileStore { store in
       let coord = ProfileSwapCoordinator(
+        // #460 keys the swap on the passed `fromModel`, not residency (no
+        // seeded resident needed); #469 drops `engine:` for `serveModel:`.
         center: ModelLoadCenter(),
-        engine: MockEngineClient(),
-        profileStore: store
+        profileStore: store,
+        serveModel: { _, _ in }
       )
 
       var committed: String?
@@ -60,8 +62,8 @@ final class ProfileSwapWiringTests: XCTestCase {
     try withTwoProfileStore { store in
       let coord = ProfileSwapCoordinator(
         center: ModelLoadCenter(),
-        engine: MockEngineClient(),
-        profileStore: store
+        profileStore: store,
+        serveModel: { _, _ in }
       )
       var committed: String?
       var preservedModel = true
@@ -84,9 +86,9 @@ final class ProfileSwapWiringTests: XCTestCase {
   func test_profileStore_backed_coordinator_stays_silent_when_no_model_is_selected() throws {
     try withTwoProfileStore { store in
       let coord = ProfileSwapCoordinator(
-        center: ModelLoadCenter(),
-        engine: MockEngineClient(),
-        profileStore: store
+        center: ModelLoadCenter(),   // engine stopped → residentModelID == nil
+        profileStore: store,
+        serveModel: { _, _ in }
       )
       var committed: String?
       coord.requestSwap(toProfileID: "beta", fromModel: nil) { profileID, _ in committed = profileID; return true }
@@ -107,7 +109,7 @@ final class ProfileSwapWiringTests: XCTestCase {
     try withTwoProfileStore { store in
       let center = ModelLoadCenter(initialResident: "model-A.gguf")
       let coord = ProfileSwapCoordinator(
-        center: center, engine: MockEngineClient(), profileStore: store)
+        center: center, profileStore: store, serveModel: { _, _ in })
 
       var committedProfile: String?
       var pinnedModel: String?
@@ -136,7 +138,6 @@ final class ProfileSwapWiringTests: XCTestCase {
       XCTAssertNil(coord.pending, "pending must clear after keep-current")
       XCTAssertEqual(center.residentModelID, "model-A.gguf",
                      "keep-current must NOT reload — A stays resident")
-      XCTAssertFalse(center.isLoading, "keep-current must NOT start a model load")
     }
   }
 
@@ -146,7 +147,7 @@ final class ProfileSwapWiringTests: XCTestCase {
     try withTwoProfileStore { store in
       let coord = ProfileSwapCoordinator(
         center: ModelLoadCenter(initialResident: "model-A.gguf"),
-        engine: MockEngineClient(), profileStore: store)
+        profileStore: store, serveModel: { _, _ in })
 
       var commitCalls = 0
       coord.requestSwap(toProfileID: "beta", fromModel: "model-A.gguf") { _, _ in
@@ -168,7 +169,7 @@ final class ProfileSwapWiringTests: XCTestCase {
     try withTwoProfileStore { store in
       let coord = ProfileSwapCoordinator(
         center: ModelLoadCenter(initialResident: "model-A.gguf"),
-        engine: MockEngineClient(), profileStore: store)
+        profileStore: store, serveModel: { _, _ in })
 
       var commitCalls = 0
       coord.requestModelOverride(modelID: "model-B.gguf", activeProfileID: "alpha",
@@ -191,7 +192,7 @@ final class ProfileSwapWiringTests: XCTestCase {
     try withTwoProfileStore { store in
       let coord = ProfileSwapCoordinator(
         center: ModelLoadCenter(initialResident: "model-A.gguf"),
-        engine: MockEngineClient(), profileStore: store)
+        profileStore: store, serveModel: { _, _ in })
 
       var commitCalls = 0
       coord.requestSwap(toProfileID: "beta", fromModel: "model-A.gguf") { _, _ in

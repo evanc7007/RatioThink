@@ -173,6 +173,7 @@ private final class FixedStatusExportedObject: NSObject, PieHelperXPC, @unchecke
   }
 
   func restartEngine(profileID: String,
+                     modelOverride: String?,
                      reply: @escaping (Data?, Data?) -> Void) {
     PieHelperXPCWire.replyStartEngine(
       .failure(EngineError(code: .wireContractViolation,
@@ -182,17 +183,6 @@ private final class FixedStatusExportedObject: NSObject, PieHelperXPC, @unchecke
   }
 
   func stopEngine(reply: @escaping (Data?) -> Void) { reply(nil) }
-
-  func loadModel(modelID: String,
-                 reply: @escaping (Data?, Data?) -> Void) {
-    PieHelperXPCWire.replyLoadModel(
-      .failure(EngineError(code: .wireContractViolation,
-                           message: "FixedStatusExportedObject is read-only")),
-      via: reply
-    )
-  }
-
-  func cancelLoad(handle: Data, reply: @escaping (Data?) -> Void) { reply(nil) }
 
   func downloadModel(repo: String, file: String,
                      reply: @escaping (Data?, Data?) -> Void) {
@@ -245,14 +235,10 @@ private final class NeverReplyStatusExportedObject: NSObject, PieHelperXPC, @unc
                    reply: @escaping (Data?, Data?) -> Void) {}
 
   func restartEngine(profileID: String,
+                     modelOverride: String?,
                      reply: @escaping (Data?, Data?) -> Void) {}
 
   func stopEngine(reply: @escaping (Data?) -> Void) {}
-
-  func loadModel(modelID: String,
-                 reply: @escaping (Data?, Data?) -> Void) {}
-
-  func cancelLoad(handle: Data, reply: @escaping (Data?) -> Void) {}
 
   func downloadModel(repo: String, file: String,
                      reply: @escaping (Data?, Data?) -> Void) {}

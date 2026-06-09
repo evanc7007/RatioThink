@@ -17,7 +17,7 @@ import Foundation
 ///   on `ChatRequest` that flattens `ChatSampling` onto the top
 ///   level, and on `InferletRequest` that embeds `input` as an
 ///   inline JSON sub-tree rather than a base64 blob.
-/// - **Streaming events** (`LoadEvent`, `ChatEvent`) are
+/// - **Streaming events** (`ChatEvent`) are
 ///   decoder-output types, NOT direct Codable mirrors of the wire.
 ///   Their on-the-wire counterparts are OpenAI-style SSE frames
 ///   (`data: {...}\n\n`) parsed by a separate frame decoder in
@@ -40,8 +40,8 @@ import Foundation
 /// Response shape of GET /healthz (design doc §HTTP API):
 /// `{"status":"ok","model":"<id>","uptime_s":…}`. `loadedModel` is
 /// optional because the engine starts up with no model resident — the
-/// healthz handler reports `"model": null` until the first
-/// `loadModel`/inferlet activation. Modeling that as `String?` keeps
+/// healthz handler reports `"model": null` until the engine boots with a
+/// model registered. Modeling that as `String?` keeps
 /// the GUI from string-matching `"none"`/`""` sentinels.
 public struct EngineHealth: Codable, Equatable, Sendable {
   public enum Status: String, Codable, Sendable {
@@ -406,22 +406,13 @@ internal enum JSONValue: Codable, Equatable, Sendable {
 
 // MARK: - Events
 
-/// One frame of /v1/models/load (or the SSE meta-frame prefix on a chat
-/// stream). `loading` carries the byte counters the design doc pins on
-/// the meta-frame schema; `etaSeconds` is optional because the engine
-/// only reports it once it has a transfer-rate sample. Closed enum so a
-/// `switch` in the loading-indicator view is exhaustive.
-public enum LoadEvent: Equatable, Sendable {
-  case loading(loadedBytes: UInt64, totalBytes: UInt64, etaSeconds: Double?)
-  case ready
-}
-
 /// One SSE frame from POST /v1/chat/completions. Maps 1:1 to the wire
 /// schema:
 /// - `.modelLoading` / `.modelReady` are the meta-frame prefix (design
-///   doc §SSE meta-frame schema). The GUI feeds them straight into
-///   `ModelLoadCenter` — same observable a bare `loadModel` call drives,
-///   so the loading indicator's source-of-truth doesn't bifurcate.
+///   doc §SSE meta-frame schema). v1 pie binds its model at boot, so
+///   `.modelLoading` never arrives in practice; `.modelReady` confirms the
+///   engine is serving the model for this turn and is fed to
+///   `ModelLoadCenter.reconcileEngineResident` (#469).
 /// - `.delta` is OpenAI's `choices[0].delta`. `role` only appears on
 ///   the first delta of a turn; subsequent deltas carry content alone.
 /// - `.reasoningDelta` is OpenAI's `choices[0].delta.reasoning_content`
@@ -472,7 +463,6 @@ public enum ChatEvent: Equatable, Sendable {
 public protocol EngineClient: Sendable {
   func health() async throws -> EngineHealth
   func models() async throws -> [ModelInfo]
-  func loadModel(_ id: String) -> AsyncThrowingStream<LoadEvent, Error>
   func chatCompletion(_ req: ChatRequest) -> AsyncThrowingStream<ChatEvent, Error>
   func dispatchInferlet(_ req: InferletRequest) -> AsyncThrowingStream<Data, Error>
 }

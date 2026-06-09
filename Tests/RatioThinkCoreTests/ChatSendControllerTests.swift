@@ -420,9 +420,6 @@ private final class ImmediateChatEngine: EngineClient, @unchecked Sendable {
 
   func health() async throws -> EngineHealth { EngineHealth(status: .ok) }
   func models() async throws -> [ModelInfo] { [] }
-  func loadModel(_ id: String) -> AsyncThrowingStream<LoadEvent, Error> {
-    AsyncThrowingStream { $0.finish() }
-  }
   func chatCompletion(_ req: ChatRequest) -> AsyncThrowingStream<ChatEvent, Error> {
     requests.append(req)
     let events = self.events
@@ -443,9 +440,6 @@ private final class ManualChatEngine: EngineClient, @unchecked Sendable {
 
   func health() async throws -> EngineHealth { EngineHealth(status: .ok) }
   func models() async throws -> [ModelInfo] { [] }
-  func loadModel(_ id: String) -> AsyncThrowingStream<LoadEvent, Error> {
-    AsyncThrowingStream { $0.finish() }
-  }
   func chatCompletion(_ req: ChatRequest) -> AsyncThrowingStream<ChatEvent, Error> {
     requests.append(req)
     return AsyncThrowingStream { continuation in
@@ -477,9 +471,6 @@ private final class FailingChatEngine: EngineClient, @unchecked Sendable {
 
   func health() async throws -> EngineHealth { EngineHealth(status: .ok) }
   func models() async throws -> [ModelInfo] { [] }
-  func loadModel(_ id: String) -> AsyncThrowingStream<LoadEvent, Error> {
-    AsyncThrowingStream { $0.finish() }
-  }
   func chatCompletion(_ req: ChatRequest) -> AsyncThrowingStream<ChatEvent, Error> {
     let error = self.error
     return AsyncThrowingStream { continuation in

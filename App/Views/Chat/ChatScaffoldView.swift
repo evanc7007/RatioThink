@@ -354,9 +354,6 @@ struct ChatScaffoldView: View {
         },
         // #397 F1: retryable engine failure → re-start the engine.
         onRetryEngineStart: { startEngineForSelectedProfile() },
-        // #397 F1: failed model load → re-run it via the ensure-engine
-        // -then-load path (restarts the engine if it has since stopped).
-        onRetryLoad: { model in loadDefaultModel(model) },
         // #397 F1: helper unreachable → force an immediate status re-poll.
         onRefresh: { refreshEngineStatus() },
         onCancel: { showNoModelPrompt = false },
@@ -509,7 +506,11 @@ struct ChatScaffoldView: View {
         currentPin: chat.modelID,
         servedID: ids[0],
         profileDefault: selectedProfileDefault,
-        isLoading: modelLoadCenter.isLoading
+        // #469: the residency-only ModelLoadCenter has no in-flight-load state
+        // (`/v1/models/load` is gone; the served model is bound at engine boot).
+        // This block runs on a successful `/v1/models` reconcile — the engine is
+        // serving, never mid-load — so the seed guard is never "in flight" here.
+        isLoading: false
       ) {
         _ = persistChatModel(toPin, on: chat)
       }
@@ -720,7 +721,9 @@ struct ChatScaffoldView: View {
     ChatStartGate.evaluate(
       engineStatus: engineStatusStore.status,
       helperError: engineStatusStore.lastError,
-      load: modelLoadCenter.state,
+      // #460: the chat's model is per-chat now (`currentModelID(for:)`); #469:
+      // `ChatStartGate.evaluate` no longer takes a `load:` state — the load
+      // state machine is gone (ModelLoadCenter is residency-only).
       resolvedModelID: currentModelID(for: chat),
       profileDefault: selectedProfileDefault,
       profileError: profileStore.lastActiveProfileError?.description
@@ -769,8 +772,10 @@ struct ChatScaffoldView: View {
   private func loadDefaultModel(_ model: String) {
     switch engineStatusStore.status {
     case .running:
-      // Engine up — load the model directly (`/v1/models/load`).
-      swapCoordinator.loadDirect(modelID: model)
+      // Engine up — make it serve this model. #469: a model that differs from
+      // the resident one rebuilds the engine onto it (a live `/v1/models/load`
+      // can't swap the boot model); the already-resident case short-circuits.
+      swapCoordinator.loadDirect(modelID: model, profileID: viewModel.selectedProfileID)
     case .stopped:
       // Bring the engine up bound to this chat's profile; v1 pie loads
       // the profile's model at boot, and `reconcileEngineResidentModel`
