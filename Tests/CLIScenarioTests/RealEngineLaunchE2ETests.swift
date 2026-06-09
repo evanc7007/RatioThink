@@ -172,10 +172,14 @@ final class RealEngineLaunchE2ETests: IsolatedTestCase {
   /// One cell of the (model × profile) real-engine compatibility matrix
   /// (#473). Routing is per-REQUEST, not per-launch-profile (chat →
   /// /v1/chat/completions, tree-of-thought → /v1/inferlet, fast-think →
-  /// chat-completions + a `speculation` field), so a single booted model
-  /// proves every profile shape against it: this boots ONCE and fires each
-  /// profile in `PIE_TEST_E2E_PROFILES` as a sub-assertion. That keeps the
-  /// matrix at 10 boots / 30 cells instead of 30 cold boots — decisive for
+  /// chat-completions + a `speculation` field, ceiling → the #475
+  /// token-ceiling contract over /v1/models + a boundary pair), so a single
+  /// booted model proves every profile shape against it: this boots ONCE and
+  /// fires each profile in `PIE_TEST_E2E_PROFILES` as a sub-assertion. The
+  /// `ceiling` profile is the memory-size half of the matrix — the engine's
+  /// effective `max_output_tokens` (and its clean over-ceiling 400) is
+  /// memory-aware, so it is proven once per loaded model. That keeps the
+  /// matrix at 9 boots / 36 cells instead of 36 cold boots — decisive for
   /// the slow ~9 GB 14B loads.
   ///
   /// Gated on `PIE_TEST_E2E_PROFILES` (a csv of `chat,tree-of-thought,
@@ -228,8 +232,10 @@ final class RealEngineLaunchE2ETests: IsolatedTestCase {
           try await assertTreeOfThoughtCell(port: port, modelID: slug)
         case "fast-think":
           try await assertFastThinkCell(port: port, modelID: slug, expectReasoning: expectReasoning)
+        case "ceiling":
+          try await assertTokenCeilingCell(port: port, modelID: slug)
         default:
-          throw MatrixCellFailure("unknown profile (expected chat|tree-of-thought|fast-think)")
+          throw MatrixCellFailure("unknown profile (expected chat|tree-of-thought|fast-think|ceiling)")
         }
         print("MATRIX-CELL\t\(model)\t\(profile)\tPASS")
       } catch {
@@ -242,6 +248,346 @@ final class RealEngineLaunchE2ETests: IsolatedTestCase {
     }
     if !failures.isEmpty {
       XCTFail("\(model): \(failures.count) profile cell(s) failed — \(failures.joined(separator: " | "))")
+    }
+  }
+
+  // MARK: - memory-budget sweep (#475)
+
+  /// Which configured budget knob a sweep cell turns.
+  private enum BudgetKnob {
+    /// App-side (#328/#438): inject a guardrail `Policy` whose RAM ceiling
+    /// is `bytes`, so the REAL `LaunchSpecResolver` → `KVCacheBudget` derives
+    /// `default_token_limit` from it — the exact production app-config path.
+    /// Lower `bytes` → lower derived ceiling. Never causes a load failure on
+    /// its own: it floors at `KVCacheBudget.minCeilingTokens` (512).
+    case guardrailBytes(Int64)
+    /// Engine-side: override `[model.driver.options].max_num_kv_pages`, the
+    /// raw KV page pool (= pages × 32 tokens). Caps N directly; when set far
+    /// too small for the model it makes `pie serve` fail to load — a
+    /// captured, classified engine-start error, not a hang.
+    case kvPages(Int)
+  }
+
+  /// One cell of the memory-budget sweep.
+  private struct BudgetCell {
+    let name: String
+    let knob: BudgetKnob
+    /// `true` when the budget is deliberately small enough that the model is
+    /// not expected to boot — a structured `.failed` is then the PASS
+    /// outcome, and an actual boot is the regression.
+    let expectStructuredLoadFailure: Bool
+  }
+
+  /// The budget ladder, ordered large → small, exercising BOTH fault domains.
+  /// Guardrail thresholds derive from the model's own weight size + the same
+  /// overhead `KVCacheBudget` reserves, so the cells move N for any model.
+  /// Calibrated against a measured real boot (#475 spike, Qwen2.5-0.5B):
+  ///   · large           — guardrail RAM ceiling far above the model → no
+  ///                       clamp; N at the engine default pool cap (32768).
+  ///                       The baseline every other cell is compared against.
+  ///   · near-boundary   — guardrail with a few hundred MiB of KV headroom →
+  ///                       mid N (measured ≈21845). App-side knob, mid.
+  ///   · harsh-guardrail — guardrail with ~0 KV headroom → N floored to 512;
+  ///                       STILL BOOTS. Proves the #328/#438 guardrail caps
+  ///                       the *advertised* ceiling, not the physical pool —
+  ///                       it cannot, by itself, trip a load failure.
+  ///   · kv-pages-low    — engine KV pool shrunk to 256 pages → N = 256×32 =
+  ///                       8192 (measured). The OTHER fault domain (engine,
+  ///                       not app) lowering N on a real boot.
+  ///   · harsh-kv-pages  — 2-page pool: far below the model's minimum → a
+  ///                       structured engine-start failure (`spawnFailed`,
+  ///                       exit code + stderr tail), captured as a cell — the
+  ///                       memory-bound failure the ticket demands be classified.
+  private static func budgetSweepCells(weightBytes: Int64) -> [BudgetCell] {
+    let overhead = max(KVCacheBudget.overheadFloorBytes,
+                       Int64(Double(weightBytes) * KVCacheBudget.overheadFraction))
+    // `base` = the threshold at which KV headroom is exactly zero, so
+    // `base + small` floors N at 512 while `base + 256 MiB` leaves mid headroom.
+    let base = weightBytes + overhead
+    let mib: Int64 = 1024 * 1024
+    return [
+      BudgetCell(name: "large",
+                 knob: .guardrailBytes(base + 64 * 1024 * mib),       // +64 GiB → no clamp
+                 expectStructuredLoadFailure: false),
+      BudgetCell(name: "near-boundary",
+                 knob: .guardrailBytes(base + 256 * mib),             // mid headroom
+                 expectStructuredLoadFailure: false),
+      BudgetCell(name: "harsh-guardrail",
+                 knob: .guardrailBytes(base + 1),                     // ~0 headroom → floor 512
+                 expectStructuredLoadFailure: false),
+      BudgetCell(name: "kv-pages-low",
+                 knob: .kvPages(256),                                 // 256×32 = 8192 KV tokens
+                 expectStructuredLoadFailure: false),
+      BudgetCell(name: "harsh-kv-pages",
+                 knob: .kvPages(2),                                   // 2×32 = 64 KV tokens → too small
+                 expectStructuredLoadFailure: true),
+    ]
+  }
+
+  /// REAL-engine memory-budget sweep (#475): boot the SAME model across a
+  /// ladder of CONFIGURED budgets and prove the effective ceiling N actually
+  /// tracks the budget — and that every memory-bound failure surfaces as a
+  /// captured, classified cell (a clean 400 token-ceiling rejection, a
+  /// structured engine-start error, or a 200), never an opaque engine error
+  /// or a hang.
+  ///
+  /// This is the memory-size half of the matrix the single `ceiling` cell
+  /// could not be: it varies the budget through BOTH fault domains — the
+  /// App guardrail (`KVCacheBudget` → `default_token_limit`, the #328/#438
+  /// app-config path) and the pie KV pool (`max_num_kv_pages`) — and asserts
+  /// N moves and the harsh-low cell trips a structured failure.
+  ///
+  /// Multi-boot (one `pie serve` per budget), so it is gated separately from
+  /// the per-request profile matrix and scoped to a small model by its
+  /// driver (`make test-e2e-budget-sweep` / `PIE_TEST_E2E_BUDGET_SWEEP=1`).
+  func test_realEngine_memoryBudgetSweep() async throws {
+    let env = try realEngineEnvOrSkip()
+    guard ProcessInfo.processInfo.environment["PIE_TEST_E2E_BUDGET_SWEEP"] == "1" else {
+      throw XCTSkip("set PIE_TEST_E2E_BUDGET_SWEEP=1 — driven by `make test-e2e-budget-sweep` (small model; one boot per budget)")
+    }
+    let model = env.modelPath.lastPathComponent
+    let weightBytes = try cellUnwrap(
+      ModelMemoryGuardrail.resolvedBytes(resolvedModelURL: env.modelPath),
+      "budget-sweep: could not read resolved weight size of \(env.modelPath.path)")
+    let cells = Self.budgetSweepCells(weightBytes: weightBytes)
+
+    struct Booted { let name: String; let n: Int; let isGuardrail: Bool; let kvPages: Int? }
+    var booted: [Booted] = []
+    var structuredFailures: [String] = []
+    var hardFailures: [String] = []
+    var baselineLargeN: Int?
+
+    for (idx, cell) in cells.enumerated() {
+      let host = PieEngineHost()
+      let outcome = await launchForBudget(env, host: host, cell: cell, index: idx)
+      let isGuardrail: Bool
+      let kvPages: Int?
+      switch cell.knob {
+      case .guardrailBytes: isGuardrail = true;  kvPages = nil
+      case let .kvPages(p):  isGuardrail = false; kvPages = p
+      }
+      switch outcome {
+      case .running(let port, let slug):
+        do {
+          let n = try await readAdvertisedCeiling(port: port, modelID: slug, label: cell.name)
+          // The structured token-ceiling contract must STILL hold at this
+          // budget: an over-ceiling request is a clean 400, never the raw
+          // engine error — at every memory budget, not just the default.
+          try await assertOverCeilingRejected(port: port, modelID: slug, ceiling: n, label: cell.name)
+          print("BUDGET-CELL\t\(model)\t\(cell.name)\trunning\tN=\(n)")
+          if cell.name == "large" { baselineLargeN = n }
+          // Exact-wire proof for the engine KV knob: a booted `max_num_kv_pages`
+          // cell must report N == min(pages × 32, the default-pool/context cap).
+          // This pins `LaunchSpec.maxNumKvPages → config.toml → driver →
+          // runtime::max-output-tokens` end-to-end (measured 256 → 8192).
+          if let p = kvPages {
+            let cap = baselineLargeN ?? KVCacheBudget.defaultPoolCapacityTokens
+            // pie's portable-driver default `kv_page_size` (PortableDriverOptions).
+            let kvPageSizeTokens = 32
+            let expected = min(p * kvPageSizeTokens, cap)
+            if n != expected {
+              hardFailures.append("\(cell.name): max_num_kv_pages=\(p) → expected N=\(expected) (min(\(p)×32, \(cap))), got \(n)")
+            }
+          }
+          booted.append(Booted(name: cell.name, n: n, isGuardrail: isGuardrail, kvPages: kvPages))
+          if cell.expectStructuredLoadFailure {
+            hardFailures.append("\(cell.name): expected a structured load failure but the engine booted (N=\(n))")
+          }
+        } catch {
+          hardFailures.append("\(cell.name): booted but the ceiling contract failed — \(error)")
+        }
+      case .failed(let code, let message):
+        print("BUDGET-CELL\t\(model)\t\(cell.name)\tstructured-fail\tcode=\(code)\tmsg=\(message.prefix(160).debugDescription)")
+        if cell.expectStructuredLoadFailure {
+          // The PASS outcome for a deliberately-too-small budget: a captured,
+          // classified ENGINE-start error. cellRequireStructured rejects an
+          // empty/opaque classification AND the `harness_error` sentinel (a
+          // setup failure, NOT the engine classifying the over-small pool).
+          structuredFailures.append(cell.name)
+          try cellRequireStructured(code: code, message: message, label: cell.name, into: &hardFailures)
+        } else {
+          // A cell that was supposed to BOOT regressed into a load failure —
+          // the silent regression #475 must never let green. Mirror the
+          // `.running`-branch guard (a supposed-to-fail cell that boots is a
+          // hard failure): this is its symmetric twin, not a captured cell.
+          hardFailures.append("\(cell.name): expected to boot but the engine failed to load — code=\(code) msg=\(message.prefix(160))")
+        }
+      case .timedOut:
+        // A hang is exactly the failure mode the ticket forbids: not a
+        // captured cell. Fail hard and name it.
+        hardFailures.append("\(cell.name): engine neither booted nor reported a structured failure within the budget (HANG)")
+      }
+      host.stop()
+      // Let the prior engine's aux socket / shmem fully release before the
+      // next boot reuses a short /tmp pieHome.
+      try await Task.sleep(nanoseconds: 750_000_000)
+    }
+
+    // 1. N must actually MOVE with the budget — the whole point of the sweep.
+    //    Both fault domains must demonstrably lower N below the large-budget
+    //    baseline: a guardrail (#328/#438 app config) cell AND a KV-pages
+    //    (engine) cell. (The engine domain is also exercised by the harsh
+    //    structured-failure cell below.)
+    if let large = baselineLargeN {
+      let guardrailLowered = booted.contains { $0.isGuardrail && $0.name != "large" && $0.n < large }
+      let kvLowered = booted.contains { $0.kvPages != nil && $0.n < large }
+      if !guardrailLowered {
+        hardFailures.append("the App guardrail knob did not lower N below the baseline \(large) (booted=\(booted.map { "\($0.name):\($0.n)" }))")
+      }
+      if !kvLowered {
+        hardFailures.append("the pie KV-pages knob did not lower N below the baseline \(large) on a boot (booted=\(booted.map { "\($0.name):\($0.n)" }))")
+      }
+    } else {
+      hardFailures.append("the large budget did not boot — cannot establish an N baseline (booted=\(booted.map { "\($0.name):\($0.n)" }))")
+    }
+
+    // 2. The deliberately-too-small budget MUST have produced a STRUCTURED
+    //    failure (captured), proving a memory-bound load failure is a
+    //    classified cell rather than an opaque error or a hang. This is a HARD
+    //    requirement — a boot there is already flagged above; a hang is flagged
+    //    in the loop; only a captured structured failure clears it.
+    let expectedFailCells = Set(cells.filter { $0.expectStructuredLoadFailure }.map { $0.name })
+    let missingStructured = expectedFailCells.subtracting(structuredFailures)
+    if !missingStructured.isEmpty {
+      hardFailures.append("no captured structured failure for the too-small budget(s): \(missingStructured.sorted().joined(separator: ","))")
+    }
+
+    print("BUDGET-SUMMARY\t\(model)\tbooted=\(booted.map { "\($0.name):\($0.n)" }.joined(separator: ","))\tstructured_fail=\(structuredFailures.joined(separator: ","))")
+
+    if !hardFailures.isEmpty {
+      XCTFail("\(model): memory-budget sweep — \(hardFailures.count) failure(s): \(hardFailures.joined(separator: " | "))")
+    }
+  }
+
+  /// A structured engine-start failure must carry a non-empty classification
+  /// (a code + message), not an empty/opaque sentinel — that is what makes a
+  /// memory-bound load failure a *captured* cell. Records a hard failure when
+  /// the failure is unclassified.
+  private func cellRequireStructured(code: String, message: String, label: String,
+                                     into hardFailures: inout [String]) throws {
+    let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
+    // A harness setup failure (model staging, dir/profile creation) is mapped
+    // to `.failed(code: "harness_error", …)` by `launchForBudget`; it is NOT
+    // the engine classifying an over-small KV pool — the one thing the
+    // expect-fail cell must prove. Reject it so an infrastructure bug cannot
+    // satisfy the captured-structured-failure requirement.
+    if code == "harness_error" {
+      hardFailures.append("\(label): structured failure was a harness error, not an engine classification — \(message.prefix(200))")
+      return
+    }
+    if code.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || trimmed.isEmpty {
+      hardFailures.append("\(label): engine failed without a structured code/message (opaque) — code=\(code.debugDescription) msg=\(message.debugDescription)")
+    }
+  }
+
+  /// The terminal state of one budget boot: a real serving port, a structured
+  /// engine-start failure (classified code + message), or a hang (neither).
+  private enum BootOutcome {
+    case running(port: Int, slug: String)
+    case failed(code: String, message: String)
+    case timedOut
+  }
+
+  /// Poll the host to a terminal state, RETURNING the outcome (unlike
+  /// `awaitRunning`, which `XCTFail`s on `.failed`). The sweep must classify
+  /// a `.failed` as a captured cell, so it needs the failure, not an assert.
+  private func awaitOutcome(host: PieEngineHost, slug: String, timeout: TimeInterval) async -> BootOutcome {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+      switch host.status {
+      case .running(let port, _):
+        return .running(port: Int(port), slug: slug)
+      case .failed(let code, let message):
+        return .failed(code: code.rawValue, message: message)
+      default:
+        try? await Task.sleep(nanoseconds: 250_000_000)
+      }
+    }
+    return .timedOut
+  }
+
+  /// Boot one budget cell on its own short `/tmp` pieHome through the REAL
+  /// production launch path (`LaunchSpecResolver` → `PieEngineHost` →
+  /// `PieControlLauncher.launch` → `pie serve`), applying the cell's knob:
+  ///   · `.guardrailBytes` — inject a fixed guardrail `Policy` so the real
+  ///     resolver/`KVCacheBudget` derives `default_token_limit` (app path).
+  ///   · `.kvPages`        — set `spec.maxNumKvPages` (engine path).
+  /// Returns the classified `BootOutcome`; never `XCTFail`s, so the caller
+  /// owns the verdict.
+  private func launchForBudget(_ e: RealEngineEnv, host: PieEngineHost,
+                               cell: BudgetCell, index: Int) async -> BootOutcome {
+    let fm = FileManager.default
+    do {
+      // Per-cell scratch under the base temp home; a per-cell SHORT /tmp
+      // pieHome keeps the engine aux socket under the sun_path limit and
+      // isolates each boot's config/shmem.
+      let cellRoot = tempPieHome.appendingPathComponent("budget-\(index)", isDirectory: true)
+      let modelsRoot = cellRoot.appendingPathComponent("models", isDirectory: true)
+      try fm.createDirectory(at: modelsRoot, withIntermediateDirectories: true)
+      let slug = e.modelPath.lastPathComponent
+      let staged = modelsRoot.appendingPathComponent(slug, isDirectory: false)
+      try? fm.removeItem(at: staged)
+      do { try fm.linkItem(at: e.modelPath, to: staged) }
+      catch { try fm.copyItem(at: e.modelPath, to: staged) }
+
+      let profiles = cellRoot.appendingPathComponent("profiles", isDirectory: true)
+      try fm.createDirectory(at: profiles, withIntermediateDirectories: true)
+      try """
+      id = "chat"
+      name = "Chat"
+      model = "\(slug)"
+      inferlet = "chat-apc"
+      """.write(to: profiles.appendingPathComponent("chat.toml"), atomically: true, encoding: .utf8)
+      let store = ProfileStore(
+        directory: profiles,
+        activeProfileURL: cellRoot.appendingPathComponent("active-profile", isDirectory: false))
+      try store.start()
+      try store.setActiveProfileID("chat")
+      defer { store.stop() }
+
+      let uuid = UUID().uuidString.prefix(8).lowercased()
+      let runID = ProcessInfo.processInfo.environment["PE2E_RUN_ID"].flatMap { $0.isEmpty ? nil : $0 }
+      let leaf = runID.map { "pe2e-\($0)-b\(index)-\(uuid)" } ?? "pe2e-b\(index)-\(uuid)"
+      let cellPieHome = URL(fileURLWithPath: "/tmp/\(leaf)", isDirectory: true)
+      try fm.createDirectory(at: cellPieHome, withIntermediateDirectories: true)
+
+      // App-side guardrail knob → injected memoryPolicy → KVCacheBudget.
+      let policyOverride: (() -> ModelMemoryGuardrail.Policy)?
+      if case let .guardrailBytes(bytes) = cell.knob {
+        policyOverride = { ModelMemoryGuardrail.Policy(maxResolvedModelBytes: bytes) }
+      } else {
+        policyOverride = nil
+      }
+
+      let resolver = LaunchSpecResolver(
+        profileStore: store,
+        pieBinary: { e.pieBin },
+        modelsRoot: { modelsRoot },
+        inferletsDir: { cellRoot.appendingPathComponent("inferlets") },
+        pieControlResources: { (wasm: e.wasm, manifest: e.manifest) },
+        pieHome: { cellPieHome },
+        subprocessEnvironment: { SpawnEnvSanitizer.sanitize(ProcessInfo.processInfo.environment) },
+        memoryPolicy: policyOverride ?? { ModelMemoryGuardrail.defaultPolicy })
+
+      var spec: PieControlLauncher.LaunchSpec
+      switch resolver.asClosure("chat", nil) {
+      case .success(let s): spec = s
+      case .failure(let err):
+        // A resolver rejection IS a structured, captured engine-start error.
+        return .failed(code: err.code.rawValue, message: err.message)
+      }
+      // Engine-side KV-pool knob.
+      if case let .kvPages(pages) = cell.knob {
+        spec.maxNumKvPages = pages
+      }
+      reapEngineSubprocess(in: &spec)
+
+      if case .failure(let err) = host.start(spec) {
+        return .failed(code: err.code.rawValue, message: err.message)
+      }
+      return await awaitOutcome(host: host, slug: slug, timeout: 120)
+    } catch {
+      return .failed(code: "harness_error", message: "\(error)")
     }
   }
 
@@ -570,6 +916,117 @@ final class RealEngineLaunchE2ETests: IsolatedTestCase {
                               "fast-think: spec_metrics absent — speculation did not engage")
     try cellRequire(spec["enabled"] as? Bool == true,
                     "fast-think: spec_metrics.enabled != true (fallback_reason=\(spec["fallback_reason"] ?? "nil"))")
+  }
+
+  /// ceiling cell (#475): the real-engine token-ceiling contract, proven per
+  /// loaded model so the (memory-size) matrix shows the engine's effective
+  /// `max_output_tokens` — and its clean over-ceiling rejection — vary with
+  /// the model that squeezed KV capacity.
+  ///
+  /// The original failure (#475 → #474 fix): a profile `max_tokens` above the
+  /// launched engine's memory-aware ceiling tripped a raw, opaque engine
+  /// error ("max ... must be in [0,512]") at generate time. #474 moved the
+  /// check to the chat-apc 400 boundary; this is the REAL-engine proof of
+  /// that boundary across every memory size:
+  ///   1. `GET /v1/models` advertises a positive, floor-respecting ceiling N
+  ///      (`max_output_tokens`, memory-aware; floor 512 = KVCacheBudget).
+  ///   2. An over-ceiling request (N+1) returns a CLEAN 400
+  ///      `max_tokens must be in [1, N]` blaming `param=max_tokens` — the
+  ///      boundary rejection, NOT the raw generate-time engine error.
+  ///   3. An at-ceiling request (N) is accepted (200) — the bound is
+  ///      inclusive, guarding an off-by-one in the ceiling check / clamp.
+  ///
+  /// The actual N and the over-ceiling 400 body are printed (CEILING* lines)
+  /// so the matrix log makes the contract auditable per memory size, not a
+  /// vacuous PASS.
+  private func assertTokenCeilingCell(port: Int, modelID: String) async throws {
+    // 1. Read the engine's advertised ceiling for the loaded model.
+    let ceiling = try await readAdvertisedCeiling(port: port, modelID: modelID, label: "ceiling")
+
+    // 2. Over-ceiling (N+1) must be rejected at the clean 400 boundary — the
+    //    exact failure #475 captures: NOT the raw generate-time engine error.
+    try await assertOverCeilingRejected(port: port, modelID: modelID, ceiling: ceiling, label: "ceiling")
+
+    // 3. At-ceiling (N) must be accepted — inclusive bound (off-by-one guard).
+    //    The trivial prompt stops the model early, so a large N stays cheap.
+    let (atData, atResp) = try await postChatRaw(port: port, body: [
+      "model": modelID,
+      "messages": [["role": "user", "content": "Reply with the single word: pong"]],
+      "max_tokens": ceiling,
+      "stream": false,
+    ])
+    let atHTTP = try cellUnwrap(atResp as? HTTPURLResponse, "ceiling: at-ceiling no HTTP response")
+    let atText = String(data: atData, encoding: .utf8) ?? ""
+    try cellRequire(atHTTP.statusCode == 200,
+                    "ceiling: at-ceiling (max_tokens=\(ceiling)) must be accepted (200), got "
+                    + "\(atHTTP.statusCode): \(atText.prefix(300))")
+  }
+
+  /// Read the engine's advertised `max_output_tokens` for `modelID` off
+  /// `GET /v1/models`, assert it is a positive, floor-respecting ceiling, and
+  /// print a `CEILING` evidence line. Shared by the single-budget `ceiling`
+  /// cell and the per-budget memory sweep so both audit the real N.
+  /// `label` tags the evidence/errors with the caller's cell name.
+  @discardableResult
+  private func readAdvertisedCeiling(port: Int, modelID: String, label: String) async throws -> Int {
+    let modelsURL = URL(string: "http://127.0.0.1:\(port)/v1/models")!
+    let (mData, mResp) = try await URLSession.shared.data(from: modelsURL)
+    let mHTTP = try cellUnwrap(mResp as? HTTPURLResponse, "\(label): no /v1/models HTTP response")
+    let mText = String(data: mData, encoding: .utf8) ?? ""
+    try cellRequire(mHTTP.statusCode == 200,
+                    "\(label): /v1/models HTTP \(mHTTP.statusCode): \(mText.prefix(300))")
+    let mJSON = try cellUnwrap(try JSONSerialization.jsonObject(with: mData) as? [String: Any],
+                               "\(label): /v1/models not a JSON object: \(mText.prefix(300))")
+    let entry = try cellUnwrap(
+      (mJSON["data"] as? [[String: Any]])?.first(where: { $0["id"] as? String == modelID }),
+      "\(label): /v1/models has no entry for \(modelID): \(mText.prefix(300))")
+    let ceiling = try cellUnwrap((entry["max_output_tokens"] as? NSNumber)?.intValue,
+                                 "\(label): entry missing numeric max_output_tokens: \(entry)")
+    print("CEILING\t\(modelID)\t\(label)\tmax_output_tokens=\(ceiling)")
+    try cellRequire(ceiling >= 512,
+                    "\(label): max_output_tokens \(ceiling) below the KVCacheBudget floor of 512")
+    return ceiling
+  }
+
+  /// Assert an over-ceiling request (`max_tokens = ceiling + 1`) is rejected
+  /// with the clean 400 `max_tokens must be in [1, ceiling]` blaming
+  /// `param=max_tokens` — the structured boundary rejection, not the raw
+  /// generate-time engine error. Prints a `CEILING-OVER` evidence line.
+  private func assertOverCeilingRejected(port: Int, modelID: String, ceiling: Int, label: String) async throws {
+    let (overData, overResp) = try await postChatRaw(port: port, body: [
+      "model": modelID,
+      "messages": [["role": "user", "content": "Reply with the single word: pong"]],
+      "max_tokens": ceiling + 1,
+      "stream": false,
+    ])
+    let overHTTP = try cellUnwrap(overResp as? HTTPURLResponse, "\(label): over-ceiling no HTTP response")
+    let overText = String(data: overData, encoding: .utf8) ?? ""
+    print("CEILING-OVER\t\(modelID)\t\(label)\tstatus=\(overHTTP.statusCode)\tbody=\(overText.prefix(200).debugDescription)")
+    try cellRequire(overHTTP.statusCode == 400,
+                    "\(label): over-ceiling (max_tokens=\(ceiling + 1)) must be a clean 400, got "
+                    + "\(overHTTP.statusCode): \(overText.prefix(300))")
+    let overErr = (try? JSONSerialization.jsonObject(with: overData) as? [String: Any])?["error"] as? [String: Any]
+    let overMsg = (overErr?["message"] as? String) ?? ""
+    let overParam = (overErr?["param"] as? String) ?? ""
+    try cellRequire(overMsg == "max_tokens must be in [1, \(ceiling)]",
+                    "\(label): over-ceiling 400 message drifted — want "
+                    + "'max_tokens must be in [1, \(ceiling)]', got \(overMsg.debugDescription)")
+    try cellRequire(overParam == "max_tokens",
+                    "\(label): over-ceiling 400 must blame param=max_tokens, got \(overParam.debugDescription)")
+  }
+
+  /// POST a non-streaming chat body and return the raw `(data, response)`
+  /// WITHOUT asserting a status — unlike `postChatJSON`, which requires 200.
+  /// The ceiling cell inspects both a 400 (over-ceiling) and a 200
+  /// (at-ceiling), so it owns the status check on each call.
+  private func postChatRaw(port: Int, body: [String: Any]) async throws -> (Data, URLResponse) {
+    let url = URL(string: "http://127.0.0.1:\(port)/v1/chat/completions")!
+    var req = URLRequest(url: url)
+    req.httpMethod = "POST"
+    req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    req.timeoutInterval = 180
+    req.httpBody = try JSONSerialization.data(withJSONObject: body)
+    return try await URLSession.shared.data(for: req)
   }
 
   // MARK: - launch helper

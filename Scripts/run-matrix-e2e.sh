@@ -3,13 +3,33 @@
 #
 # Drives the production launch path (real LaunchSpecResolver → real
 # PieControlLauncher → real `pie serve` → HTTP) once per curated model and
-# fires all three profile request shapes against that single booted engine:
+# fires every profile request shape against that single booted engine:
 #   · chat            → POST /v1/chat/completions
 #   · tree-of-thought → POST /v1/inferlet {inferlet:"tree-of-thought"}
 #   · fast-think      → POST /v1/chat/completions + a `speculation` field
+#   · ceiling         → the #475 token-ceiling contract: read the engine's
+#                       memory-aware `max_output_tokens` N off /v1/models,
+#                       then assert N+1 → a clean 400 `max_tokens must be in
+#                       [1, N]` (not the raw generate-time engine error) and
+#                       N → 200. Proven once per loaded model, so the matrix
+#                       is also the memory-size sweep of the ceiling.
 # Routing is per-REQUEST, not per-launch-profile, so one loaded model proves
-# every profile against it — 10 boots / 30 cells instead of 30 cold boots
+# every profile against it — 9 boots / 36 cells instead of 36 cold boots
 # (decisive for the slow ~9 GB 14B loads).
+#
+# The `ceiling` profile here probes ONE budget (the default launch). The
+# memory-SIZE dimension — varying the CONFIGURED budget so the effective N
+# actually changes — is a separate, multi-boot test driven by
+# `make test-e2e-budget-sweep` (RealEngineLaunchE2ETests.test_realEngine_
+# memoryBudgetSweep), kept off this per-request loop because it boots the
+# engine once per budget. Measured (#475, Qwen2.5-0.5B) which knob moves N:
+#   · App guardrail (#328/#438 → scheduler `default_token_limit`): lowers the
+#     ADVERTISED ceiling on a live boot — 32768 → 21845 → 512 — but never
+#     trips a load failure (it floors at 512; the physical KV pool is NOT
+#     resized — see the LaunchSpec.maxNumKvPages note + follow-up #489).
+#   · pie KV pool (`max_num_kv_pages`): lowers N = pages × 32 on a live boot
+#     (256 → 8192); too small for the model → a captured structured
+#     engine-start failure (`spawnFailed`, exit code + stderr), not a hang.
 #
 # The FULL run downloads ~36 GB (incl. two ~9 GB 14B models) and runs the
 # real Metal engine for every cell — minutes to hours. It must NEVER run by
@@ -21,7 +41,7 @@
 # a model that booted-but-emitted-no-cells = a load failure).
 #
 # Tunables (all optional):
-#   PIE_TEST_E2E_PROFILES        csv subset of chat,tree-of-thought,fast-think  (default: all)
+#   PIE_TEST_E2E_PROFILES        csv subset of chat,tree-of-thought,fast-think,ceiling  (default: all)
 #   PIE_TEST_E2E_MATRIX_MODELS   csv of case-insensitive substrings; keep only matching models
 #   PIE_BIN                      pie engine binary (default: the worktree release build)
 #   PIE_TEST_E2E_MODELS_DIR      staging dir for downloaded GGUFs (default: /tmp/pie-e2e-models)
@@ -52,7 +72,7 @@ MATRIX_MODELS=(
   "Qwen/Qwen3-14B-GGUF|Qwen3-14B-Q4_K_M.gguf|9001752960|1|1"
 )
 
-ALL_PROFILES="chat,tree-of-thought,fast-think"
+ALL_PROFILES="chat,tree-of-thought,fast-think,ceiling"
 
 # --- pie engine binary: enforce the worktree build --------------------
 # Like run-large-model-e2e.sh: a stale /Applications engine must not green
@@ -119,8 +139,8 @@ aggregate_cell() {
 
 # recognized_profile_count <profiles_csv>
 #
-# Echo how many recognized profiles (chat|tree-of-thought|fast-think) remain in
-# the csv after trimming whitespace and dropping empty fields. Extracted (like
+# Echo how many recognized profiles (chat|tree-of-thought|fast-think|ceiling)
+# remain in the csv after trimming whitespace and dropping empty fields. Extracted (like
 # aggregate_cell) so Scripts/test-matrix-aggregator.sh can unit-test the #483
 # hollow-green guard engine-free. An explicitly-set but empty / whitespace-only
 # / all-commas PIE_TEST_E2E_PROFILES resolves to zero recognized profiles: the
@@ -137,7 +157,7 @@ recognized_profile_count() {
   for p in ${parts[@]+"${parts[@]}"}; do
     p="$(printf '%s' "$p" | tr -d '[:space:]')"
     case "$p" in
-      chat|tree-of-thought|fast-think) n=$((n + 1)) ;;
+      chat|tree-of-thought|fast-think|ceiling) n=$((n + 1)) ;;
     esac
   done
   printf '%s\n' "$n"
