@@ -214,7 +214,43 @@ impl SpecRequest {
 #[derive(Deserialize, Serialize, Clone)]
 pub struct ChatMessage {
     pub role: String,
+    #[serde(deserialize_with = "deserialize_message_content")]
     pub content: String,
+}
+
+/// OpenAI content-part shape (`{"type":"text","text":"..."}`); other part
+/// types (image_url, etc.) are accepted but contribute no text.
+#[derive(Deserialize)]
+struct ContentPart {
+    #[serde(default)]
+    text: Option<String>,
+}
+
+/// `messages[].content` accepts either the simple string form or the
+/// multi-part array form (`[{"type":"text","text":"..."}, ...]`) that many
+/// OpenAI-compatible clients send (e.g. for retries/multi-modal turns).
+/// The array form is flattened into a single string by concatenating each
+/// part's `text` field, so every downstream consumer keeps treating
+/// `content` as a plain `String`.
+fn deserialize_message_content<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Content {
+        Text(String),
+        Parts(Vec<ContentPart>),
+    }
+
+    match Content::deserialize(deserializer)? {
+        Content::Text(s) => Ok(s),
+        Content::Parts(parts) => Ok(parts
+            .into_iter()
+            .filter_map(|p| p.text)
+            .collect::<Vec<_>>()
+            .join("")),
+    }
 }
 
 /// OpenAI tool entry. Only `function`-type tools are recognized; the
