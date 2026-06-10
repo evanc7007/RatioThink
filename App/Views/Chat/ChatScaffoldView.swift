@@ -194,23 +194,34 @@ struct ChatScaffoldView: View {
   }
 
   /// Human, fault-domain-correct message for an engine start/stop error.
+  /// #477: `EngineError.message` is a raw diagnostic — show the shared
+  /// taxonomy's curated line instead and log the raw text here, so the
+  /// in-chat banner never carries launcher/resolver internals.
   static func engineErrorMessage(_ error: Error, verb: String) -> String {
     if let e = error as? EngineError {
-      return "Couldn't \(verb) the engine: \(e.message)"
+      let problem = EngineProblem(statusCode: e.code, rawMessage: e.message)
+      if let detail = problem.technicalDetail {
+        Log.engine.error("ChatScaffoldView: \(verb) engine failed: \(detail, privacy: .public)")
+      }
+      return "Couldn't \(verb) the engine. \(problem.message)"
     }
-    return "Couldn't \(verb) the engine: \(error)"
+    Log.engine.error("ChatScaffoldView: \(verb) engine failed: \(String(describing: error), privacy: .public)")
+    return "Couldn't \(verb) the engine."
   }
 
   /// Message for the in-chat engine-failure banner (PR#15 F2/F3), or nil
   /// when it should stay hidden. modelMissing is owned by the download
   /// banner; other `.failed` codes show the live status detail; a thrown
   /// action error shows when the status itself isn't `.failed`.
-  private var engineFailureMessage: String? {
+  private func engineFailureMessage(for chat: Chat) -> String? {
     // PR#15 v2 F1: only suppress modelMissing when the download banner
     // will actually own it (a single-file-GGUF slug). A non-downloadable
     // modelMissing has no download banner, so it must fall through to the
-    // engine-failure banner rather than be menu-bar-dot-only.
-    let slug = selectedProfileDefault
+    // engine-failure banner rather than be menu-bar-dot-only. Keyed on the
+    // same GATE model as the display banner — if the two axes disagree
+    // (non-downloadable pick + downloadable default), both banners vanish
+    // and modelMissing becomes menu-bar-dot-only.
+    let slug = gateModelID(for: chat)
     let hasDownloadTarget = MissingModelRecovery.bannerTarget(
       engineStatus: engineStatusStore.status,
       profileDefaultModel: slug) != nil
@@ -298,15 +309,18 @@ struct ChatScaffoldView: View {
       // banner (the only one-click download there) must stay visible.
       if let bannerTarget = MissingModelRecovery.bannerTarget(
         engineStatus: engineStatusStore.status,
-        profileDefaultModel: selectedProfileDefault,
-        sendGatePresented: showNoModelPrompt && noModelAction.isDownload
+        // Keyed on the GATE model (pick ?? default) like the suppression
+        // axis below and the boot path — the banner must never offer a
+        // download for a default the Load tap wouldn't boot.
+        profileDefaultModel: gateModelID(for: chat),
+        sendGatePresented: showNoModelPrompt && noModelAction(for: chat).isDownload
       ) {
         ModelMissingBanner(
           target: bannerTarget,
           onDownloaded: { startEngineForSelectedProfile() },
           engineStatus: engineStatusStore.status
         )
-      } else if let message = engineFailureMessage {
+      } else if let message = engineFailureMessage(for: chat) {
         // PR#15 F2/F3: surface a non-modelMissing engine failure (or a
         // thrown start/stop error) in-chat — the user just acted; it must
         // not be menu-bar-dot-only or hidden under "Couldn't save". v2 F2:
@@ -337,7 +351,7 @@ struct ChatScaffoldView: View {
         gateState: chatStartState(for: chat),
         // #326: the model-availability action (Load / Download /
         // unavailable) captured when the send was blocked.
-        action: noModelAction,
+        action: noModelAction(for: chat),
         onLoad: { model in
           // #397: ensure the engine is running FIRST, then load — the
           // pre-#397 `loadDirect` no-opped on a stopped engine. The sheet
@@ -725,7 +739,10 @@ struct ChatScaffoldView: View {
       // `ChatStartGate.evaluate` no longer takes a `load:` state — the load
       // state machine is gone (ModelLoadCenter is residency-only).
       resolvedModelID: currentModelID(for: chat),
-      profileDefault: selectedProfileDefault,
+      // The gate names the model the Load tap will BOOT — the chat's pick
+      // when present (`gateModelID`), not the profile default the boot
+      // path would ignore (#459 repro 1 vs #460's engine-running nil).
+      profileDefault: gateModelID(for: chat),
       profileError: profileStore.lastActiveProfileError?.description
     )
   }
@@ -744,8 +761,8 @@ struct ChatScaffoldView: View {
   /// the shared `ModelDownloadController` and then dismisses on
   /// completion.) The decision itself stays #326's pure
   /// `MissingModelRecovery.promptAction`.
-  private var noModelAction: MissingModelRecovery.PromptAction {
-    Self.availabilityAction(profileDefault: selectedProfileDefault,
+  private func noModelAction(for chat: Chat) -> MissingModelRecovery.PromptAction {
+    Self.availabilityAction(gateModel: gateModelID(for: chat),
                             isModelInstalled: Self.isModelInstalled)
   }
 
@@ -754,13 +771,38 @@ struct ChatScaffoldView: View {
   /// a view host (and so no stored/memoized copy can hide here): it
   /// re-reads `isModelInstalled` on every call, which is what keeps the
   /// availability axis live per render. `isModelInstalled` is injected so a
-  /// test can drive it; production passes `Self.isModelInstalled`.
-  static func availabilityAction(profileDefault slug: String?,
+  /// test can drive it; production passes `Self.isModelInstalled`. Keys on
+  /// the GATE model (chat pick ?? profile default, `gateModelID`) so the
+  /// install check probes the model the Load/Download will actually use.
+  static func availabilityAction(gateModel slug: String?,
                                  isModelInstalled: (String) -> Bool)
     -> MissingModelRecovery.PromptAction {
     MissingModelRecovery.promptAction(
       profileDefaultModel: slug,
       isInstalled: slug.map(isModelInstalled) ?? false)
+  }
+
+  /// The model identity the send GATE describes — mirrors the boot path's
+  /// precedence (`startEngineForSelectedProfile` boots
+  /// `chats.first?.modelID`, falling back to the profile default), so the
+  /// prompt's chip, download CTA, and Load action all name the model the
+  /// tap will actually boot (#459 repro 1). Distinct from
+  /// `currentModelID(for:)`, which deliberately nils the pick while the
+  /// engine isn't `.running` (#460 send-resolution semantics) and so can't
+  /// feed the gate's model-identity axis. Pure + static for SPM-free
+  /// unit-testing of the precedence.
+  static func gateModelID(selectedModelID: String?,
+                          profileDefaultModel: String?) -> String? {
+    if let pick = selectedModelID,
+       !pick.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+      return pick
+    }
+    return profileDefaultModel
+  }
+
+  private func gateModelID(for chat: Chat) -> String? {
+    Self.gateModelID(selectedModelID: chat.modelID,
+                     profileDefaultModel: selectedProfileDefault)
   }
 
   /// "Load default" action. Honors the no-eager-load invariant — only
