@@ -3209,6 +3209,86 @@ fn next_tool_call_id() -> String {
 mod tests {
     use super::*;
 
+    // ─── Multi-part message content (#115) ─────────────────
+
+    fn parse_message(json: &str) -> Result<ChatMessage, serde_json::Error> {
+        serde_json::from_str(json)
+    }
+
+    #[test]
+    fn content_plain_string_unchanged() {
+        let m = parse_message(r#"{"role":"user","content":"hello"}"#).unwrap();
+        assert_eq!(m.content, "hello");
+    }
+
+    #[test]
+    fn content_single_text_part_flattens() {
+        let m = parse_message(r#"{"role":"user","content":[{"type":"text","text":"hello"}]}"#)
+            .unwrap();
+        assert_eq!(m.content, "hello");
+    }
+
+    #[test]
+    fn content_multiple_text_parts_concatenate_in_order() {
+        let m = parse_message(
+            r#"{"role":"user","content":[
+                {"type":"text","text":"a"},
+                {"type":"text","text":"b"},
+                {"type":"text","text":"c"}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(m.content, "abc");
+    }
+
+    #[test]
+    fn content_empty_array_yields_empty_string() {
+        // Flattens to "" — downstream the blank-content 400 gate in
+        // `handle_parsed` rejects it, same as `content:""`.
+        let m = parse_message(r#"{"role":"user","content":[]}"#).unwrap();
+        assert_eq!(m.content, "");
+    }
+
+    #[test]
+    fn content_non_text_parts_contribute_nothing() {
+        // image_url and other part types are accepted but textless.
+        let m = parse_message(
+            r#"{"role":"user","content":[
+                {"type":"image_url","image_url":{"url":"http://x/y.png"}},
+                {"type":"text","text":"caption"}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(m.content, "caption");
+    }
+
+    #[test]
+    fn content_part_with_null_text_is_skipped() {
+        let m = parse_message(
+            r#"{"role":"user","content":[{"type":"text","text":null},{"type":"text","text":"x"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(m.content, "x");
+    }
+
+    #[test]
+    fn content_rejects_non_string_non_array() {
+        assert!(parse_message(r#"{"role":"user","content":42}"#).is_err());
+        assert!(parse_message(r#"{"role":"user","content":{"text":"x"}}"#).is_err());
+        assert!(parse_message(r#"{"role":"user","content":null}"#).is_err());
+    }
+
+    #[test]
+    fn content_rejects_array_with_non_object_part() {
+        // One malformed part poisons the whole array → 400 at the
+        // request boundary, never a silently dropped part.
+        assert!(parse_message(r#"{"role":"user","content":["bare string"]}"#).is_err());
+        assert!(
+            parse_message(r#"{"role":"user","content":[{"type":"text","text":"ok"}, 7]}"#)
+                .is_err()
+        );
+    }
+
     // ─── Forward-pass starvation guard (#439) ─────────────
 
     #[test]
