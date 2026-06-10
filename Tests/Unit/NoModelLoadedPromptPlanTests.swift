@@ -87,9 +87,13 @@ final class NoModelLoadedPromptPlanTests: XCTestCase {
   func test_modelMissing_downloadable_offers_inline_download() {
     // #326 inline download IS the fix for a missing-but-downloadable model.
     // #477: the CTA carries the action; no reason line under it.
+    // Review v2 F1: this failure state carries no target axis while the CTA
+    // downloads the gate target (the pin when present) — the headline is
+    // target-NEUTRAL and doubles as the explainer, so no downloadCaption.
     let p = plan(.engineFailed(code: .modelMissing, reason: "not downloaded"), downloadAction)
-    XCTAssertEqual(p.headline, "Default model isn't downloaded")
+    XCTAssertEqual(p.headline, "Model isn't downloaded")
     XCTAssertNil(p.reason)
+    XCTAssertNil(p.downloadCaption, "headline explains the state; no second caption")
     XCTAssertTrue(p.showsDownloadCTA)
     XCTAssertEqual(p.primary, .none)               // CTA owns the action, not Load
   }
@@ -144,15 +148,15 @@ final class NoModelLoadedPromptPlanTests: XCTestCase {
 
   // MARK: - #326 paths preserved (regression guard)
 
-  func test_needsDefaultLoad_on_disk_offers_load_with_benign_headline() {
-    let p = plan(.needsDefaultLoad(modelID: ProfileStore.defaultChatModelID), loadAction)
+  func test_needsLoad_on_disk_offers_load_with_benign_headline() {
+    let p = plan(.needsLoad(target: ModelTarget(modelID: ProfileStore.defaultChatModelID, source: .profileDefault)), loadAction)
     XCTAssertEqual(p.headline, "Model not loaded yet")  // #397 framing
     XCTAssertTrue(p.showsModelChip)
     XCTAssertEqual(p.primary, .load)
   }
 
-  func test_needsDefaultLoad_not_on_disk_offers_download_with_truthful_headline() {
-    let p = plan(.needsDefaultLoad(modelID: ProfileStore.defaultChatModelID), downloadAction)
+  func test_needsLoad_not_on_disk_offers_download_with_truthful_headline() {
+    let p = plan(.needsLoad(target: ModelTarget(modelID: ProfileStore.defaultChatModelID, source: .profileDefault)), downloadAction)
     // #446: headline agrees with the body ("isn't downloaded yet") and with
     // the .engineFailed(.modelMissing) + .download sibling — not the
     // contradictory "No model loaded" (a default IS configured). GUI S286/S326
@@ -162,12 +166,87 @@ final class NoModelLoadedPromptPlanTests: XCTestCase {
     XCTAssertEqual(p.primary, .none)                    // no noModel.load for .download
   }
 
+  // MARK: - #497: source-honest framing for a pinned selection
+
+  func test_497_needsLoad_selected_download_headline_names_the_selection() {
+    let p = plan(.needsLoad(target: ModelTarget(
+      modelID: ProfileStore.defaultChatModelID, source: .selected)), downloadAction)
+    XCTAssertEqual(p.headline, "Selected model isn't downloaded",
+                   "a pinned selection must never be described as the default")
+    XCTAssertTrue(p.showsDownloadCTA)
+  }
+
+  func test_497_needsLoad_selected_on_disk_offers_load_same_affordances() {
+    let p = plan(.needsLoad(target: ModelTarget(
+      modelID: ProfileStore.defaultChatModelID, source: .selected)), loadAction)
+    XCTAssertEqual(p.headline, "Model not loaded yet")
+    XCTAssertTrue(p.showsModelChip)
+    XCTAssertEqual(p.primary, .load)
+  }
+
   func test_noDefault_is_unavailable_with_settings() {
     let p = plan(.noDefault, unavailableAction)
     XCTAssertEqual(p.headline, "No model loaded")
-    XCTAssertTrue(p.showsUnavailableCopy)
+    XCTAssertEqual(p.unavailableCopy,
+                   "This profile has no model ready. Choose one from the Model menu in the toolbar, or add one in Settings → Models.")
     XCTAssertTrue(p.showsOpenSettings)
     XCTAssertEqual(p.primary, .none)
+  }
+
+  // MARK: - review v1 F1/F2/F5: source-honest copy lives in the pure Plan
+
+  func test_497_needsLoad_selected_unavailable_names_the_pin() {
+    // Review v1 F1: a pinned, non-loadable, non-downloadable model must be
+    // named as the SELECTION — never "this profile has no model ready".
+    let p = plan(.needsLoad(target: ModelTarget(
+      modelID: "org/picked", source: .selected)), unavailableAction)
+    XCTAssertEqual(p.headline, "Selected model isn't available")
+    XCTAssertEqual(p.unavailableCopy,
+                   "Your selected model isn't available on this Mac. Choose another from the Model menu in the toolbar, or add one in Settings → Models.")
+    XCTAssertTrue(p.showsOpenSettings)
+    XCTAssertEqual(p.primary, .none)
+  }
+
+  func test_497_needsLoad_default_unavailable_keeps_profile_framing() {
+    let p = plan(.needsLoad(target: ModelTarget(
+      modelID: "org/default", source: .profileDefault)), unavailableAction)
+    XCTAssertEqual(p.headline, "No model loaded")
+    XCTAssertEqual(p.unavailableCopy,
+                   "This profile has no model ready. Choose one from the Model menu in the toolbar, or add one in Settings → Models.")
+  }
+
+  func test_497_load_captions_follow_target_source() {
+    // Review v1 F5: captions are part of the pure Plan, asserted here.
+    let selected = plan(.needsLoad(target: ModelTarget(
+      modelID: ProfileStore.defaultChatModelID, source: .selected)), loadAction)
+    XCTAssertEqual(selected.loadCaption,
+                   "Load your selected model to send your message?")
+    let fallback = plan(.needsLoad(target: ModelTarget(
+      modelID: ProfileStore.defaultChatModelID, source: .profileDefault)), loadAction)
+    XCTAssertEqual(fallback.loadCaption,
+                   "Load this profile's default model to send your message?")
+  }
+
+  func test_497_download_captions_follow_target_source() {
+    let selected = plan(.needsLoad(target: ModelTarget(
+      modelID: ProfileStore.defaultChatModelID, source: .selected)), downloadAction)
+    XCTAssertEqual(selected.downloadCaption,
+                   "Your selected model isn't downloaded yet. Download it to send your message.")
+    let fallback = plan(.needsLoad(target: ModelTarget(
+      modelID: ProfileStore.defaultChatModelID, source: .profileDefault)), downloadAction)
+    XCTAssertEqual(fallback.downloadCaption,
+                   "This profile's model isn't downloaded yet. Download it to send your message.")
+  }
+
+  func test_497_busy_download_detail_is_target_neutral() {
+    // Review v1 F2: `.busy` has no target axis, so the spinner detail must
+    // never claim "this profile's model" while the CTA downloads a pin.
+    let p = plan(.busy(.startingEngine), downloadAction)
+    XCTAssertEqual(p.detail, "The model isn't downloaded yet — download it to continue.")
+    XCTAssertNil(p.downloadCaption, "the spinner detail explains the state; no second caption")
+    let loading = plan(.busy(.startingEngine), loadAction)
+    XCTAssertEqual(loading.detail, "Your model is loading — your message will send once it's ready.")
+    XCTAssertEqual(plan(.busy(.stoppingEngine), loadAction).detail, "One moment…")
   }
 
   // MARK: - #400: availability action is derived LIVE per render (drift fix)
@@ -211,7 +290,8 @@ final class NoModelLoadedPromptPlanTests: XCTestCase {
 
     // The rendered plan follows the live action for an unchanged lifecycle
     // state (sheet open on a profile default): Download CTA → Load.
-    let sheetOpen: ChatStartGate.State = .needsDefaultLoad(modelID: slug)
+    let sheetOpen: ChatStartGate.State = .needsLoad(target: ModelTarget(
+      modelID: slug, source: .profileDefault))
     XCTAssertTrue(plan(sheetOpen, r1).showsDownloadCTA)
     XCTAssertEqual(plan(sheetOpen, r2).primary, .load)
   }
@@ -231,7 +311,7 @@ final class NoModelLoadedPromptPlanTests: XCTestCase {
 
   /// With the engine stopped, `currentModelID` deliberately nils the chat's
   /// pick (#460), so the gate's model-identity axis must come from
-  /// `gateModelID` — the same pick-over-default precedence the Load tap's
+  /// `gateTarget` — the same pick-over-default precedence the Load tap's
   /// `startEngineForSelectedProfile` boots (#459 repro 1). The prompt must
   /// name the PICK, never the profile default the boot would ignore.
   func test_gate_with_pick_and_stopped_engine_carries_the_pick() {
@@ -240,24 +320,24 @@ final class NoModelLoadedPromptPlanTests: XCTestCase {
       engineStatus: .stopped,
       helperError: nil,
       resolvedModelID: nil,  // engine stopped → currentModelID is nil (#460)
-      profileDefault: ChatScaffoldView.gateModelID(
+      target: ChatScaffoldView.gateTarget(
         selectedModelID: pick,
         profileDefaultModel: ProfileStore.defaultChatModelID))
-    XCTAssertEqual(state, .needsDefaultLoad(modelID: pick))
+    XCTAssertEqual(state, .needsLoad(target: ModelTarget(modelID: pick, source: .selected)))
   }
 
-  func test_gateModelID_precedence_matches_boot_path() {
+  func test_gateTarget_precedence_matches_boot_path() {
     XCTAssertEqual(
-      ChatScaffoldView.gateModelID(selectedModelID: "pick", profileDefaultModel: "default"),
-      "pick")
+      ChatScaffoldView.gateTarget(selectedModelID: "pick", profileDefaultModel: "default"),
+      ModelTarget(modelID: "pick", source: .selected))
     XCTAssertEqual(
-      ChatScaffoldView.gateModelID(selectedModelID: nil, profileDefaultModel: "default"),
-      "default")
+      ChatScaffoldView.gateTarget(selectedModelID: nil, profileDefaultModel: "default"),
+      ModelTarget(modelID: "default", source: .profileDefault))
     // Blank pick falls back, mirroring the helper's nil/blank boot fallback.
     XCTAssertEqual(
-      ChatScaffoldView.gateModelID(selectedModelID: "  ", profileDefaultModel: "default"),
-      "default")
-    XCTAssertNil(ChatScaffoldView.gateModelID(selectedModelID: nil, profileDefaultModel: nil))
+      ChatScaffoldView.gateTarget(selectedModelID: "  ", profileDefaultModel: "default"),
+      ModelTarget(modelID: "default", source: .profileDefault))
+    XCTAssertNil(ChatScaffoldView.gateTarget(selectedModelID: nil, profileDefaultModel: nil))
   }
 
   /// Availability keys on the gate model: a pick that IS installed while
@@ -268,9 +348,9 @@ final class NoModelLoadedPromptPlanTests: XCTestCase {
     let pick = "org/picked/picked.gguf"
     let installed: (String) -> Bool = { $0 == pick }  // default missing
     let action = ChatScaffoldView.availabilityAction(
-      gateModel: ChatScaffoldView.gateModelID(
+      gateModel: ChatScaffoldView.gateTarget(
         selectedModelID: pick,
-        profileDefaultModel: ProfileStore.defaultChatModelID),
+        profileDefaultModel: ProfileStore.defaultChatModelID)?.modelID,
       isModelInstalled: installed)
     XCTAssertEqual(action, .load(pick))
   }
@@ -279,14 +359,14 @@ final class NoModelLoadedPromptPlanTests: XCTestCase {
   /// chip naming the PICK (the chip slug comes from the `.load` payload).
   func test_prompt_plan_chip_names_the_pick() {
     let pick = "org/picked/picked.gguf"
-    let gateModel = ChatScaffoldView.gateModelID(
+    let gateTarget = ChatScaffoldView.gateTarget(
       selectedModelID: pick,
       profileDefaultModel: ProfileStore.defaultChatModelID)
     let state = ChatStartGate.evaluate(
       engineStatus: .stopped, helperError: nil,
-      resolvedModelID: nil, profileDefault: gateModel)
+      resolvedModelID: nil, target: gateTarget)
     let action = ChatScaffoldView.availabilityAction(
-      gateModel: gateModel, isModelInstalled: { $0 == pick })
+      gateModel: gateTarget?.modelID, isModelInstalled: { $0 == pick })
     let p = plan(state, action)
     XCTAssertTrue(p.showsModelChip)
     XCTAssertEqual(p.primary, .load)
@@ -309,9 +389,9 @@ final class NoModelLoadedPromptPlanTests: XCTestCase {
     // fixture here gets a target and defeats the suppression assert).
     let pick = "org/picked"
     let failed = EngineStatus.failed(code: .modelMissing, message: "resolver trace")
-    let gateModel = ChatScaffoldView.gateModelID(
+    let gateModel = ChatScaffoldView.gateTarget(
       selectedModelID: pick,
-      profileDefaultModel: ProfileStore.defaultChatModelID)
+      profileDefaultModel: ProfileStore.defaultChatModelID)?.modelID
 
     XCTAssertNil(
       MissingModelRecovery.bannerTarget(
@@ -328,9 +408,9 @@ final class NoModelLoadedPromptPlanTests: XCTestCase {
     XCTAssertNotNil(
       MissingModelRecovery.bannerTarget(
         engineStatus: failed,
-        profileDefaultModel: ChatScaffoldView.gateModelID(
+        profileDefaultModel: ChatScaffoldView.gateTarget(
           selectedModelID: nil,
-          profileDefaultModel: ProfileStore.defaultChatModelID)))
+          profileDefaultModel: ProfileStore.defaultChatModelID)?.modelID))
   }
 
   /// Review v5 F2: with the display banner suppressed for a
@@ -341,9 +421,9 @@ final class NoModelLoadedPromptPlanTests: XCTestCase {
   func test_missingModel_nonDownloadablePick_fallsThroughToEngineFailureBanner() {
     let pick = "org/picked"  // non-downloadable (2-segment dir slug)
     let failed = EngineStatus.failed(code: .modelMissing, message: "resolver trace")
-    let gateModel = ChatScaffoldView.gateModelID(
+    let gateModel = ChatScaffoldView.gateTarget(
       selectedModelID: pick,
-      profileDefaultModel: ProfileStore.defaultChatModelID)
+      profileDefaultModel: ProfileStore.defaultChatModelID)?.modelID
 
     // Both axes key on the same gate model, as ChatScaffoldView wires them.
     let hasDownloadTarget = MissingModelRecovery.bannerTarget(
