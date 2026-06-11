@@ -712,14 +712,19 @@ struct ChatScaffoldView: View {
     // #507: the chat's app-scoped controller — the send outlives this view.
     let sendController = sendCoordinator.controller(for: chatID)
 
-    if let totConfig = profileStore.profile(forProfileID: viewModel.selectedProfileID)?.treeOfThought {
+    // #523 Part B binds the whole profile so the ToT dispatch can source its
+    // candidate-generation temperature from it (`toTRequestSampling` below).
+    if let totProfile = profileStore.profile(forProfileID: viewModel.selectedProfileID),
+       let totConfig = totProfile.treeOfThought {
       sendController.sendTreeOfThought(
         chat: chat,
         context: modelContext,
         engine: engineStore.client,
         config: totConfig,
         persistenceStatus: persistenceStatus,
-        options: options
+        // #523 Part B: source the ToT candidate-generation temperature from
+        // the profile, not the toolbar default.
+        options: options.withSampling(totProfile.toTRequestSampling)
       )
       return
     }
