@@ -30,13 +30,10 @@ a prompt box. Rational adds **profiles** — named *thinking modes* you switch i
 one click, each a saved preset bundling a model, sampling, a system prompt, and a
 chat workflow.
 
-- **Thinking modes, not just a model picker.** A profile is a complete preset,
-  saved to disk and editable as TOML. Rational ships with **Chat**, **Fast Think**,
-  and **Tree of Thought** — make your own, too. Ollama exposes these only as
-  per-request parameters; LM Studio has no explicit profiles.
 - **Fast Think — speculative decoding by switching a profile.** Runs the same
   model greedily with a speculative drafter — fewer waits, identical output — on
   the bundled Apple-Silicon engine. No flags, no separate model: just pick it.
+  It currently implements [Cacheback algorithm](https://www.yecl.org/publications/ma2025emnlp.pdf).
 - **Tree of Thought — a search tree, in one click.** The Tree of Thought profile
   turns one question into a scored search: the engine branches, scores each branch
   1–10, and keeps the best beam — shown live in a foldable tree, then the chosen
