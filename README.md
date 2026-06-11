@@ -42,7 +42,7 @@ chat workflow.
   1–10, and keeps the best beam — shown live in a foldable tree, then the chosen
   answer.
 
-▶ **[See the animated walkthrough](docs/landing.html)** — open it in your browser.
+▶ **[See the animated walkthrough](https://shsym.github.io/RatioThink/landing)** — open it in your browser.
 
 ## Install
 
