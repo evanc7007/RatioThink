@@ -61,6 +61,13 @@ struct ChatScaffoldView: View {
   /// `HelperUnavailableNotice` — never the engine-failure banner, which would
   /// re-attribute a Helper state to the engine.
   @State private var helperBlock: HelperUnavailable?
+  /// #516: the send the gate is holding plus its fire signal. Armed when a
+  /// send is blocked (with the blocked draft + the gate's load target),
+  /// settled on every model-resolution edge (fired exactly once through the
+  /// composer's normal submit path), and disarmed on cancel, manual send,
+  /// profile switch, navigation away, or a stale resolution. The
+  /// transitions live in `PendingSendState` so they are unit-tested.
+  @State private var pendingSend = PendingSendState()
 
   init(
     chatID: UUID,
@@ -378,8 +385,22 @@ struct ChatScaffoldView: View {
           viewModel: viewModel,
           isSending: sendController.isInFlight,
           shouldAllowSend: { currentModelID(for: chat) != nil },
-          onSendBlocked: { presentNoModelPrompt() },
-          onUserMessageSaved: { _ in sendAssistantTurn(for: chat) }
+          onSendBlocked: { draft in
+            // #516: capture the blocked send so it can auto-submit once
+            // the gate's load target resolves — the promise the sheet's
+            // copy makes ("…to send your message").
+            pendingSend.arm(chatID: chat.id,
+                            targetModelID: gateTarget(for: chat)?.modelID,
+                            messageText: draft)
+            presentNoModelPrompt()
+          },
+          onUserMessageSaved: { _ in
+            // A send committed (manual or fired auto-send) — any armed
+            // pending send is now satisfied or superseded. #516.
+            pendingSend.disarm()
+            sendAssistantTurn(for: chat)
+          },
+          autoSubmit: pendingSend.autoSubmit
         )
       }
     }
@@ -410,8 +431,17 @@ struct ChatScaffoldView: View {
         onRetryEngineStart: { startEngineForSelectedProfile() },
         // #397 F1: helper unreachable → force an immediate status re-poll.
         onRefresh: { refreshEngineStatus() },
-        onCancel: { showNoModelPrompt = false },
-        engineStatus: engineStatusStore.status
+        onCancel: {
+          // #516: a dismissed gate drops the pending send — the draft stays
+          // in the composer, but nothing auto-fires later.
+          pendingSend.disarm()
+          showNoModelPrompt = false
+        },
+        engineStatus: engineStatusStore.status,
+        // #516: only promise "…to send your message" when a blocked send is
+        // actually armed to fire (the launch-time prompt raises this same
+        // sheet with an empty composer — there, the copy must not lie).
+        willAutoSend: pendingSend.pending != nil
       )
     }
     .onChange(of: engineStatusStore.status) { _, new in
@@ -422,6 +452,18 @@ struct ChatScaffoldView: View {
       // #4: the engine no longer auto-starts on boot — once status settles
       // (.starting → .stopped), proactively ask to start the model.
       maybePromptEngineStartOnLaunch()
+      // #516 review F1: `currentModelID` gates on THIS status being
+      // `.running`, but the residency feed (`EngineLifecycle` →
+      // `ModelLoadCenter`) observes the engine independently and can land
+      // FIRST — its `residentModelID` edge then evaluates to `.hold` and
+      // the change-guarded setters emit no later edge. The status flip is
+      // that missing edge; `resolutionEdge` is idempotent, so the extra
+      // call is safe in every other ordering.
+      // Review F6: at the `.running` flip the selection authority is still
+      // pre-reconcile (the `.task` reconcile runs after) — require
+      // reconciled residency so this edge can't fire a stale pin into an
+      // engine serving a different model.
+      resolutionEdge(for: chat, requiresResidency: true)
     }
     // #496: auto-dismiss the inline helper-refusal once the Helper recovers to
     // a state where the op would be allowed again, so a stale "helper is
@@ -432,8 +474,10 @@ struct ChatScaffoldView: View {
     // #397: auto-dismiss the gate once a model resolves (engine came up
     // and reconciled, or a load completed) so the user lands back at the
     // composer with their draft intact — no stale "starting…" sheet.
-    .onChange(of: modelLoadCenter.residentModelID) { _, _ in dismissPromptIfResolved(for: chat) }
-    .onChange(of: chat.modelID) { _, _ in dismissPromptIfResolved(for: chat) }
+    // These two are the post-reconcile edges — residency (or the re-seeded
+    // selection) IS the new fact being observed, so no residency pre-check.
+    .onChange(of: modelLoadCenter.residentModelID) { _, _ in resolutionEdge(for: chat, requiresResidency: false) }
+    .onChange(of: chat.modelID) { _, _ in resolutionEdge(for: chat, requiresResidency: false) }
     // #413: open/close the helper-health generation gate around every stream.
     // While a chat / ToT generation is in flight a saturated engineStatus poll
     // path can time out for many consecutive polls; without this gate the
@@ -443,6 +487,14 @@ struct ChatScaffoldView: View {
     // ending the generation and releasing the gate).
     .onChange(of: sendController.isInFlight) { _, inFlight in
       helperHealth.setGenerating(inFlight)
+      // #516 review F2: a fire delivered while a send is in flight would be
+      // swallowed by `submit()`'s `!isSending` guard — so `verdict` holds
+      // while in flight, and THIS edge (in-flight clearing) re-evaluates
+      // and delivers the deferred fire.
+      // Residency-checked (F6): a deferred fire must not consume the
+      // pending against a relaunched-but-unreconciled engine either; if
+      // residency is still nil this holds and the residency edge delivers.
+      if !inFlight { resolutionEdge(for: chat, requiresResidency: true) }
     }
     .onAppear {
       // Seed the toolbar from the persisted profile so the menu
@@ -463,6 +515,9 @@ struct ChatScaffoldView: View {
       // the sidebar. Save explicitly so a quick relaunch lands the
       // new profile durably.
       guard chat.profileID != new else { return }
+      // #516: a profile switch makes the gate's promised load target stale —
+      // drop the pending send rather than auto-firing under a new profile.
+      pendingSend.disarm()
       let previous = chat.profileID
       chat.profileID = new
       do {
@@ -492,6 +547,9 @@ struct ChatScaffoldView: View {
     }
     .onDisappear {
       sendController.cancel()
+      // #516: navigating away abandons the pending flow — no stale
+      // auto-send when the user later returns or switches chats.
+      pendingSend.disarm()
     }
     .task(id: downloadController.completionTick) {
       await refreshToolbarModelOptions()
@@ -520,7 +578,8 @@ struct ChatScaffoldView: View {
   /// engine actually serves (`GET /v1/models`) — the only id its chat
   /// endpoint accepts. No-op when the engine isn't running or a load is
   /// already in flight.
-  private func reconcileEngineResidentModel(for chat: Chat) async {
+  private func reconcileEngineResidentModel(for chat: Chat,
+                                            isRetryPass: Bool = false) async {
     // Bounded retry while the engine stays running — a single transient
     // /v1/models failure must not strand residentModelID unset until a
     // status flip that may never come on equal .running polls (F2).
@@ -582,6 +641,24 @@ struct ChatScaffoldView: View {
     case .failedAfterRetries(let attempts):
       // Don't silently drop: engine running but unreachable for models.
       NSLog("ChatScaffold: /v1/models reconcile failed after \(attempts) attempts while engine .running")
+      // #516 review F8: residency-required edges hold the pending send
+      // until THIS reconcile lands — and equal `.running` polls never
+      // re-run the `.task`, so a bounded failure here would strand the
+      // promise forever. Settle instead: one backed-off retry round, and
+      // on the final failure fall back to the residency-free edge (the
+      // bounded pre-F6 behavior beats an infinite hold). The `.task`
+      // cancels this on a status flip (the sleep throws), so a real
+      // engine transition supersedes the fallback.
+      switch Self.reconcileFailureStep(hasPendingAutoSend: pendingSend.pending != nil,
+                                       isRetryPass: isRetryPass) {
+      case .none:
+        break
+      case .retry:
+        guard (try? await Task.sleep(nanoseconds: 2_000_000_000)) != nil else { break }
+        await reconcileEngineResidentModel(for: chat, isRetryPass: true)
+      case .fallbackEdge:
+        resolutionEdge(for: chat, requiresResidency: false)
+      }
     case .empty:
       // Engine running but serving NO model — clear any stale residency so
       // the send gate doesn't pass a model the engine no longer has (the
@@ -871,7 +948,7 @@ struct ChatScaffoldView: View {
   /// running FIRST (the App's only engine-start path), since a load
   /// against a stopped engine would otherwise just defer on
   /// `engineNotReady`. The sheet stays open and reflects busy→ready, then
-  /// auto-dismisses via `dismissPromptIfResolved`.
+  /// auto-dismisses via `resolutionEdge` (probe-gated — review v3 F9).
   private func loadDefaultModel(_ model: String) {
     switch engineStatusStore.status {
     case .running:
@@ -903,12 +980,68 @@ struct ChatScaffoldView: View {
     }
   }
 
-  /// #397: close the gate once a model resolves so the user lands back at
-  /// the composer with their draft intact.
-  private func dismissPromptIfResolved(for chat: Chat) {
-    if showNoModelPrompt, currentModelID(for: chat) != nil {
+
+  /// #516 review F8: the bounded reconcile-failure policy. Without a
+  /// pending send there is nothing to settle (the pre-existing NSLog
+  /// behavior stands — surfacing the failure in the gate UI is the
+  /// deferred FC1). With one armed: first pass earns a backed-off retry;
+  /// the final failure falls back to the residency-free resolution edge
+  /// so the promise settles (fire or disarm) instead of holding forever.
+  enum ReconcileFailureStep: Equatable {
+    case none, retry, fallbackEdge
+  }
+
+  static func reconcileFailureStep(hasPendingAutoSend: Bool,
+                                   isRetryPass: Bool) -> ReconcileFailureStep {
+    guard hasPendingAutoSend else { return .none }
+    return isRetryPass ? .fallbackEdge : .retry
+  }
+
+  /// #516 review F6: what a resolution edge may treat as resolved. On the
+  /// STATUS edge (`requiresResidency: true`) the selection authority is
+  /// still pre-reconcile — `chat.modelID`/profile default can name model A
+  /// while the engine just came up serving model B (helper auto-relaunch
+  /// boots the active-profile marker's model) — so until
+  /// `residentModelID` is reconciled nothing counts as resolved; the
+  /// post-reconcile residency/`chat.modelID` edges then deliver the real
+  /// fire-or-disarm. Pure + static so the ordering matrix is unit-tested.
+  static func resolutionProbe(resolvedModelID: String?,
+                              residentModelID: String?,
+                              requiresResidency: Bool) -> String? {
+    if requiresResidency, residentModelID == nil { return nil }
+    return resolvedModelID
+  }
+
+  /// #516: a model-resolution edge (residency reconciled, or the chat's
+  /// selection re-seeded to the served model). Closes the gate (#397) and
+  /// settles any armed pending send: fire it through the composer when the
+  /// INTENDED model resolved, drop it when a different one did (the user
+  /// switched model/profile mid-load), keep holding otherwise.
+  ///
+  /// `requiresResidency` — true ONLY for the engine-status edge, which can
+  /// arrive before `reconcileEngineResidentModel` re-seeds the selection
+  /// authority (review F6, see `resolutionProbe`). No default: every new
+  /// edge must decide explicitly.
+  private func resolutionEdge(for chat: Chat, requiresResidency: Bool) {
+    let resolved = Self.resolutionProbe(
+      resolvedModelID: currentModelID(for: chat),
+      residentModelID: modelLoadCenter.residentModelID,
+      requiresResidency: requiresResidency)
+    // #397: close the gate once a model resolves so the user lands back at
+    // the composer with their draft intact. Review v3 F9: keyed on the SAME
+    // probe result as the verdict below — on a residency-required edge the
+    // sheet must not flash the dismiss-success signal while the fire is
+    // still held pending reconcile (a later disarm/strand would otherwise
+    // read as a silent success).
+    if showNoModelPrompt, resolved != nil {
       showNoModelPrompt = false
     }
+    // Settle the pending: fire-once (cleared before the signal so
+    // re-entrant edges can never double-send), disarm on stale, else hold.
+    // The transition bookkeeping lives in `PendingSendState` (tested).
+    pendingSend.settle(chatID: chat.id,
+                       resolvedModelID: resolved,
+                       isSending: sendController.isInFlight)
   }
 
   /// Resolve the model a send should target from the chat's SELECTION

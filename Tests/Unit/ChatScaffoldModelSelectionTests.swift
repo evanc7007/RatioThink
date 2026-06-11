@@ -189,4 +189,91 @@ final class ChatScaffoldModelSelectionTests: XCTestCase {
     XCTAssertNil(
       ContentToolbar.effectiveModelID(selectedModelID: nil, profileDefaultModel: nil))
   }
+
+
+  // MARK: - #516 review F6: status edge must not fire before residency reconcile
+
+  /// The full ordering the review names: arm with target A; the `.running`
+  /// status flip arrives while the chat pin still says A but residency is
+  /// unreconciled (the engine may be serving B) → HOLD. Then the reconcile
+  /// lands: residency B (relaunch booted a different model) → DISARM;
+  /// residency A → FIRE. `resolutionProbe` is the status-edge gate and
+  /// `PendingAutoSend.verdict` the decision — composed here exactly as
+  /// `resolutionEdge` composes them.
+  func test_516_status_edge_holds_until_residency_reconciles_then_settles() {
+    let chatID = UUID()
+    let pending = PendingAutoSend.arm(
+      chatID: chatID, targetModelID: "org/A", messageText: "hello")!
+
+    // Status edge: pin resolves to A, but residency not reconciled yet —
+    // the probe must report nothing resolved, so the verdict holds.
+    let preReconcile = ChatScaffoldView.resolutionProbe(
+      resolvedModelID: "org/A", residentModelID: nil, requiresResidency: true)
+    XCTAssertNil(preReconcile, "status edge must treat an unreconciled engine as unresolved")
+    XCTAssertEqual(pending.verdict(chatID: chatID, resolvedModelID: preReconcile, isSending: false),
+                   .hold)
+
+    // Reconcile lands on B (relaunch booted the active-profile marker's
+    // model): the selection authority re-seeds to B → stale pending drops.
+    XCTAssertEqual(pending.verdict(chatID: chatID, resolvedModelID: "org/B", isSending: false),
+                   .disarm)
+
+    // Reconcile lands on A: the residency edge passes A through (no
+    // residency pre-check on post-reconcile edges) → the pending fires.
+    let postReconcile = ChatScaffoldView.resolutionProbe(
+      resolvedModelID: "org/A", residentModelID: "org/A", requiresResidency: false)
+    XCTAssertEqual(pending.verdict(chatID: chatID, resolvedModelID: postReconcile, isSending: false),
+                   .fire)
+  }
+
+  // MARK: - #516 review F8: bounded reconcile failure must settle, never strand
+
+  /// The liveness contract: with a pending send armed, a reconcile that
+  /// exhausts its bounded retries earns ONE backed-off retry round, and the
+  /// final failure falls back to the residency-free resolution edge — the
+  /// pending settles (fires or disarms via the pre-F6 evidence) instead of
+  /// holding forever against equal `.running` polls that never re-run the
+  /// reconcile task. Without a pending there is nothing to settle.
+  func test_516_reconcile_failure_settles_an_armed_pending_send() {
+    XCTAssertEqual(
+      ChatScaffoldView.reconcileFailureStep(hasPendingAutoSend: true, isRetryPass: false),
+      .retry, "first bounded failure while armed → one backed-off retry round")
+    XCTAssertEqual(
+      ChatScaffoldView.reconcileFailureStep(hasPendingAutoSend: true, isRetryPass: true),
+      .fallbackEdge, "final failure while armed → residency-free edge so the pending settles")
+    XCTAssertEqual(
+      ChatScaffoldView.reconcileFailureStep(hasPendingAutoSend: false, isRetryPass: false),
+      .none, "no pending → nothing to settle (NSLog-only behavior stands)")
+    XCTAssertEqual(
+      ChatScaffoldView.reconcileFailureStep(hasPendingAutoSend: false, isRetryPass: true),
+      .none)
+
+    // The fallback edge re-evaluates with the pre-F6 evidence: the chat's
+    // selection authority settles the verdict — fire on the intended model,
+    // disarm on a mismatch — bounded, never an infinite hold.
+    let chatID = UUID()
+    let pending = PendingAutoSend.arm(chatID: chatID, targetModelID: "org/A", messageText: "hi")!
+    let fallback = ChatScaffoldView.resolutionProbe(
+      resolvedModelID: "org/A", residentModelID: nil, requiresResidency: false)
+    XCTAssertEqual(pending.verdict(chatID: chatID, resolvedModelID: fallback, isSending: false), .fire)
+  }
+
+  // MARK: - #516 review F9: sheet dismissal keys on the probe, not raw resolution
+
+  /// On a residency-required edge that evaluates to hold, the probe is nil —
+  /// and the sheet dismissal is keyed on that SAME probe result, so the gate
+  /// stays up (no false success signal) while the fire is held. Once
+  /// residency reconciles, the probe passes resolution through and the
+  /// sheet may dismiss with the verdict settled on the same evidence.
+  func test_516_sheet_stays_up_while_a_residency_required_edge_holds() {
+    XCTAssertNil(
+      ChatScaffoldView.resolutionProbe(
+        resolvedModelID: "org/A", residentModelID: nil, requiresResidency: true),
+      "held edge → probe nil → the probe-keyed dismissal leaves the sheet up")
+    XCTAssertEqual(
+      ChatScaffoldView.resolutionProbe(
+        resolvedModelID: "org/A", residentModelID: "org/A", requiresResidency: true),
+      "org/A",
+      "reconciled → probe passes resolution → dismissal and verdict settle on the same evidence")
+  }
 }
