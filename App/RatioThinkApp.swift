@@ -61,6 +61,10 @@ struct RatioThinkApp: App {
   /// closing + reopening the Settings sheet does not orphan an
   /// in-flight download.
   @StateObject private var downloadController: ModelDownloadController
+  /// #514: the one live source of truth for local model availability
+  /// (scan results + in-flight downloads + completion reconciliation).
+  /// App-scoped beside the download controller it observes.
+  @StateObject private var modelLibrary: ModelLibraryStore
   /// #411: once-per-launch GitHub-Releases update check. App-scoped so the
   /// check (and its single network call) fires once per process; RootView
   /// observes `pending` to render the non-modal update banner.
@@ -215,7 +219,9 @@ struct RatioThinkApp: App {
       coordinator?.reportServeFailure(modelID: modelID, error: error)
     }
     _swapCoordinator = StateObject(wrappedValue: coordinator)
-    _downloadController = StateObject(wrappedValue: Self.makeDownloadController())
+    let downloadController = Self.makeDownloadController()
+    _downloadController = StateObject(wrappedValue: downloadController)
+    _modelLibrary = StateObject(wrappedValue: ModelLibraryStore(downloads: downloadController))
 
     _persistenceStatus = StateObject(wrappedValue: status)
     chatContainer = RatioThinkModelContainer.openWithFallback(status: status)
@@ -495,6 +501,7 @@ struct RatioThinkApp: App {
         .environmentObject(helperHealth)
         .environmentObject(sendCoordinator)
         .environmentObject(downloadController)
+        .environmentObject(modelLibrary)
         .environmentObject(updateAvailability)
         .environmentObject(settingsNavigation)
         // #420: route the menu-bar Helper's `ratiothink://settings` deep
@@ -561,6 +568,7 @@ struct RatioThinkApp: App {
         .environmentObject(swapCoordinator)
         .environmentObject(engineClientStore)
         .environmentObject(downloadController)
+        .environmentObject(modelLibrary)
         .environmentObject(persistenceStatus)
         .environmentObject(engineStatusStore)
     }

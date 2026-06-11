@@ -29,6 +29,27 @@ pub const DEFAULT_MAX_TOKENS_PER_NODE: usize = 256;
 /// Default reasoning budget — generous so a thinking model finishes its
 /// `<think>` block before the answer phase begins.
 pub const DEFAULT_MAX_REASONING_TOKENS: usize = 1024;
+/// Branch-generation temperature. Sibling diversity now has two
+/// sources — per-branch strategy directives (`search.rs`
+/// `strategy_directive`) plus sampling temperature — but temperature
+/// still has to carry within-strategy variation, so the default is
+/// justified by measurement, not assumption.
+///
+/// MEASURED, portable Metal + Qwen3-0.6B-Q8_0,
+/// `Scripts/run-tot-diversity-probe.sh` (2026-06-10, log
+/// `test-20260610-230258-tot-diversity-probe.log`) — taken on the
+/// temperature-ONLY baseline (before the strategy directives landed),
+/// i.e. the worst case for this knob: depth-1 searches at
+/// `DEFAULT_BREADTH`, thinking on, short-factual / math / open-ended
+/// prompts, 2 repeats per cell. At 0.7: zero byte-identical sibling
+/// pairs in every cell; the diversity-sensitive open-ended prompt
+/// produced 3/3 distinct 8-word prefixes both repeats (mean pairwise
+/// word-Jaccard 0.21). Raising to 1.0/1.3 increased divergence
+/// monotonically (open-ended Jaccard 0.19/0.10) but fixed nothing that
+/// was broken, and 1.3 produced the sweep's only branch failure (a
+/// math cell at 2/3 answered). 0.7 already gave healthy divergence
+/// with no quality cliff even WITHOUT the directives; with them
+/// stacked on top there is even less reason to raise it.
 pub const DEFAULT_TEMPERATURE: f32 = 0.7;
 pub const DEFAULT_TOP_P: f32 = 0.95;
 /// Reasoning is the POINT of a tree-of-thought search, so thinking is ON by
@@ -289,6 +310,12 @@ mod tests {
         // #413: thinking ON by default, with a generous reasoning budget.
         assert!(p.thinking);
         assert_eq!(p.max_reasoning_tokens, 1024);
+        // Branch-generation sampling defaults. 0.7 is measurement-backed
+        // (see DEFAULT_TEMPERATURE docs) — a silent default change would
+        // invalidate the recorded sibling-diversity justification.
+        assert_eq!(p.temperature, DEFAULT_TEMPERATURE);
+        assert_eq!(p.temperature, 0.7);
+        assert_eq!(p.top_p, DEFAULT_TOP_P);
     }
 
     #[test]
