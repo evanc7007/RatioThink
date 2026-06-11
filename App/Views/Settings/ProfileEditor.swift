@@ -166,6 +166,8 @@ struct ProfileEditor: View {
       Label(text, systemImage: "checkmark")
     } else if option.isOverLimit || option.unsupportedReason != nil {
       Label(text, systemImage: "exclamationmark.triangle")
+    } else if option.supportWarning != nil {
+      Label(text, systemImage: "exclamationmark.triangle")
     } else {
       Text(text)
     }
@@ -184,6 +186,8 @@ struct ProfileEditor: View {
       text += " — exceeds \(InstalledModels.formattedSize(policy.maxResolvedModelBytes)) limit"
     } else if let reason = option.unsupportedReason {
       text += " — \(reason)"
+    } else if let warning = option.supportWarning {
+      text += " — \(warning)"
     }
     return text
   }
@@ -418,19 +422,15 @@ struct ProfileModelPickerLabel: View {
     .frame(idealWidth: Self.maxLayoutWidth,
            maxWidth: Self.maxLayoutWidth,
            alignment: .leading)
-    .help(helpText)
+    .help(Self.accessibilityHelp(for: modelID))
     .accessibilityElement(children: .ignore)
     .accessibilityLabel(Self.accessibilityText(for: displayName))
-    .accessibilityHint(helpText)
-    .accessibilityValue(helpText)
+    .accessibilityHint(Self.accessibilityHelp(for: modelID))
+    .accessibilityValue(Self.accessibilityHelp(for: modelID))
   }
 
   private var displayName: String {
     Self.displayText(for: modelID)
-  }
-
-  private var helpText: String {
-    modelID ?? displayName
   }
 
   static func displayText(for modelID: String?) -> String {
@@ -439,5 +439,9 @@ struct ProfileModelPickerLabel: View {
 
   static func accessibilityText(for displayName: String) -> String {
     "Default model: \(displayName)"
+  }
+
+  static func accessibilityHelp(for modelID: String?) -> String {
+    modelID ?? displayText(for: modelID)
   }
 }
