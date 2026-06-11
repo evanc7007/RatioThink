@@ -39,7 +39,7 @@ chat workflow.
   1–10, and keeps the best beam — shown live in a foldable tree, then the chosen
   answer.
 
-▶ **[See the animated walkthrough](https://shsym.github.io/RatioThink/landing)** — open it in your browser.
+▶ **[See the animated walkthrough](https://shsym.github.io/RatioThink/landing)**
 
 ## Install
 
@@ -122,9 +122,6 @@ metadata only. Flags: `--window <dur>` (Unified Logging look-back, default
 
 A few known issues in the v0.1.2 release, with workarounds:
 
-- **Very large GGUF models can still respond poorly or truncate misleadingly.** Prefer the
-  starter model or smaller curated models until the large-model rendering fixes land
-  ([tracking PR](https://github.com/shsym/RatioThink/pull/64)).
 - **Deleting a model that a profile uses as its default may need a restart to fully settle.**
   If a deleted model still appears selected, restart RatioThink and choose a new profile model
   ([tracking PR](https://github.com/shsym/RatioThink/pull/62)).
