@@ -423,7 +423,7 @@ test-gui-script: ## Fast preflight regressions for GUI E2E wrappers
 test-gui-history: genproject ## Deterministic  GUI history/resume E2E — needs seated session
 	Scripts/run-resume-gui-history-e2e.sh
 
-test-gui-stream-cancel: genproject ## #381 deterministic GUI cancel-mid-stream E2E (partial bubble + composer recovery) — needs seated session
+test-gui-stream-cancel: genproject ## #507 deterministic GUI stream-continuity E2E (stream survives chat switch + row indicator) — needs seated session
 	Scripts/run-stream-cancel-gui-e2e.sh
 
 test-gui-copy: genproject ## #515 deterministic GUI copy E2E (Copy button → pasteboard == canonical multi-section Markdown) — needs seated session
