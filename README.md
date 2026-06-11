@@ -19,7 +19,7 @@ local models using specialized _thinking profiles_.
 
 ## Early release
 
-v0.1.2 is an early release, focusing on core functionality and bug fixes.
+This an early release, focusing on core functionality and bug fixes.
 Since many components are still a work in progress, your feedback is incredibly valuable.
 Feel free to report any issues you find!
 
