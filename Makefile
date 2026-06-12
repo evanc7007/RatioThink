@@ -42,6 +42,8 @@ GUI_TMP_HOMES := /tmp/pie-s285-* /tmp/pie-s286gate-* /tmp/pie-s326dl-* /tmp/pie-
 define gui_suite_run
 @set +e +o pipefail; \
   LOG=$(LOGDIR)/test-$$(date +%Y%m%d-%H%M%S)-gui-$(1).log; \
+  . Scripts/lib/sandbox-diagnostics.sh; \
+  sandbox_diag_require_xcodebuild_caches "test-gui-$(1)" || exit 2; \
   if ! pgrep -x Dock >/dev/null 2>&1; then \
     echo "warning: no seated GUI session — GUI tests will XCTSkip."; \
   fi; \
@@ -56,13 +58,14 @@ define gui_suite_run
   status=$${PIPESTATUS[0]}; \
   rm -rf $(GUI_TMP_HOMES) 2>/dev/null || true; \
   echo "log: $$LOG"; \
+  if [ "$$status" -ne 0 ]; then sandbox_diag_report_from_log "test-gui-$(1)" "$$LOG"; fi; \
   exit $$status
 endef
 
 .PHONY: help genproject build build-static build-tests clean lint verify-tot-docs ci-pr check-vendor-pin local-pre-merge local-gui-gate local-e2e-gate release-gate \
         verify-app-icon-assets test-app-icon-assets test-dmg-layout test-collect-diagnostics test-landing-page \
         test-ci-v2-static-gate test-xcode-chat-scaffold test-app-unit test-xcode-helper \
-        test-unit test-scenario test-smoke test-tot-real-smoke-unit test-tot-real-smoke test-curated-hf test-install-guards test-readme-harness test-e2e-http \
+        test-unit test-scenario test-smoke test-tot-real-smoke-unit test-tot-real-smoke test-curated-hf test-install-guards test-sandbox-diagnostics test-readme-harness test-e2e-http \
         test-gui-script test-gui-history test-gui-first-launch-package test-gui-stream-cancel test-gui-chat-retry test-gui-load-default test-gui test-ssh test-all \
         test-gui-shell test-gui-first-launch test-gui-helper test-gui-chat test-gui-chat-lifecycle test-menubar-icon-template \
         test-e2e-engine test-e2e-large-model test-e2e-models test-e2e-chat test-e2e-tot test-e2e-tot-batched test-e2e-budget-sweep bench-tot test-e2e-full test-e2e-package test-helper-respawn test-helper-recovery test-quit-structured \
@@ -123,6 +126,8 @@ build-tests: genproject ## Compile every xcodebuild target + the SPM probe (revi
 test-xcode-chat-scaffold: genproject $(LOGDIR) ## Run Xcode-only ChatScaffold unit regressions with zero-test guard
 	@set +e +o pipefail; \
 	  LOG=$(LOGDIR)/test-$$(date +%Y%m%d-%H%M%S)-xcode-chat-scaffold.log; \
+	  . Scripts/lib/sandbox-diagnostics.sh; \
+	  sandbox_diag_require_xcodebuild_caches "test-xcode-chat-scaffold" || exit 2; \
 	  xcodebuild -project RatioThink.xcodeproj -scheme RatioThink \
 	    -destination 'platform=macOS,arch=arm64' \
 	    -configuration Debug \
@@ -132,7 +137,7 @@ test-xcode-chat-scaffold: genproject $(LOGDIR) ## Run Xcode-only ChatScaffold un
 	    test 2>&1 | tee $$LOG | tail -40; \
 	  status=$${PIPESTATUS[0]}; \
 	  echo "log: $$LOG"; \
-	  if [ "$$status" -ne 0 ]; then exit "$$status"; fi; \
+	  if [ "$$status" -ne 0 ]; then sandbox_diag_report_from_log "test-xcode-chat-scaffold" "$$LOG"; exit "$$status"; fi; \
 	  if ! grep -Eq "Test Suite 'ChatScaffoldModelSelectionTests' passed" $$LOG; then \
 	    echo "FAIL: ChatScaffoldModelSelectionTests did not execute (filter may have matched zero tests)"; \
 	    exit 1; \
@@ -151,6 +156,8 @@ test-app-unit: genproject $(LOGDIR) ## App-tier unit bundle (xcodebuild RatioThi
 	@# actually assert. Headless (unit, not GUI) — no seated session needed.
 	@set +e +o pipefail; \
 	  LOG=$(LOGDIR)/test-$$(date +%Y%m%d-%H%M%S)-app-unit.log; \
+	  . Scripts/lib/sandbox-diagnostics.sh; \
+	  sandbox_diag_require_xcodebuild_caches "test-app-unit" || exit 2; \
 	  xcodebuild -project RatioThink.xcodeproj -scheme RatioThink \
 	    -destination 'platform=macOS,arch=arm64' \
 	    -configuration Debug \
@@ -160,7 +167,7 @@ test-app-unit: genproject $(LOGDIR) ## App-tier unit bundle (xcodebuild RatioThi
 	    test 2>&1 | tee $$LOG | tail -40; \
 	  status=$${PIPESTATUS[0]}; \
 	  echo "log: $$LOG"; \
-	  if [ "$$status" -ne 0 ]; then exit "$$status"; fi; \
+	  if [ "$$status" -ne 0 ]; then sandbox_diag_report_from_log "test-app-unit" "$$LOG"; exit "$$status"; fi; \
 	  if ! grep -Eq 'Executed [1-9][0-9]* tests, with 0 failures' $$LOG; then \
 	    echo "FAIL: RatioThinkTests bundle did not report an executed-test summary (zero-test guard — filter matched nothing or the bundle did not run)"; \
 	    exit 1; \
@@ -169,6 +176,8 @@ test-app-unit: genproject $(LOGDIR) ## App-tier unit bundle (xcodebuild RatioThi
 test-xcode-helper: genproject $(LOGDIR) ## Run Helper-executable unit tests (#440 deep-link delivery) with zero-test guard
 	@set +e +o pipefail; \
 	  LOG=$(LOGDIR)/test-$$(date +%Y%m%d-%H%M%S)-xcode-helper.log; \
+	  . Scripts/lib/sandbox-diagnostics.sh; \
+	  sandbox_diag_require_xcodebuild_caches "test-xcode-helper" || exit 2; \
 	  xcodebuild -project RatioThink.xcodeproj -scheme RatioThinkHelperTests \
 	    -destination 'platform=macOS,arch=arm64' \
 	    -configuration Debug \
@@ -177,7 +186,7 @@ test-xcode-helper: genproject $(LOGDIR) ## Run Helper-executable unit tests (#44
 	    test 2>&1 | tee $$LOG | tail -40; \
 	  status=$${PIPESTATUS[0]}; \
 	  echo "log: $$LOG"; \
-	  if [ "$$status" -ne 0 ]; then exit "$$status"; fi; \
+	  if [ "$$status" -ne 0 ]; then sandbox_diag_report_from_log "test-xcode-helper" "$$LOG"; exit "$$status"; fi; \
 	  if ! grep -Eq "Test Suite 'RatioThinkHelperTests.xctest' passed" $$LOG; then \
 	    echo "FAIL: RatioThinkHelperTests did not execute (host may have booted instead of skipping)"; \
 	    exit 1; \
@@ -188,7 +197,7 @@ test-xcode-helper: genproject $(LOGDIR) ## Run Helper-executable unit tests (#44
 	  fi
 
 engine-build: ## Build pie engine binary (host arch, no triple) — used by test-smoke
-	cd Vendor/pie && PIE_PORTABLE_METAL=1 cargo build -p pie-server --release
+	Scripts/run-engine-build.sh
 
 # Default ARCH to the host's native arch so Intel-host devs do not get
 # a silent arm64 cross-build (review v1 F7). Override with
@@ -312,6 +321,10 @@ test-curated-hf: $(LOGDIR) ## Live-HF existence audit of the curated catalog (PI
 test-install-guards: ## Install-time launchd-safety regression guards (stubbed, deterministic — runs anywhere)
 	Scripts/test-proc-acceptance.sh
 	Scripts/test-source-closed.sh
+	Scripts/test-sandbox-diagnostics.sh
+
+test-sandbox-diagnostics: ## Regression-test sandbox/cache/IPC recovery guidance for test wrappers
+	Scripts/test-sandbox-diagnostics.sh
 
 test-ci-v2-static-gate: ## Regression-test the CI v2 manual/static gate taxonomy (#456)
 	Scripts/test-ci-v2-static-gate.sh
@@ -494,6 +507,8 @@ test-gui: genproject $(LOGDIR) ## GUI scenarios — full RatioThinkGUITests matr
 	@Scripts/stage-test-model.sh || echo "warning: model fixture unavailable — model-dependent GUI tests will XCTSkip; see guidance above."
 	@set +e +o pipefail; \
 	  LOG=$(LOGDIR)/test-$$(date +%Y%m%d-%H%M%S)-gui.log; \
+	  . Scripts/lib/sandbox-diagnostics.sh; \
+	  sandbox_diag_require_xcodebuild_caches "test-gui" || exit 2; \
 	  if ! pgrep -x Dock >/dev/null 2>&1; then \
 	    echo "warning: no seated GUI session — GUI tests will XCTSkip."; \
 	  fi; \
@@ -513,6 +528,7 @@ test-gui: genproject $(LOGDIR) ## GUI scenarios — full RatioThinkGUITests matr
 	  status=$${PIPESTATUS[0]}; \
 	  rm -rf $(GUI_TMP_HOMES) 2>/dev/null || true; \
 	  echo "log: $$LOG"; \
+	  if [ "$$status" -ne 0 ]; then sandbox_diag_report_from_log "test-gui" "$$LOG"; fi; \
 	  exit $$status
 
 # --- Focused GUI suites by product area (xcodebuild -only-testing) ----------

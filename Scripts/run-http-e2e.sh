@@ -31,17 +31,21 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
+# shellcheck source=lib/sandbox-diagnostics.sh
+. "$ROOT/Scripts/lib/sandbox-diagnostics.sh"
 
 PIE_BIN="Vendor/pie/target/release/pie"
 PIE_STAMP="${PIE_BIN}.vendor-sha"
 WASM="Inferlets/chat-apc/prebuilt/chat-apc.wasm"
 PYDIR="Vendor/pie/client/python"
+TAG="http-e2e"
 
 if ! command -v uv >/dev/null 2>&1; then
   echo "[http-e2e] FATAL: 'uv' not found on PATH." >&2
   echo "           install it: https://docs.astral.sh/uv/getting-started/installation/" >&2
   exit 2
 fi
+sandbox_diag_require_uv_cache "$TAG" || exit 2
 
 # Self-bootstrap: build the pie engine binary when missing OR when the
 # existing binary was built from a different Vendor/pie checkout. The WIT host
@@ -63,7 +67,7 @@ elif [ "$(cat "$PIE_STAMP")" != "$current_pie_sha" ]; then
   build_pie=1
 fi
 if [ "$build_pie" -eq 1 ]; then
-  (cd Vendor/pie && PIE_PORTABLE_METAL=1 cargo build -p pie-server --release)
+  Scripts/run-engine-build.sh
   printf '%s\n' "$current_pie_sha" > "$PIE_STAMP"
 fi
 
@@ -95,7 +99,7 @@ run_suite() {
   echo "=============================================================="
   echo "[http-e2e] running $script"
   echo "=============================================================="
-  uv run --project "$PYDIR" --with httpx python "$script"
+  sandbox_diag_run_with_recovery "$TAG $script" uv run --project "$PYDIR" --with httpx python "$script"
 }
 
 # Baseline first (cheap control-plane smoke), then the full stress suite.
