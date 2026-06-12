@@ -77,6 +77,7 @@ FAKE_PGREP
   PIE_BIN="$tmp/missing-pie" \
   PIE_TEST_TCC_GRANTED=1 \
   PIE_E2E_AUTOPREP=0 \
+  STAGE_TEST_MODEL_DEST="$tmp/fixture/Qwen3-0.6B-Q8_0.gguf" \
   PIE_TEST_RUN_ROOT="$tmp/run" \
   "$SCRIPT" >/dev/null 2>&1
   set -e

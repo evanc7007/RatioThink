@@ -59,7 +59,7 @@ define gui_suite_run
   exit $$status
 endef
 
-.PHONY: help genproject build build-static build-tests clean lint ci-pr check-vendor-pin local-pre-merge local-gui-gate local-e2e-gate release-gate \
+.PHONY: help genproject build build-static build-tests clean lint verify-tot-docs ci-pr check-vendor-pin local-pre-merge local-gui-gate local-e2e-gate release-gate \
         verify-app-icon-assets test-app-icon-assets test-dmg-layout test-collect-diagnostics test-landing-page \
         test-ci-v2-static-gate test-xcode-chat-scaffold test-app-unit test-xcode-helper \
         test-unit test-scenario test-smoke test-tot-real-smoke-unit test-tot-real-smoke test-curated-hf test-install-guards test-readme-harness test-e2e-http \
@@ -463,8 +463,11 @@ test-gui-load-default: genproject ## #381 deterministic GUI no-model → Load-de
 test-gui-first-launch-package: ## Package-backed  first-launch E2E — needs seated session
 	Scripts/run-first-launch-package-e2e.sh
 
-lint: ## Static checks for  helper-side-effect invariants
+lint: verify-tot-docs ## Static checks for helper-side-effect and ToT docs/example invariants
 	@Scripts/lint-helper-side-effects.sh
+
+verify-tot-docs: ## Verify Tree-of-Thought docs/example beam-search semantics
+	python3 Scripts/verify-tot-docs.py
 
 verify-app-icon-assets: ## Verify committed app-icon source, generated PNGs, and XcodeGen wiring
 	Scripts/verify-app-icon-assets.sh
