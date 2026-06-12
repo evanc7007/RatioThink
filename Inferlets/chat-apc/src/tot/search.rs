@@ -88,18 +88,20 @@
 //! `cargo test --lib`.
 
 use futures::future::join_all;
+use inferlet::Context;
 use inferlet::model::Model;
 use inferlet::sample::Sampler;
 use inferlet::{chat, reasoning};
-use inferlet::Context;
+use std::future::Future;
+use std::pin::Pin;
 
 use crate::sse::Emitter;
 
 use super::schema::TotParams;
 use super::stream;
 use super::tree::{
-    assemble, best_leaf, error_leaf, new_node_id, parse_score, select_beam_diverse, Candidate,
-    Node, NodeStatus,
+    Candidate, Node, NodeStatus, assemble, best_leaf, error_leaf, new_node_id, parse_score,
+    select_beam_diverse,
 };
 
 /// Per-branch directive appended to each forked child before it generates
@@ -180,6 +182,15 @@ const SYNTHESIS_TOP_P: f32 = 0.9;
 /// needs to absorb a suppressed empty `<think></think>` before the answer.
 const SYNTHESIS_REASONING_TOKENS: usize = 32;
 
+/// Reasoning budget for the bounded branch retry after a thinking attempt
+/// starves before answer content. The retry appends `/no_think`, so this is
+/// not a second full-thinking budget; it only allows a template that emits an
+/// empty `<think></think>` prelude to close before the answer. If a model
+/// ignores `/no_think` and keeps thinking, the retry is intentionally cut off
+/// quickly and the node remains `Incomplete` rather than consuming another
+/// production-sized reasoning budget.
+const NO_THINK_RETRY_REASONING_TOKENS: usize = 32;
+
 /// Append the `/no_think` directive when reasoning is disabled for this
 /// search (`thinking:false`). On a Qwen3-style model this suppresses the
 /// `<think>` block; on a non-reasoning model it is an inert token.
@@ -189,6 +200,75 @@ fn with_thinking(base: &str, thinking: bool) -> String {
     } else {
         format!("{base} /no_think")
     }
+}
+
+/// Retry only the specific starvation mode #544 cares about: a thinking
+/// branch produced reasoning but no answer. Normal answered branches keep
+/// their useful reasoning; explicit `thinking:false` requests already use the
+/// safe no-think policy; infrastructure aborts stay errors rather than being
+/// disguised by a retry.
+fn should_retry_reasoning_starved(thinking: bool, demux: &Demux) -> bool {
+    thinking && matches!(demux.kind, DemuxKind::Incomplete)
+}
+
+/// Fold a bounded `/no_think` retry back into the node result. If the retry
+/// answers, the node becomes `Ok` with the retry answer while preserving the
+/// useful reasoning trace from the first attempt. If the retry also starves
+/// (or aborts), its terminal kind stands, so the node remains non-selectable.
+fn merge_no_think_retry(first: Demux, retry: Demux) -> Demux {
+    let mut reasoning = first.reasoning;
+    let retry_reasoning = retry.reasoning.trim();
+    if !retry_reasoning.is_empty() {
+        if !reasoning.trim().is_empty() {
+            reasoning.push_str("\n\nRetry reasoning:\n");
+        }
+        reasoning.push_str(retry_reasoning);
+    }
+    Demux {
+        reasoning,
+        answer: retry.answer,
+        kind: retry.kind,
+    }
+}
+
+/// Stricter branch directive for the bounded no-think retry. It keeps the
+/// same sibling path/focus as the original directive but adds explicit
+/// recovery wording so a model that spent the first attempt inside `<think>`
+/// gets a fresh, answer-first instruction.
+fn retry_branch_directive(level: usize, branch_index: usize, breadth: usize) -> String {
+    format!(
+        "The previous attempt spent its budget in hidden reasoning without producing an answer. \
+         Retry now with no hidden reasoning: produce the answer directly and concisely.\n\n{}",
+        branch_directive(level, branch_index, breadth, false)
+    )
+}
+
+fn retry_fork_failed(first: Demux, err: String) -> Demux {
+    Demux {
+        reasoning: first.reasoning,
+        answer: String::new(),
+        kind: DemuxKind::Aborted(format!("no-think retry fork failed: {err}")),
+    }
+}
+
+type DemuxFuture<'a> = Pin<Box<dyn Future<Output = Demux> + 'a>>;
+
+struct BranchGenerateRequest<'a> {
+    directive: &'a str,
+    reasoning_budget: usize,
+    answer_budget: usize,
+    sink_node_id: &'a str,
+}
+
+trait BranchDriver<C> {
+    fn fork_retry_base(&mut self, ctx: &C) -> Result<C, String>;
+    fn push_user(&mut self, ctx: &mut C, directive: &str);
+    fn cue(&mut self, ctx: &mut C);
+    fn generate<'a>(
+        &'a mut self,
+        ctx: &'a mut C,
+        request: BranchGenerateRequest<'a>,
+    ) -> DemuxFuture<'a>;
 }
 
 /// Build the synthesis user-turn (#523 Part A): the instruction appended to
@@ -335,7 +415,9 @@ async fn generate_demuxed(
                 // node's `node_delta` or, for synthesis, `final_delta` (#523).
                 if let Some(em) = emitter.as_deref_mut() {
                     let _ = match sink {
-                        DeltaSink::Node(id) => stream::emit_node_delta(em, id, stream::DELTA_ANSWER, &s).await,
+                        DeltaSink::Node(id) => {
+                            stream::emit_node_delta(em, id, stream::DELTA_ANSWER, &s).await
+                        }
                         DeltaSink::Final => stream::emit_final_delta(em, &s).await,
                     };
                 }
@@ -343,7 +425,7 @@ async fn generate_demuxed(
             Ok(chat::Event::Delta(_)) | Ok(chat::Event::Idle) => {}
             Ok(chat::Event::Done(_)) => break DemuxKind::Answered,
             Ok(chat::Event::Interrupt(_)) => {
-                break DemuxKind::Aborted("chat template interrupt".to_string())
+                break DemuxKind::Aborted("chat template interrupt".to_string());
             }
             Err(e) => break DemuxKind::Aborted(format!("chat decode failed: {e}")),
         }
@@ -531,9 +613,12 @@ pub async fn run(
                         metas.push((new_node_id(), f.node_id.clone(), b));
                         ctxs.push(child);
                     }
-                    Err(e) => {
-                        flat.push(error_leaf(&f.node_id, level, b, format!("fork failed: {e}")))
-                    }
+                    Err(e) => flat.push(error_leaf(
+                        &f.node_id,
+                        level,
+                        b,
+                        format!("fork failed: {e}"),
+                    )),
                 }
             }
         }
@@ -804,14 +889,15 @@ async fn resolve_level(
         // (#458): the short greedy scoring generations decode in flight at
         // once so the engine coalesces them, instead of one score forward
         // pass at a time. `Incomplete`/`Error` nodes have no answer to rate.
-        let scores: Vec<Option<ScoreOutcome>> = join_all(gens.iter().map(|(ctx, demux)| async move {
-            if matches!(demux.kind, DemuxKind::Answered) {
-                Some(score_node(ctx, model).await)
-            } else {
-                None
-            }
-        }))
-        .await;
+        let scores: Vec<Option<ScoreOutcome>> =
+            join_all(gens.iter().map(|(ctx, demux)| async move {
+                if matches!(demux.kind, DemuxKind::Answered) {
+                    Some(score_node(ctx, model).await)
+                } else {
+                    None
+                }
+            }))
+            .await;
 
         gens.into_iter()
             .zip(scores)
@@ -835,9 +921,7 @@ async fn resolve_level(
                 if let Some(em) = emitter.as_deref_mut() {
                     let _ = stream::emit_node_start(em, &m.0, &m.1, level, m.2).await;
                 }
-                out.push(
-                    expand(c, model, params, emitter.as_deref_mut(), &m.0, level, m.2).await,
-                );
+                out.push(expand(c, model, params, emitter.as_deref_mut(), &m.0, level, m.2).await);
             }
             out
         }
@@ -851,8 +935,72 @@ async fn resolve_level(
 /// Streams this node's reasoning/answer chunks as `node_delta` frames when
 /// an emitter is present (#413 token stream); `None` on the non-stream /
 /// concurrent path.
+async fn generate_branch_with<C, Driver>(
+    mut ctx: C,
+    params: &TotParams,
+    node_id: &str,
+    level: usize,
+    branch_index: usize,
+    driver: &mut Driver,
+) -> (C, Demux)
+where
+    Driver: BranchDriver<C>,
+{
+    let retry_base = if params.thinking {
+        Some(driver.fork_retry_base(&ctx))
+    } else {
+        None
+    };
+
+    // Append this branch's per-branch directive (#523), then open the
+    // assistant turn. The forked context shares a fully-flushed, cue-free
+    // prefix; the directive steers this sibling toward a distinct strategy
+    // (its text also makes the first forward pass carry real new tokens
+    // rather than spin).
+    let first_directive = branch_directive(level, branch_index, params.breadth, params.thinking);
+    driver.push_user(&mut ctx, &first_directive);
+    driver.cue(&mut ctx);
+    let demux = driver
+        .generate(
+            &mut ctx,
+            BranchGenerateRequest {
+                directive: &first_directive,
+                reasoning_budget: params.max_reasoning_tokens,
+                answer_budget: params.max_tokens_per_node,
+                sink_node_id: node_id,
+            },
+        )
+        .await;
+
+    if should_retry_reasoning_starved(params.thinking, &demux) {
+        match retry_base {
+            Some(Ok(mut retry_ctx)) => {
+                let retry_directive = retry_branch_directive(level, branch_index, params.breadth);
+                driver.push_user(&mut retry_ctx, &retry_directive);
+                driver.cue(&mut retry_ctx);
+                let retry = driver
+                    .generate(
+                        &mut retry_ctx,
+                        BranchGenerateRequest {
+                            directive: &retry_directive,
+                            reasoning_budget: NO_THINK_RETRY_REASONING_TOKENS,
+                            answer_budget: params.max_tokens_per_node,
+                            sink_node_id: node_id,
+                        },
+                    )
+                    .await;
+                return (retry_ctx, merge_no_think_retry(demux, retry));
+            }
+            Some(Err(e)) => return (ctx, retry_fork_failed(demux, e)),
+            None => {}
+        }
+    }
+
+    (ctx, demux)
+}
+
 async fn generate_branch(
-    mut ctx: Context,
+    ctx: Context,
     model: &Model,
     params: &TotParams,
     emitter: Option<&mut Emitter>,
@@ -860,29 +1008,64 @@ async fn generate_branch(
     level: usize,
     branch_index: usize,
 ) -> (Context, Demux) {
-    // Append this branch's per-branch directive (#523), then open the
-    // assistant turn. The forked context shares a fully-flushed, cue-free
-    // prefix; the directive steers this sibling toward a distinct strategy
-    // (its text also makes the first forward pass carry real new tokens
-    // rather than spin).
-    ctx.user(&branch_directive(level, branch_index, params.breadth, params.thinking));
-    ctx.cue();
-    let stops = chat::stop_tokens(model);
-    let demux = generate_demuxed(
-        &mut ctx,
+    struct InferletBranchDriver<'a, 'e> {
+        model: &'a Model,
+        stops: Vec<u32>,
+        emitter: Option<&'e mut Emitter>,
+        temperature: f32,
+        top_p: f32,
+    }
+
+    impl BranchDriver<Context> for InferletBranchDriver<'_, '_> {
+        fn fork_retry_base(&mut self, ctx: &Context) -> Result<Context, String> {
+            ctx.fork().map_err(|e| e.to_string())
+        }
+
+        fn push_user(&mut self, ctx: &mut Context, directive: &str) {
+            ctx.user(directive);
+        }
+
+        fn cue(&mut self, ctx: &mut Context) {
+            ctx.cue();
+        }
+
+        fn generate<'a>(
+            &'a mut self,
+            ctx: &'a mut Context,
+            request: BranchGenerateRequest<'a>,
+        ) -> DemuxFuture<'a> {
+            let _directive = request.directive;
+            let sampler = Sampler::TopP {
+                temperature: self.temperature,
+                p: self.top_p,
+            };
+            let model = self.model;
+            let stops = &self.stops;
+            let emitter = self.emitter.as_deref_mut();
+            Box::pin(async move {
+                generate_demuxed(
+                    ctx,
+                    model,
+                    sampler,
+                    request.reasoning_budget,
+                    request.answer_budget,
+                    stops,
+                    emitter,
+                    DeltaSink::Node(request.sink_node_id),
+                )
+                .await
+            })
+        }
+    }
+
+    let mut driver = InferletBranchDriver {
         model,
-        Sampler::TopP {
-            temperature: params.temperature,
-            p: params.top_p,
-        },
-        params.max_reasoning_tokens,
-        params.max_tokens_per_node,
-        &stops,
+        stops: chat::stop_tokens(model),
         emitter,
-        DeltaSink::Node(node_id),
-    )
-    .await;
-    (ctx, demux)
+        temperature: params.temperature,
+        top_p: params.top_p,
+    };
+    generate_branch_with(ctx, params, node_id, level, branch_index, &mut driver).await
 }
 
 /// Turn a branch's [`Demux`] (+ its scorer outcome, when it answered) into a
@@ -977,7 +1160,10 @@ async fn score_node(ctx: &Context, model: &Model) -> ScoreOutcome {
     sctx.cue();
     let stops = chat::stop_tokens(model);
     let text = match sctx
-        .generate(Sampler::TopP { temperature: 0.0, p: 1.0 }) // greedy
+        .generate(Sampler::TopP {
+            temperature: 0.0,
+            p: 1.0,
+        }) // greedy
         .max_tokens(SCORE_MAX_TOKENS)
         .stop(&stops)
         .collect_text()
@@ -1011,7 +1197,10 @@ async fn synthesize(
     answer_budget: usize,
     emitter: Option<&mut Emitter>,
 ) -> Result<String, String> {
-    let directive = with_thinking(&build_synthesis_directive(best_content, best_reasoning), false);
+    let directive = with_thinking(
+        &build_synthesis_directive(best_content, best_reasoning),
+        false,
+    );
     base.user(&directive);
     base.cue();
     let stops = chat::stop_tokens(model);
@@ -1182,7 +1371,8 @@ mod tests {
 
     #[test]
     fn synthesis_directive_includes_reasoning_when_present() {
-        let d = build_synthesis_directive("Answer X.", "First consider the budget, then the venue.");
+        let d =
+            build_synthesis_directive("Answer X.", "First consider the budget, then the venue.");
         assert!(d.contains("The reasoning behind it:"));
         assert!(d.contains("First consider the budget, then the venue."));
     }
@@ -1200,9 +1390,18 @@ mod tests {
     fn synthesis_temperature_is_low_and_distinct_from_generation_default() {
         // Synthesis stays coherent (low) regardless of how high candidate
         // generation runs; the scorer is greedy (0.0) — see `score_node`.
-        let (synth, gen_default) = (SYNTHESIS_TEMPERATURE, super::super::schema::DEFAULT_TEMPERATURE);
-        assert!(synth > 0.0, "synthesis temperature must be a real low value");
-        assert!(synth < gen_default, "synthesis must stay below the generation default");
+        let (synth, gen_default) = (
+            SYNTHESIS_TEMPERATURE,
+            super::super::schema::DEFAULT_TEMPERATURE,
+        );
+        assert!(
+            synth > 0.0,
+            "synthesis temperature must be a real low value"
+        );
+        assert!(
+            synth < gen_default,
+            "synthesis must stay below the generation default"
+        );
     }
 
     // ── ScoreOutcome (F4): the three classes the old Option<u8> merged ──
@@ -1232,7 +1431,10 @@ mod tests {
 
     #[test]
     fn classify_answered_scored_is_ok_with_score() {
-        let o = classify(demux("r", "a", DemuxKind::Answered), Some(ScoreOutcome::Scored(7)));
+        let o = classify(
+            demux("r", "a", DemuxKind::Answered),
+            Some(ScoreOutcome::Scored(7)),
+        );
         assert_eq!(o.status, NodeStatus::Ok);
         assert_eq!(o.content, "a");
         assert_eq!(o.reasoning, "r");
@@ -1245,7 +1447,10 @@ mod tests {
     fn classify_answered_unparseable_is_ok_null_score_no_error() {
         // Benign unparseable score (reasoning model emits no in-range int):
         // ok + null score, NO score_error — distinct from an infra failure.
-        let o = classify(demux("", "a", DemuxKind::Answered), Some(ScoreOutcome::Unparseable));
+        let o = classify(
+            demux("", "a", DemuxKind::Answered),
+            Some(ScoreOutcome::Unparseable),
+        );
         assert_eq!(o.status, NodeStatus::Ok);
         assert_eq!(o.score, None);
         assert_eq!(o.score_error, None);
@@ -1289,6 +1494,305 @@ mod tests {
         assert_eq!(o.content, "");
         assert_eq!(o.reasoning, "r");
         assert_eq!(o.error.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn retry_policy_only_retries_thinking_starvation() {
+        assert!(should_retry_reasoning_starved(
+            true,
+            &demux("long hidden reasoning", "", DemuxKind::Incomplete)
+        ));
+        assert!(!should_retry_reasoning_starved(
+            false,
+            &demux("long hidden reasoning", "", DemuxKind::Incomplete)
+        ));
+        assert!(!should_retry_reasoning_starved(
+            true,
+            &demux("useful reasoning", "visible answer", DemuxKind::Answered)
+        ));
+        assert!(!should_retry_reasoning_starved(
+            true,
+            &demux(
+                "partial",
+                "",
+                DemuxKind::Aborted("forward failed".to_string())
+            )
+        ));
+    }
+
+    #[test]
+    fn no_think_retry_can_recover_reasoning_starved_branch() {
+        let recovered = merge_no_think_retry(
+            demux(
+                "first attempt kept thinking until the budget",
+                "",
+                DemuxKind::Incomplete,
+            ),
+            demux("", "42", DemuxKind::Answered),
+        );
+
+        assert!(matches!(recovered.kind, DemuxKind::Answered));
+        assert_eq!(recovered.answer, "42");
+        // Preserve the useful first-pass thought trace even though the
+        // survivor context/answer came from the bounded no-think retry.
+        assert_eq!(
+            recovered.reasoning,
+            "first attempt kept thinking until the budget"
+        );
+    }
+
+    #[test]
+    fn no_think_retry_does_not_turn_second_starvation_into_ok() {
+        let still_starved = merge_no_think_retry(
+            demux("first long thought", "", DemuxKind::Incomplete),
+            demux("retry also ignored /no_think", "", DemuxKind::Incomplete),
+        );
+
+        assert!(matches!(still_starved.kind, DemuxKind::Incomplete));
+        assert!(still_starved.answer.is_empty());
+        assert!(still_starved.reasoning.contains("first long thought"));
+        assert!(
+            still_starved
+                .reasoning
+                .contains("retry also ignored /no_think")
+        );
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct FakeBranchCtx {
+        id: &'static str,
+        users: Vec<String>,
+        cues: usize,
+    }
+
+    impl FakeBranchCtx {
+        fn new(id: &'static str) -> Self {
+            Self {
+                id,
+                users: Vec::new(),
+                cues: 0,
+            }
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct FakeBranchCall {
+        ctx_id: &'static str,
+        directive: String,
+        reasoning_budget: usize,
+        answer_budget: usize,
+        sink_node_id: String,
+    }
+
+    struct FakeBranchDriver {
+        retry_fork: Result<FakeBranchCtx, String>,
+        outputs: Vec<Demux>,
+        calls: Vec<FakeBranchCall>,
+    }
+
+    impl FakeBranchDriver {
+        fn new(retry_fork: Result<FakeBranchCtx, String>, outputs: Vec<Demux>) -> Self {
+            Self {
+                retry_fork,
+                outputs,
+                calls: Vec::new(),
+            }
+        }
+    }
+
+    impl BranchDriver<FakeBranchCtx> for FakeBranchDriver {
+        fn fork_retry_base(&mut self, ctx: &FakeBranchCtx) -> Result<FakeBranchCtx, String> {
+            assert_eq!(ctx.id, "first");
+            self.retry_fork.clone()
+        }
+
+        fn push_user(&mut self, ctx: &mut FakeBranchCtx, directive: &str) {
+            ctx.users.push(directive.to_string());
+        }
+
+        fn cue(&mut self, ctx: &mut FakeBranchCtx) {
+            ctx.cues += 1;
+        }
+
+        fn generate<'a>(
+            &'a mut self,
+            ctx: &'a mut FakeBranchCtx,
+            request: BranchGenerateRequest<'a>,
+        ) -> DemuxFuture<'a> {
+            self.calls.push(FakeBranchCall {
+                ctx_id: ctx.id,
+                directive: request.directive.to_string(),
+                reasoning_budget: request.reasoning_budget,
+                answer_budget: request.answer_budget,
+                sink_node_id: request.sink_node_id.to_string(),
+            });
+            Box::pin(std::future::ready(self.outputs.remove(0)))
+        }
+    }
+
+    fn retry_test_params() -> TotParams {
+        TotParams {
+            breadth: 3,
+            depth: 1,
+            beam_width: 1,
+            max_tokens_per_node: 64,
+            max_reasoning_tokens: 1024,
+            temperature: 0.7,
+            top_p: 0.9,
+            thinking: true,
+            exec: super::super::schema::ExecStrategy::CoupledSequential,
+        }
+    }
+
+    #[test]
+    fn branch_retry_flow_answers_from_retry_context_and_is_beam_eligible() {
+        let params = retry_test_params();
+        let mut driver = FakeBranchDriver::new(
+            Ok(FakeBranchCtx::new("retry")),
+            vec![
+                demux(
+                    "first attempt spent the whole budget thinking",
+                    "",
+                    DemuxKind::Incomplete,
+                ),
+                demux("", "retry answer", DemuxKind::Answered),
+            ],
+        );
+        let (ctx, demux) = futures::executor::block_on(generate_branch_with(
+            FakeBranchCtx::new("first"),
+            &params,
+            "tot-n1",
+            1,
+            2,
+            &mut driver,
+        ));
+
+        assert_eq!(
+            ctx.id, "retry",
+            "answered retry context must survive for scoring/next-level expansion"
+        );
+        assert!(matches!(demux.kind, DemuxKind::Answered));
+        assert_eq!(demux.answer, "retry answer");
+        assert_eq!(driver.calls.len(), 2);
+        assert_eq!(driver.calls[0].ctx_id, "first");
+        assert_eq!(
+            driver.calls[0].reasoning_budget,
+            params.max_reasoning_tokens
+        );
+        assert_eq!(driver.calls[0].answer_budget, params.max_tokens_per_node);
+        assert_eq!(driver.calls[1].ctx_id, "retry");
+        assert_eq!(
+            driver.calls[1].reasoning_budget,
+            NO_THINK_RETRY_REASONING_TOKENS
+        );
+        assert_eq!(driver.calls[1].answer_budget, params.max_tokens_per_node);
+        assert_eq!(driver.calls[1].sink_node_id, "tot-n1");
+        assert!(driver.calls[1].directive.contains("/no_think"));
+        assert!(
+            driver.calls[1]
+                .directive
+                .contains("Retry now with no hidden reasoning")
+        );
+
+        let outcome = classify(demux, Some(ScoreOutcome::Scored(9)));
+        assert_eq!(outcome.status, NodeStatus::Ok);
+        let materialized = materialize_level(1, vec![branch("tot-n1", "root", 2, outcome)], 1);
+        assert_eq!(
+            materialized.keep,
+            vec!["tot-n1"],
+            "answered retry must be beam-eligible"
+        );
+    }
+
+    #[test]
+    fn branch_retry_flow_double_starvation_remains_non_selectable() {
+        let params = retry_test_params();
+        let mut driver = FakeBranchDriver::new(
+            Ok(FakeBranchCtx::new("retry")),
+            vec![
+                demux("first thinking", "", DemuxKind::Incomplete),
+                demux("still thinking", "", DemuxKind::Incomplete),
+            ],
+        );
+        let (_ctx, demux) = futures::executor::block_on(generate_branch_with(
+            FakeBranchCtx::new("first"),
+            &params,
+            "tot-n2",
+            1,
+            0,
+            &mut driver,
+        ));
+
+        assert_eq!(
+            driver.calls.len(),
+            2,
+            "starvation should attempt exactly one bounded retry"
+        );
+        assert_eq!(
+            driver.calls[0].reasoning_budget,
+            params.max_reasoning_tokens
+        );
+        assert_eq!(
+            driver.calls[1].reasoning_budget,
+            NO_THINK_RETRY_REASONING_TOKENS
+        );
+        assert!(matches!(demux.kind, DemuxKind::Incomplete));
+        let outcome = classify(demux, None);
+        assert_eq!(outcome.status, NodeStatus::Incomplete);
+        let materialized = materialize_level(1, vec![branch("tot-n2", "root", 0, outcome)], 1);
+        assert!(
+            materialized.keep.is_empty(),
+            "double-starved retry must not survive the beam"
+        );
+        assert!(!materialized.candidates[0].ok);
+    }
+
+    #[test]
+    fn branch_retry_flow_surfaces_retry_base_fork_failure() {
+        let params = retry_test_params();
+        let mut driver = FakeBranchDriver::new(
+            Err("snapshot unavailable".to_string()),
+            vec![demux("first attempt starved", "", DemuxKind::Incomplete)],
+        );
+        let (ctx, demux) = futures::executor::block_on(generate_branch_with(
+            FakeBranchCtx::new("first"),
+            &params,
+            "tot-n3",
+            1,
+            1,
+            &mut driver,
+        ));
+
+        assert_eq!(
+            ctx.id, "first",
+            "without a retry fork, the original context is returned"
+        );
+        assert_eq!(
+            driver.calls.len(),
+            1,
+            "failed retry-base fork must not run an impossible retry"
+        );
+        assert_eq!(
+            driver.calls[0].reasoning_budget,
+            params.max_reasoning_tokens
+        );
+        assert!(matches!(demux.kind, DemuxKind::Aborted(_)));
+        let outcome = classify(demux, None);
+        assert_eq!(outcome.status, NodeStatus::Error);
+        assert_eq!(outcome.reasoning, "first attempt starved");
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("no-think retry fork failed: snapshot unavailable")
+        );
+        let materialized = materialize_level(1, vec![branch("tot-n3", "root", 1, outcome)], 1);
+        assert!(
+            materialized.keep.is_empty(),
+            "retry fork failure must stay non-selectable"
+        );
+        assert!(!materialized.candidates[0].ok);
     }
 
     // ── materialize_level (F4 + F6) ──
@@ -1567,7 +2071,10 @@ mod tests {
         assert!(!out.synthesized);
 
         reconcile_synthesis(&mut out, Some("synthesized-final-answer".to_string()));
-        assert_eq!(out.final_answer.as_deref(), Some("synthesized-final-answer"));
+        assert_eq!(
+            out.final_answer.as_deref(),
+            Some("synthesized-final-answer")
+        );
         assert!(out.synthesized);
     }
 
