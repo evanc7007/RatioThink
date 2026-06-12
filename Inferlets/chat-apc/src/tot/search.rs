@@ -216,6 +216,7 @@ fn should_retry_reasoning_starved(thinking: bool, demux: &Demux) -> bool {
 /// useful reasoning trace from the first attempt. If the retry also starves
 /// (or aborts), its terminal kind stands, so the node remains non-selectable.
 fn merge_no_think_retry(first: Demux, retry: Demux) -> Demux {
+    let generated_tokens = first.generated_tokens + retry.generated_tokens;
     let mut reasoning = first.reasoning;
     let retry_reasoning = retry.reasoning.trim();
     if !retry_reasoning.is_empty() {
@@ -228,6 +229,7 @@ fn merge_no_think_retry(first: Demux, retry: Demux) -> Demux {
         reasoning,
         answer: retry.answer,
         kind: retry.kind,
+        generated_tokens,
     }
 }
 
@@ -248,6 +250,7 @@ fn retry_fork_failed(first: Demux, err: String) -> Demux {
         reasoning: first.reasoning,
         answer: String::new(),
         kind: DemuxKind::Aborted(format!("no-think retry fork failed: {err}")),
+        generated_tokens: first.generated_tokens,
     }
 }
 
@@ -325,6 +328,10 @@ struct Demux {
     reasoning: String,
     answer: String,
     kind: DemuxKind,
+    /// All model-generated decode tokens consumed by this generation,
+    /// including reasoning delimiters/hidden thinking and visible answer
+    /// tokens. Prompt/input tokens are never counted here (#542).
+    generated_tokens: usize,
 }
 
 /// Where [`generate_demuxed`]'s streamed deltas go. `Node` tags a tree
@@ -372,6 +379,7 @@ async fn generate_demuxed(
     let mut reasoning_done = false;
     let mut reasoning_tokens = 0usize;
     let mut answer_tokens = 0usize;
+    let mut generated_tokens = 0usize;
 
     let kind = loop {
         let step = match generator.next() {
@@ -383,6 +391,7 @@ async fn generate_demuxed(
             Ok(o) => o,
             Err(e) => break DemuxKind::Aborted(format!("forward pass failed: {e}")),
         };
+        generated_tokens += out.tokens.len();
 
         // Capture the gate state BEFORE feeding the reasoning decoder: `feed`
         // flips `in_reasoning` as it consumes a boundary token, but the chat
@@ -459,6 +468,7 @@ async fn generate_demuxed(
         reasoning,
         answer,
         kind,
+        generated_tokens,
     }
 }
 
@@ -474,6 +484,14 @@ enum ScoreOutcome {
     Scored(u8),
     Unparseable,
     Failed(String),
+}
+
+/// Value-evaluator result plus the generated-token count spent producing it
+/// (#542). A scorer infra failure can still have consumed tokens before the
+/// failure; those tokens are part of total ToT work.
+struct ScoreResult {
+    outcome: ScoreOutcome,
+    generated_tokens: usize,
 }
 
 impl ScoreOutcome {
@@ -503,6 +521,9 @@ struct NodeOutcome {
     score_error: Option<String>,
     /// Per-node diagnostic for a non-`Ok` node (`None` for `Ok`).
     error: Option<String>,
+    /// Total generated tokens spent for this branch: node generation plus
+    /// scorer generation when the node answered. Input/prompt tokens excluded.
+    generated_tokens: usize,
 }
 
 /// One forked branch ready to materialize: its caller-assigned id + tree
@@ -520,6 +541,7 @@ struct LevelMaterialized {
     nodes: Vec<Node>,
     candidates: Vec<Candidate>,
     keep: Vec<String>,
+    generated_tokens: usize,
 }
 
 /// A live frontier entry: a context ready to expand + its tree-node id.
@@ -539,6 +561,10 @@ pub struct SearchOutcome {
     /// silently dead synthesizer is observable rather than masked by an
     /// always-renderable best-leaf answer (#523 Part A F1).
     pub synthesized: bool,
+    /// Total model-generated decode tokens spent by the whole successful or
+    /// failed search (node reasoning/answers, scorer generations, synthesis
+    /// attempt if any), excluding prompt/input tokens (#542).
+    pub total_generated_tokens: usize,
 }
 
 /// Run the beam search. `root_ctx` must already be filled (system +
@@ -583,6 +609,7 @@ pub async fn run(
     // `fold_level` so a late all-fail level can't null an answer that
     // earlier levels legitimately produced (F7).
     let mut last_level: Vec<Candidate> = Vec::new();
+    let mut total_generated_tokens = 0usize;
 
     for level in 1..=params.depth {
         // Index into `flat` of this level's first node. Every node appended
@@ -655,7 +682,9 @@ pub async fn run(
             nodes,
             candidates,
             keep,
+            generated_tokens,
         } = materialize_level(level, branches, params.beam_width);
+        total_generated_tokens += generated_tokens;
         flat.extend(nodes);
 
         // Carry only the beam survivors (ok-only) as the next frontier; a
@@ -710,8 +739,12 @@ pub async fn run(
         )
         .await
         {
-            Ok(answer) => Some(answer),
-            Err(reason) => {
+            Ok((answer, generated_tokens)) => {
+                total_generated_tokens += generated_tokens;
+                Some(answer)
+            }
+            Err((reason, generated_tokens)) => {
+                total_generated_tokens += generated_tokens;
                 eprintln!("[chat-apc] tot synthesis fell back to best leaf: {reason}");
                 None
             }
@@ -726,6 +759,7 @@ pub async fn run(
         (None, _) => None,
     };
     reconcile_synthesis(&mut outcome, synth);
+    outcome.total_generated_tokens = total_generated_tokens;
     outcome
 }
 
@@ -757,7 +791,9 @@ fn reconcile_synthesis(outcome: &mut SearchOutcome, synth: Option<String>) {
 fn materialize_level(level: usize, branches: Vec<Branch>, beam_width: usize) -> LevelMaterialized {
     let mut nodes: Vec<Node> = Vec::with_capacity(branches.len());
     let mut candidates: Vec<Candidate> = Vec::with_capacity(branches.len());
+    let mut generated_tokens = 0usize;
     for b in branches {
+        generated_tokens += b.outcome.generated_tokens;
         // Only an `Ok` node (a non-empty answer) is beam-eligible; both
         // `Error` (generation failed) and `Incomplete` (reasoned but never
         // answered) are excluded from survival and final-answer selection,
@@ -793,6 +829,7 @@ fn materialize_level(level: usize, branches: Vec<Branch>, beam_width: usize) -> 
         nodes,
         candidates,
         keep,
+        generated_tokens,
     }
 }
 
@@ -833,6 +870,8 @@ fn finalize(flat: Vec<Node>, last_level: &[Candidate]) -> SearchOutcome {
         // finalize() sets the raw best-leaf answer; `run` flips this true only
         // when the post-search synthesis replaces it (#523 Part A F1).
         synthesized: false,
+        // Filled by `run`, which owns the engine-bound token accounting.
+        total_generated_tokens: 0,
     }
 }
 
@@ -889,7 +928,7 @@ async fn resolve_level(
         // (#458): the short greedy scoring generations decode in flight at
         // once so the engine coalesces them, instead of one score forward
         // pass at a time. `Incomplete`/`Error` nodes have no answer to rate.
-        let scores: Vec<Option<ScoreOutcome>> =
+        let scores: Vec<Option<ScoreResult>> =
             join_all(gens.iter().map(|(ctx, demux)| async move {
                 if matches!(demux.kind, DemuxKind::Answered) {
                     Some(score_node(ctx, model).await)
@@ -1074,18 +1113,20 @@ async fn generate_branch(
 /// partial reasoning preserved (#434); `Aborted` → `Error`. Only an
 /// `Answered` node is scored — a node with no answer has nothing to rate, so
 /// its `score` is `None`. Pure → unit-tested.
-fn classify(demux: Demux, score: Option<ScoreOutcome>) -> NodeOutcome {
+fn classify(demux: Demux, score: Option<ScoreResult>) -> NodeOutcome {
     match demux.kind {
         DemuxKind::Answered => {
             // An `Answered` node is always scored (phased: scored in phase 2;
             // coupled: scored in `expand`). A `None` here would be a caller
             // bug, not a benign unscored node — default it to an infra
             // failure rather than silently dropping the score.
-            let (score, score_error) = score
-                .unwrap_or(ScoreOutcome::Failed(
-                    "internal: answered node was not scored".to_string(),
-                ))
-                .into_parts();
+            let node_generated_tokens = demux.generated_tokens;
+            let score = score.unwrap_or(ScoreResult {
+                outcome: ScoreOutcome::Failed("internal: answered node was not scored".to_string()),
+                generated_tokens: 0,
+            });
+            let generated_tokens = node_generated_tokens + score.generated_tokens;
+            let (score, score_error) = score.outcome.into_parts();
             NodeOutcome {
                 status: NodeStatus::Ok,
                 content: demux.answer,
@@ -1093,6 +1134,7 @@ fn classify(demux: Demux, score: Option<ScoreOutcome>) -> NodeOutcome {
                 score,
                 score_error,
                 error: None,
+                generated_tokens,
             }
         }
         DemuxKind::Incomplete => NodeOutcome {
@@ -1104,6 +1146,7 @@ fn classify(demux: Demux, score: Option<ScoreOutcome>) -> NodeOutcome {
             error: Some(
                 "no answer: the node ran out of reasoning budget before producing one".to_string(),
             ),
+            generated_tokens: demux.generated_tokens,
         },
         DemuxKind::Aborted(e) => NodeOutcome {
             status: NodeStatus::Error,
@@ -1112,6 +1155,7 @@ fn classify(demux: Demux, score: Option<ScoreOutcome>) -> NodeOutcome {
             score: None,
             score_error: None,
             error: Some(e),
+            generated_tokens: demux.generated_tokens,
         },
     }
 }
@@ -1151,30 +1195,72 @@ async fn expand(
 /// case the content-channel gate would drop. The three outcomes stay distinct
 /// so an infra failure (fork/generate) is not mistaken for a benign
 /// unparseable score — see [`ScoreOutcome`].
-async fn score_node(ctx: &Context, model: &Model) -> ScoreOutcome {
+async fn score_node(ctx: &Context, model: &Model) -> ScoreResult {
     let mut sctx = match ctx.fork() {
         Ok(c) => c,
-        Err(e) => return ScoreOutcome::Failed(format!("score fork failed: {e}")),
+        Err(e) => {
+            return ScoreResult {
+                outcome: ScoreOutcome::Failed(format!("score fork failed: {e}")),
+                generated_tokens: 0,
+            };
+        }
     };
     sctx.user(&with_thinking(SCORE_PROMPT, false));
     sctx.cue();
     let stops = chat::stop_tokens(model);
-    let text = match sctx
+    let mut generator = sctx
         .generate(Sampler::TopP {
             temperature: 0.0,
             p: 1.0,
         }) // greedy
         .max_tokens(SCORE_MAX_TOKENS)
-        .stop(&stops)
-        .collect_text()
-        .await
-    {
-        Ok(t) => t,
-        Err(e) => return ScoreOutcome::Failed(format!("score generate failed: {e}")),
-    };
-    match parse_score(&text) {
+        .stop(&stops);
+    let mut decoder = chat::Decoder::new(model);
+    let mut text = String::new();
+    let mut generated_tokens = 0usize;
+    loop {
+        let step = match generator.next() {
+            Ok(Some(step)) => step,
+            Ok(None) => break,
+            Err(e) => {
+                return ScoreResult {
+                    outcome: ScoreOutcome::Failed(format!("score generate failed: {e}")),
+                    generated_tokens,
+                };
+            }
+        };
+        let out = match step.execute().await {
+            Ok(out) => out,
+            Err(e) => {
+                return ScoreResult {
+                    outcome: ScoreOutcome::Failed(format!("score generate failed: {e}")),
+                    generated_tokens,
+                };
+            }
+        };
+        generated_tokens += out.tokens.len();
+        match decoder.feed(&out.tokens) {
+            Ok(chat::Event::Delta(s)) => text.push_str(&s),
+            Ok(chat::Event::Done(s)) => {
+                text = s;
+                break;
+            }
+            Ok(chat::Event::Idle) | Ok(chat::Event::Interrupt(_)) => {}
+            Err(e) => {
+                return ScoreResult {
+                    outcome: ScoreOutcome::Failed(format!("score decode failed: {e}")),
+                    generated_tokens,
+                };
+            }
+        }
+    }
+    let outcome = match parse_score(&text) {
         Some(v) => ScoreOutcome::Scored(v),
         None => ScoreOutcome::Unparseable,
+    };
+    ScoreResult {
+        outcome,
+        generated_tokens,
     }
 }
 
@@ -1183,10 +1269,11 @@ async fn score_node(ctx: &Context, model: &Model) -> ScoreOutcome {
 /// before the search consumed the root. Appends [`build_synthesis_directive`]
 /// (+ `/no_think`) and runs ONE low-temperature, demuxed generation grounded
 /// in the best leaf, streaming its answer as `final_delta` when an emitter is
-/// present. Returns the synthesized answer, or `Err(reason)` on any failure /
-/// empty result — the reason (`not_answered` / `empty` / `aborted: …`) is
-/// surfaced by the caller as a host diagnostic before it falls back to the raw
-/// best-leaf content, so a failed synthesis is never lost silently (#523 F1).
+/// present. Returns the synthesized answer plus generated-token count, or
+/// `Err(reason, generated_tokens)` on any failure / empty result — the reason
+/// (`not_answered` / `empty` / `aborted: …`) is surfaced by the caller as a
+/// host diagnostic before it falls back to the raw best-leaf content, so a
+/// failed synthesis is never lost silently (#523 F1).
 /// Search, scoring, and beam selection are untouched — this runs only after a
 /// best ok leaf is chosen.
 async fn synthesize(
@@ -1196,7 +1283,7 @@ async fn synthesize(
     best_reasoning: &str,
     answer_budget: usize,
     emitter: Option<&mut Emitter>,
-) -> Result<String, String> {
+) -> Result<(String, usize), (String, usize)> {
     let directive = with_thinking(
         &build_synthesis_directive(best_content, best_reasoning),
         false,
@@ -1218,11 +1305,14 @@ async fn synthesize(
         DeltaSink::Final,
     )
     .await;
+    let generated_tokens = demux.generated_tokens;
     match demux.kind {
-        DemuxKind::Answered if !demux.answer.trim().is_empty() => Ok(demux.answer),
-        DemuxKind::Answered => Err("empty".to_string()),
-        DemuxKind::Incomplete => Err("not_answered".to_string()),
-        DemuxKind::Aborted(e) => Err(format!("aborted: {e}")),
+        DemuxKind::Answered if !demux.answer.trim().is_empty() => {
+            Ok((demux.answer, generated_tokens))
+        }
+        DemuxKind::Answered => Err(("empty".to_string(), generated_tokens)),
+        DemuxKind::Incomplete => Err(("not_answered".to_string(), generated_tokens)),
+        DemuxKind::Aborted(e) => Err((format!("aborted: {e}"), generated_tokens)),
     }
 }
 
@@ -1238,6 +1328,7 @@ mod tests {
             score,
             score_error: None,
             error: None,
+            generated_tokens: 0,
         }
     }
 
@@ -1249,6 +1340,7 @@ mod tests {
             score: None,
             score_error: Some(err.to_string()),
             error: None,
+            generated_tokens: 0,
         }
     }
 
@@ -1260,6 +1352,7 @@ mod tests {
             score: None,
             score_error: None,
             error: Some(msg.to_string()),
+            generated_tokens: 0,
         }
     }
 
@@ -1271,6 +1364,7 @@ mod tests {
             score: None,
             score_error: None,
             error: Some("no answer".to_string()),
+            generated_tokens: 0,
         }
     }
 
@@ -1422,10 +1516,34 @@ mod tests {
     // execution strategies produce identical nodes.
 
     fn demux(reasoning: &str, answer: &str, kind: DemuxKind) -> Demux {
+        demux_with_tokens(reasoning, answer, kind, 0)
+    }
+
+    fn demux_with_tokens(
+        reasoning: &str,
+        answer: &str,
+        kind: DemuxKind,
+        generated_tokens: usize,
+    ) -> Demux {
         Demux {
             reasoning: reasoning.to_string(),
             answer: answer.to_string(),
             kind,
+            generated_tokens,
+        }
+    }
+
+    fn score(outcome: ScoreOutcome) -> ScoreResult {
+        ScoreResult {
+            outcome,
+            generated_tokens: 0,
+        }
+    }
+
+    fn score_with_tokens(outcome: ScoreOutcome, generated_tokens: usize) -> ScoreResult {
+        ScoreResult {
+            outcome,
+            generated_tokens,
         }
     }
 
@@ -1433,7 +1551,7 @@ mod tests {
     fn classify_answered_scored_is_ok_with_score() {
         let o = classify(
             demux("r", "a", DemuxKind::Answered),
-            Some(ScoreOutcome::Scored(7)),
+            Some(score(ScoreOutcome::Scored(7))),
         );
         assert_eq!(o.status, NodeStatus::Ok);
         assert_eq!(o.content, "a");
@@ -1449,7 +1567,7 @@ mod tests {
         // ok + null score, NO score_error — distinct from an infra failure.
         let o = classify(
             demux("", "a", DemuxKind::Answered),
-            Some(ScoreOutcome::Unparseable),
+            Some(score(ScoreOutcome::Unparseable)),
         );
         assert_eq!(o.status, NodeStatus::Ok);
         assert_eq!(o.score, None);
@@ -1460,7 +1578,9 @@ mod tests {
     fn classify_answered_score_infra_failure_surfaces_score_error() {
         let o = classify(
             demux("", "a", DemuxKind::Answered),
-            Some(ScoreOutcome::Failed("score fork failed: x".to_string())),
+            Some(score(ScoreOutcome::Failed(
+                "score fork failed: x".to_string(),
+            ))),
         );
         assert_eq!(o.status, NodeStatus::Ok);
         assert_eq!(o.score, None);
@@ -1475,6 +1595,25 @@ mod tests {
         assert_eq!(o.status, NodeStatus::Ok);
         assert_eq!(o.score, None);
         assert!(o.score_error.as_deref().unwrap().contains("not scored"));
+    }
+
+    #[test]
+    fn classify_total_generated_tokens_include_reasoning_and_scorer_tokens() {
+        let o = classify(
+            demux_with_tokens(
+                "hidden reasoning",
+                "visible answer",
+                DemuxKind::Answered,
+                11,
+            ),
+            Some(score_with_tokens(ScoreOutcome::Scored(8), 3)),
+        );
+
+        assert_eq!(o.status, NodeStatus::Ok);
+        assert_eq!(o.content, "visible answer");
+        assert_eq!(o.reasoning, "hidden reasoning");
+        assert_eq!(o.score, Some(8));
+        assert_eq!(o.generated_tokens, 14);
     }
 
     #[test]
@@ -1694,7 +1833,7 @@ mod tests {
                 .contains("Retry now with no hidden reasoning")
         );
 
-        let outcome = classify(demux, Some(ScoreOutcome::Scored(9)));
+        let outcome = classify(demux, Some(score(ScoreOutcome::Scored(9))));
         assert_eq!(outcome.status, NodeStatus::Ok);
         let materialized = materialize_level(1, vec![branch("tot-n1", "root", 2, outcome)], 1);
         assert_eq!(
@@ -2028,6 +2167,7 @@ mod tests {
             nodes,
             candidates,
             keep,
+            generated_tokens: _,
         } = materialize_level(
             1,
             vec![branch("n0", "root", 0, ok_outcome("L1-best", Some(6)))],
@@ -2045,6 +2185,7 @@ mod tests {
             nodes,
             candidates,
             keep,
+            generated_tokens: _,
         } = materialize_level(2, vec![], 2);
         flat.extend(nodes);
         let (pool2, stop2) = fold_level(pool1, candidates, &keep);

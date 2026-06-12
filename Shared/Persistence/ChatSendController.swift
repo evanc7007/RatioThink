@@ -339,6 +339,7 @@ public final class ChatSendController: ObservableObject {
       // a failure, not a silent partial tree the UI shows forever (the
       // "hangs after the beam selection, no completion, no error" report).
       var reachedTerminal = false
+      var generationMetrics: GenerationMetrics?
       let encoder = JSONEncoder()
       // Coalesce the live-view encode (#413 phase B). Each `assistant.tot`
       // set republishes the @Model and rebuilds the whole recursive tree
@@ -387,7 +388,21 @@ public final class ChatSendController: ObservableObject {
               }
               Diag.app.event("chat.fail.tot", [("reason", "no_answer")])
             } else {
-              assistant.content = finalAnswer ?? ""
+              if let generationMetrics {
+                assistant.content = finalAnswer ?? ""
+                Self.persistGenerationMetrics(
+                  generationMetrics,
+                  on: assistant,
+                  finishReason: Self.finishReasonValue(for: .stop),
+                  context: context,
+                  persistenceStatus: persistenceStatus
+                )
+              } else {
+                tree.fail(Self.totMissingMetricsMessage)
+                assistant.tot = try? encoder.encode(tree)
+                assistant.content = "⚠️ \(Self.totMissingMetricsMessage)"
+                Diag.app.event("chat.fail.tot", [("reason", "missing_generation_metrics")])
+              }
             }
             Self.persistTree(context, status: persistenceStatus)
             // Terminal: nil the active row so a later cancel() can't delete
@@ -395,6 +410,8 @@ public final class ChatSendController: ObservableObject {
             self.activeAssistant = nil
             self.activeContext = nil
             self.activePersistenceStatus = nil
+          case let .generationMetrics(metrics):
+            generationMetrics = metrics
           case let .finalDelta(text):
             // #523 Part A: stream the synthesized final answer into the row
             // live (the row's content is otherwise empty until the terminal);
@@ -466,6 +483,10 @@ public final class ChatSendController: ObservableObject {
   /// the engine closed the connection mid-search (commonly its per-request
   /// timeout on a slow search). The partial tree is preserved (F-stall).
   static let totIncompleteMessage = "Tree-of-thought search did not finish — the engine closed the connection (it may have timed out). Try a lighter profile (smaller breadth/depth) or a simpler question."
+
+  /// User-facing copy when a selected ToT success arrives without the
+  /// required terminal total-throughput metrics (#542 review F1).
+  static let totMissingMetricsMessage = "Tree-of-thought search finished without generation metrics."
 
   private static func persistTree(_ context: ModelContext, status: PersistenceStatus) {
     do {

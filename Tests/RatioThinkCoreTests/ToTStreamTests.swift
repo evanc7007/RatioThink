@@ -155,6 +155,38 @@ final class ToTStreamTests: XCTestCase {
     XCTAssertEqual(e, .finalDelta(text: "the answer is "))
   }
 
+  func test_decodes_generation_metrics_total_throughput() throws {
+    // #542: ToT streams one terminal total generated-token throughput metric
+    // for the whole completed search, using the same compact payload as chat.
+    let e = try decodeToTFrame(frame(
+      #"{"event":"generation_metrics","output_tokens":84,"elapsed_s":2.0,"tokens_per_sec":42.0}"#
+    ))
+    XCTAssertEqual(
+      e,
+      .generationMetrics(GenerationMetrics(outputTokens: 84, elapsedSeconds: 2.0, tokensPerSecond: 42.0))
+    )
+  }
+
+  func test_malformed_generation_metrics_is_malformed_frame() {
+    XCTAssertThrowsError(try decodeToTFrame(frame(
+      #"{"event":"generation_metrics","output_tokens":84,"elapsed_s":2.0}"#
+    ))) { err in
+      guard case .malformedFrame = (err as? ToTStreamError) else {
+        return XCTFail("expected malformedFrame, got \(err)")
+      }
+    }
+  }
+
+  func test_inconsistent_generation_metrics_is_malformed_frame() {
+    XCTAssertThrowsError(try decodeToTFrame(frame(
+      #"{"event":"generation_metrics","output_tokens":84,"elapsed_s":2.0,"tokens_per_sec":1.0}"#
+    ))) { err in
+      guard case .malformedFrame = (err as? ToTStreamError) else {
+        return XCTFail("expected malformedFrame, got \(err)")
+      }
+    }
+  }
+
   func test_final_delta_missing_text_is_malformed() {
     XCTAssertThrowsError(try decodeToTFrame(frame(#"{"event":"final_delta"}"#))) { err in
       guard case .malformedFrame = (err as? ToTStreamError) else {
@@ -202,6 +234,7 @@ final class ToTStreamTests: XCTestCase {
       frame(#"{"event":"future_frame"}"#),  // dropped
       frame(#"{"event":"node_complete","node":{"id":"tot-n2","parent_id":"root","depth":1,"branch_index":0,"content":"a","score":5,"status":"ok"}}"#),
       frame(#"{"event":"level_pruned","level":1,"kept":["tot-n2"]}"#),
+      frame(#"{"event":"generation_metrics","output_tokens":10,"elapsed_s":0.25,"tokens_per_sec":40.0}"#),
       frame(#"{"event":"tree_complete","selected_node_id":"tot-n2","final_answer":"a"}"#),
     ]
     let source = AsyncThrowingStream<Data, Error> { c in
@@ -214,6 +247,7 @@ final class ToTStreamTests: XCTestCase {
       .treeStart(id: "tot-1", model: "m", breadth: 2, depth: 1, beamWidth: 1),
       .nodeComplete(ToTNode(id: "tot-n2", parentID: "root", depth: 1, branchIndex: 0, content: "a", score: 5, status: .ok)),
       .levelPruned(level: 1, kept: ["tot-n2"]),
+      .generationMetrics(GenerationMetrics(outputTokens: 10, elapsedSeconds: 0.25, tokensPerSecond: 40.0)),
       .treeComplete(selectedNodeID: "tot-n2", finalAnswer: "a"),
     ])
   }
