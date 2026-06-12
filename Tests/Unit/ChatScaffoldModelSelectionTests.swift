@@ -9,7 +9,8 @@ final class ChatScaffoldModelSelectionTests: XCTestCase {
     // no-model confirm rather than silently loading something.
     let selected = ChatScaffoldView.requestModelID(
       selectedModelID: nil,
-      profileDefaultModel: nil
+      profileDefaultModel: nil,
+      residentModelID: nil
     )
     XCTAssertNil(selected)
   }
@@ -23,13 +24,35 @@ final class ChatScaffoldModelSelectionTests: XCTestCase {
     )
   }
 
+  // MARK: - #528 request/resident synchronization
+
+  func test_request_model_requires_matching_resident_engine_model() {
+    XCTAssertNil(
+      ChatScaffoldView.requestModelID(
+        selectedModelID: "pinned-model",
+        profileDefaultModel: "profile-default",
+        residentModelID: "profile-default"
+      ),
+      "a pinned-model request must not be constructed while the engine still serves the profile default"
+    )
+    XCTAssertEqual(
+      ChatScaffoldView.requestModelID(
+        selectedModelID: "pinned-model",
+        profileDefaultModel: "profile-default",
+        residentModelID: "pinned-model"
+      ),
+      "pinned-model"
+    )
+  }
+
   // MARK: - #460 single-source selection resolution
 
   func test_pinned_model_takes_precedence_over_profile_default() {
     XCTAssertEqual(
       ChatScaffoldView.requestModelID(
         selectedModelID: "pinned-model",
-        profileDefaultModel: "profile-default"
+        profileDefaultModel: "profile-default",
+        residentModelID: "pinned-model"
       ),
       "pinned-model"
     )
@@ -41,7 +64,8 @@ final class ChatScaffoldModelSelectionTests: XCTestCase {
     XCTAssertEqual(
       ChatScaffoldView.requestModelID(
         selectedModelID: nil,
-        profileDefaultModel: "profile-default"
+        profileDefaultModel: "profile-default",
+        residentModelID: "profile-default"
       ),
       "profile-default"
     )
@@ -158,7 +182,11 @@ final class ChatScaffoldModelSelectionTests: XCTestCase {
     for c in Self.pinDefaultMatrix {
       XCTAssertEqual(
         ChatScaffoldView.requestModelID(
-          selectedModelID: c.pin, profileDefaultModel: c.def),
+          selectedModelID: c.pin,
+          profileDefaultModel: c.def,
+          residentModelID: ModelTarget.resolve(
+            selectedModelID: c.pin,
+            profileDefault: c.def)?.modelID),
         ModelTarget.resolve(selectedModelID: c.pin, profileDefault: c.def)?.modelID,
         "requestModelID must equal ModelTarget.resolve for pin=\(String(describing: c.pin)) default=\(String(describing: c.def))"
       )
@@ -320,7 +348,7 @@ final class ChatScaffoldModelSelectionTests: XCTestCase {
     XCTAssertEqual(decision, .ready(modelID: "pinned-model"))
   }
 
-  func test_send_gate_does_not_treat_unpinned_profile_default_as_pin_mismatch() throws {
+  func test_send_gate_blocks_unpinned_profile_default_until_resident_matches() throws {
     let decision = ChatScaffoldView.sendGateDecision(
       engineStatus: .running(EngineSessionSnapshot(
         port: try XCTUnwrap(EnginePort(exactly: 48484)),
@@ -333,8 +361,8 @@ final class ChatScaffoldModelSelectionTests: XCTestCase {
 
     XCTAssertEqual(
       decision,
-      .ready(modelID: "profile-default"),
-      "the #527 prompt is scoped to explicit per-chat pins; follow-default gaps remain out of scope for #528")
+      .noResolvableModel,
+      "the #527 prompt stays scoped to explicit per-chat pins, but #528 still blocks profile-default sends until the resident engine matches")
   }
 
 
@@ -395,14 +423,149 @@ final class ChatScaffoldModelSelectionTests: XCTestCase {
       ChatScaffoldView.reconcileFailureStep(hasPendingAutoSend: false, isRetryPass: true),
       .none)
 
-    // The fallback edge re-evaluates with the pre-F6 evidence: the chat's
-    // selection authority settles the verdict — fire on the intended model,
-    // disarm on a mismatch — bounded, never an infinite hold.
+    // The final fallback no longer invents a send-safe model from the chat's
+    // selection authority. With no resident evidence after bounded reconcile
+    // failure, the pending flow explicitly terminates instead of silently
+    // holding forever.
     let chatID = UUID()
-    let pending = PendingAutoSend.arm(chatID: chatID, targetModelID: "org/A", messageText: "hi")!
-    let fallback = ChatScaffoldView.resolutionProbe(
-      resolvedModelID: "org/A", residentModelID: nil, requiresResidency: false)
-    XCTAssertEqual(pending.verdict(chatID: chatID, resolvedModelID: fallback, isSending: false), .fire)
+    var state = PendingSendState()
+    state.arm(chatID: chatID, targetModelID: "org/A", messageText: "hi")
+    XCTAssertNotNil(state.pending)
+    XCTAssertEqual(
+      ChatScaffoldView.pendingSettlementResolution(
+        currentTargetModelID: "org/A", pendingTargetModelID: "org/A", residentModelID: nil),
+      .hold)
+    state.terminate(chatID: chatID)
+    XCTAssertNil(state.pending)
+    XCTAssertNil(state.autoSubmit)
+  }
+
+  func test_528_pending_settlement_disarms_on_different_resident_even_when_send_model_is_nil() {
+    let chatID = UUID()
+    var state = PendingSendState()
+    state.arm(chatID: chatID, targetModelID: "org/A", messageText: "hi")
+
+    let sendSafe = ChatScaffoldView.resolutionProbe(
+      resolvedModelID: nil, residentModelID: "org/B", requiresResidency: false)
+    XCTAssertNil(sendSafe, "production currentModelID is nil when target A and resident B differ")
+
+    XCTAssertEqual(
+      ChatScaffoldView.pendingSettlementResolution(
+        currentTargetModelID: "org/A", pendingTargetModelID: "org/A", residentModelID: "org/B"),
+      .model("org/B"),
+      "resident B is stale-context evidence for the pending send")
+
+    state.settle(chatID: chatID, resolvedModelID: "org/B", isSending: false)
+    XCTAssertNil(state.pending, "different resident must disarm instead of holding forever")
+    XCTAssertNil(state.autoSubmit)
+  }
+
+  func test_528_pending_settlement_disarms_when_current_target_changes_from_pending_target() {
+    let chatID = UUID()
+    var state = PendingSendState()
+    state.arm(chatID: chatID, targetModelID: "org/A", messageText: "hi")
+
+    switch ChatScaffoldView.pendingSettlementResolution(
+      currentTargetModelID: "org/B",
+      pendingTargetModelID: "org/A",
+      residentModelID: "org/A"
+    ) {
+    case .disarm:
+      state.disarm()
+    case .model(let modelID):
+      state.settle(chatID: chatID, resolvedModelID: modelID, isSending: false)
+    case .hold:
+      state.settle(chatID: chatID, resolvedModelID: nil, isSending: false)
+    }
+
+    XCTAssertNil(state.autoSubmit, "a resident old target must not auto-fire after the chat target changes")
+    XCTAssertNil(state.pending, "changed current target makes the armed pending send stale")
+  }
+
+  func test_528_pending_settlement_fires_only_on_exact_target_resident_match() {
+    let chatID = UUID()
+    var state = PendingSendState()
+    state.arm(chatID: chatID, targetModelID: "org/A", messageText: "hi")
+
+    XCTAssertEqual(
+      ChatScaffoldView.pendingSettlementResolution(
+        currentTargetModelID: "org/A", pendingTargetModelID: "org/A", residentModelID: "org/A"),
+      .model("org/A"))
+    state.settle(chatID: chatID, resolvedModelID: "org/A", isSending: false)
+
+    XCTAssertNil(state.pending)
+    XCTAssertEqual(state.autoSubmit, ComposerAutoSubmit(tick: 1, expectedText: "hi"))
+  }
+
+  func test_528_engine_sync_defers_until_all_chats_are_idle() {
+    let chatB = UUID()
+    XCTAssertTrue(
+      ChatScaffoldView.shouldDeferEngineSyncForStreams([chatB]),
+      "automatic model sync must not restart the single engine while another chat streams")
+    XCTAssertFalse(
+      ChatScaffoldView.shouldDeferEngineSyncForStreams([]),
+      "once the app-wide stream set is idle the deferred sync may run")
+  }
+
+  func test_528_explicit_prompt_load_uses_same_stream_guard_as_automatic_sync() {
+    let chatB = UUID()
+    XCTAssertEqual(
+      ChatScaffoldView.engineMutationDecision(inFlightChatIDs: [chatB]),
+      .deferUntilIdle,
+      "the prompt Load action and automatic sync must both avoid restarting the single engine while another chat streams")
+    XCTAssertEqual(
+      ChatScaffoldView.engineMutationDecision(inFlightChatIDs: []),
+      .runNow)
+  }
+
+  func test_528_pinned_mismatch_relaunch_uses_stream_guard_before_restart() {
+    let chatB = UUID()
+    XCTAssertEqual(
+      ChatScaffoldView.pinnedMismatchRelaunchDecision(inFlightChatIDs: [chatB]),
+      .deferUntilIdle,
+      "relaunching a pinned mismatch must not restart the single engine while another chat streams")
+    XCTAssertEqual(
+      ChatScaffoldView.pinnedMismatchRelaunchDecision(inFlightChatIDs: []),
+      .runNow)
+  }
+
+  func test_528_deferred_explicit_load_drops_when_current_target_changed_before_idle() {
+    let chatID = UUID()
+    let queued = ChatScaffoldView.DeferredEngineMutation.explicitLoad(
+      chatID: chatID,
+      targetModelID: "org/A",
+      generation: 1)
+
+    XCTAssertEqual(
+      ChatScaffoldView.deferredEngineMutationResolution(
+        queued: queued,
+        currentChatID: chatID,
+        currentTargetModelID: "org/C"),
+      .drop,
+      "a queued Load for A must not restart the engine after the chat target moves to C")
+  }
+
+  func test_528_deferred_explicit_load_is_latest_wins_for_same_chat() {
+    let chatID = UUID()
+    let queuedA = ChatScaffoldView.DeferredEngineMutation.explicitLoad(
+      chatID: chatID,
+      targetModelID: "org/A",
+      generation: 1)
+    let queuedC = ChatScaffoldView.DeferredEngineMutation.explicitLoad(
+      chatID: chatID,
+      targetModelID: "org/C",
+      generation: 2)
+
+    XCTAssertEqual(
+      ChatScaffoldView.replacingDeferredEngineMutation(current: queuedA, replacement: queuedC),
+      queuedC,
+      "pressing Load for C while A is queued must replace A instead of being ignored")
+    XCTAssertEqual(
+      ChatScaffoldView.deferredEngineMutationResolution(
+        queued: queuedC,
+        currentChatID: chatID,
+        currentTargetModelID: "org/C"),
+      .run(modelID: "org/C"))
   }
 
   // MARK: - #516 review F9: sheet dismissal keys on the probe, not raw resolution

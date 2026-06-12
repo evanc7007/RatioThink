@@ -74,6 +74,14 @@ struct ChatScaffoldView: View {
   /// profile switch, navigation away, or a stale resolution. The
   /// transitions live in `PendingSendState` so they are unit-tested.
   @State private var pendingSend = PendingSendState()
+  /// A blocked send may need to restart the single engine onto a different
+  /// model, but doing that while another chat is streaming would interrupt
+  /// that stream. Defer the automatic sync until the app-wide stream set is
+  /// idle; explicit user actions (Stop / Load) remain separate choices.
+  @State private var deferredEngineSyncTask: Task<Void, Never>?
+  @State private var deferredEngineMutation: DeferredEngineMutation?
+  @State private var deferredEngineMutationGeneration: Int = 0
+
   /// #527: when an explicit per-chat model pin differs from the engine's
   /// known resident model, a send would deterministically fail with
   /// model_not_found. Block before persisting the user message and ask which
@@ -476,6 +484,7 @@ struct ChatScaffoldView: View {
             // A send committed (manual or fired auto-send) — any armed
             // pending send is now satisfied or superseded. #516.
             pendingSend.disarm()
+            cancelDeferredEngineSync()
             sendAssistantTurn(for: chat)
           },
           // #507: the composer's stop button — the user-reachable cancel
@@ -498,7 +507,10 @@ struct ChatScaffoldView: View {
           // #397: ensure the engine is running FIRST, then load — the
           // pre-#397 `loadDirect` no-opped on a stopped engine. The sheet
           // stays open, reflects busy→ready, and auto-dismisses below.
-          loadDefaultModel(model)
+          // The common load path defers while any chat is streaming so this
+          // prompt button can't restart the single engine out from under a
+          // sibling chat.
+          loadDefaultModel(model, for: chat)
         },
         onDownloaded: {
           // Model is now on disk — boot the engine on this chat's
@@ -516,6 +528,7 @@ struct ChatScaffoldView: View {
           // #516: a dismissed gate drops the pending send — the draft stays
           // in the composer, but nothing auto-fires later.
           pendingSend.disarm()
+          cancelDeferredEngineSync()
           showNoModelPrompt = false
         },
         engineStatus: engineStatusStore.status,
@@ -529,12 +542,7 @@ struct ChatScaffoldView: View {
       PinnedModelMismatchPrompt(
         mismatch: mismatch,
         onRelaunchPinned: {
-          pinnedModelMismatch = nil
-          // #469 explicit-pick launch path: a confirmed model identity change
-          // routes through the coordinator's status-aware serve executor,
-          // which restarts a running engine onto the selected boot model.
-          swapCoordinator.loadDirect(modelID: mismatch.pinnedModelID,
-                                     profileID: viewModel.selectedProfileID)
+          relaunchPinnedMismatch(mismatch, for: chat)
         },
         onUseResident: {
           if persistChatModel(mismatch.residentModelID, on: chat) {
@@ -639,6 +647,7 @@ struct ChatScaffoldView: View {
       // #516: a profile switch makes the gate's promised load target stale —
       // drop the pending send rather than auto-firing under a new profile.
       pendingSend.disarm()
+      cancelDeferredEngineSync()
       let previous = chat.profileID
       chat.profileID = new
       do {
@@ -674,6 +683,7 @@ struct ChatScaffoldView: View {
       // #516: navigating away abandons the pending flow — no stale
       // auto-send when the user later returns or switches chats.
       pendingSend.disarm()
+      cancelDeferredEngineSync()
     }
     .task(id: downloadController.completionTick) {
       await refreshToolbarModelOptions()
@@ -781,7 +791,7 @@ struct ChatScaffoldView: View {
         guard (try? await Task.sleep(nanoseconds: 2_000_000_000)) != nil else { break }
         await reconcileEngineResidentModel(for: chat, isRetryPass: true)
       case .fallbackEdge:
-        resolutionEdge(for: chat, requiresResidency: false)
+        terminatePendingSendAfterReconcileFailure(for: chat)
       }
     case .empty:
       // Engine running but serving NO model — clear any stale residency so
@@ -949,11 +959,10 @@ struct ChatScaffoldView: View {
   /// default when unpinned. The engine must actually be `.running` for the
   /// selection to count (a stopped engine yields a "Load X?" prompt rather
   /// than a send that passes the gate then fails at HTTP); `EngineLifecycle`
-  /// clears residency on the leave-`.running` edge and `reconcileEngine
-  /// ResidentModel` re-seeds `chat.modelID` to the served id once running,
-  /// so by send time the authority matches what the engine serves. No
-  /// `residentModelID` read here — residency is an engine fact reconciled
-  /// INTO the authority, not a parallel selection source.
+  /// clears residency on the leave-`.running` edge; this preflight then
+  /// requires the helper-observed resident model to match the app's target
+  /// before returning a request model id. A mismatch blocks the send and
+  /// synchronizes the engine instead of leaking `model_not_found`.
   private func currentModelID(for chat: Chat) -> String? {
     let engineRunning: Bool = {
       if case .running = engineStatusStore.status { return true }
@@ -961,7 +970,8 @@ struct ChatScaffoldView: View {
     }()
     return Self.requestModelID(
       selectedModelID: engineRunning ? chat.modelID : nil,
-      profileDefaultModel: engineRunning ? selectedProfileDefault : nil
+      profileDefaultModel: engineRunning ? selectedProfileDefault : nil,
+      residentModelID: modelLoadCenter.residentModelID
     )
   }
 
@@ -979,6 +989,7 @@ struct ChatScaffoldView: View {
       return
     case .pinnedModelMismatch(let pinned, let resident):
       pendingSend.disarm()
+      cancelDeferredEngineSync()
       pinnedModelMismatch = PinnedModelMismatch(pinnedModelID: pinned,
                                                 residentModelID: resident)
     case .noResolvableModel:
@@ -990,7 +1001,24 @@ struct ChatScaffoldView: View {
       pendingSend.arm(chatID: chat.id,
                       targetModelID: gateTarget(for: chat)?.modelID,
                       messageText: draft)
+      synchronizeEngineForPendingSend(chat)
       presentNoModelPrompt()
+    }
+  }
+
+  private func relaunchPinnedMismatch(_ mismatch: PinnedModelMismatch, for chat: Chat) {
+    pinnedModelMismatch = nil
+    // The mismatch prompt is a blocked-send surface, not a permission to
+    // interrupt unrelated chats. Route its Relaunch action through the same
+    // stream-aware, target-bound engine-mutation path as the no-model prompt's
+    // explicit Load button, so a running chat elsewhere defers the restart and
+    // a stale prompt target is dropped before it can mutate the shared engine.
+    guard gateTarget(for: chat)?.modelID == mismatch.pinnedModelID else { return }
+    switch Self.pinnedMismatchRelaunchDecision(inFlightChatIDs: sendCoordinator.inFlightChatIDs) {
+    case .runNow:
+      loadDefaultModel(mismatch.pinnedModelID, for: chat)
+    case .deferUntilIdle:
+      deferEngineLoadUntilStreamsIdle(mismatch.pinnedModelID, for: chat)
     }
   }
 
@@ -1010,6 +1038,7 @@ struct ChatScaffoldView: View {
     chat.modelID = modelID
     do {
       try modelContext.save()
+      cancelStaleDeferredEngineMutation(afterTargetChangeFor: chat, newTargetModelID: modelID)
       return true
     } catch {
       modelContext.rollback()
@@ -1120,6 +1149,7 @@ struct ChatScaffoldView: View {
       // `ChatStartGate.evaluate` no longer takes a `load:` state — the load
       // state machine is gone (ModelLoadCenter is residency-only).
       resolvedModelID: currentModelID(for: chat),
+      residentModelID: modelLoadCenter.residentModelID,
       // The gate names the model the Load tap will BOOT — the chat's pick
       // when present, not the profile default the boot path would ignore
       // (#459 repro 1 vs #460's engine-running nil). #497: the full
@@ -1192,7 +1222,16 @@ struct ChatScaffoldView: View {
   /// against a stopped engine would otherwise just defer on
   /// `engineNotReady`. The sheet stays open and reflects busy→ready, then
   /// auto-dismisses via `resolutionEdge` (probe-gated — review v3 F9).
-  private func loadDefaultModel(_ model: String) {
+  private func loadDefaultModel(_ model: String, for chat: Chat? = nil) {
+    switch Self.engineMutationDecision(inFlightChatIDs: sendCoordinator.inFlightChatIDs) {
+    case .runNow:
+      break
+    case .deferUntilIdle:
+      if let chat {
+        deferEngineLoadUntilStreamsIdle(model, for: chat)
+      }
+      return
+    }
     switch engineStatusStore.status {
     case .running:
       // Engine up — make it serve this model. #469: a model that differs from
@@ -1215,6 +1254,152 @@ struct ChatScaffoldView: View {
     }
   }
 
+  /// #528 send preflight: if a user presses Send while the app's target and
+  /// helper resident model disagree, immediately converge the engine onto the
+  /// intended target instead of letting the request reach chat completions and
+  /// fail as `model_not_found`. `PendingAutoSend` still owns the actual submit
+  /// and fires only after residency confirms this target.
+  private func synchronizeEngineForPendingSend(_ chat: Chat) {
+    guard let target = gateTarget(for: chat) else { return }
+    guard pendingSend.pending?.chatID == chat.id else { return }
+    guard currentModelID(for: chat) == nil else { return }
+    guard case .load = Self.availabilityAction(gateModel: target.modelID,
+                                               isModelInstalled: Self.isModelInstalled) else {
+      return
+    }
+    guard Self.engineMutationDecision(inFlightChatIDs: sendCoordinator.inFlightChatIDs) == .runNow else {
+      deferEngineSyncUntilStreamsIdle(for: chat)
+      return
+    }
+    if case .running = engineStatusStore.status,
+       modelLoadCenter.residentModelID == nil {
+      Task { @MainActor in
+        await reconcileEngineResidentModel(for: chat)
+        if currentModelID(for: chat) == nil {
+          loadDefaultModel(target.modelID, for: chat)
+        }
+      }
+      return
+    }
+    loadDefaultModel(target.modelID, for: chat)
+  }
+
+  static func shouldDeferEngineSyncForStreams(_ inFlightChatIDs: Set<UUID>) -> Bool {
+    !inFlightChatIDs.isEmpty
+  }
+
+  enum EngineMutationDecision: Equatable {
+    case runNow
+    case deferUntilIdle
+  }
+
+  static func engineMutationDecision(inFlightChatIDs: Set<UUID>) -> EngineMutationDecision {
+    shouldDeferEngineSyncForStreams(inFlightChatIDs) ? .deferUntilIdle : .runNow
+  }
+
+  static func pinnedMismatchRelaunchDecision(inFlightChatIDs: Set<UUID>) -> EngineMutationDecision {
+    engineMutationDecision(inFlightChatIDs: inFlightChatIDs)
+  }
+
+  private func deferEngineSyncUntilStreamsIdle(for chat: Chat) {
+    guard deferredEngineSyncTask == nil else { return }
+    deferredEngineSyncTask = Task { @MainActor in
+      defer { deferredEngineSyncTask = nil }
+      while Self.engineMutationDecision(inFlightChatIDs: sendCoordinator.inFlightChatIDs) == .deferUntilIdle {
+        do {
+          try await Task.sleep(nanoseconds: 250_000_000)
+        } catch {
+          return
+        }
+      }
+      synchronizeEngineForPendingSend(chat)
+    }
+  }
+
+  struct DeferredEngineMutation: Equatable {
+    let chatID: UUID
+    let targetModelID: String
+    let generation: Int
+
+    static func explicitLoad(chatID: UUID,
+                             targetModelID: String,
+                             generation: Int) -> DeferredEngineMutation {
+      DeferredEngineMutation(chatID: chatID, targetModelID: targetModelID, generation: generation)
+    }
+  }
+
+  enum DeferredEngineMutationResolution: Equatable {
+    case drop
+    case run(modelID: String)
+  }
+
+  static func deferredEngineMutationResolution(
+    queued: DeferredEngineMutation,
+    currentChatID: UUID,
+    currentTargetModelID: String?
+  ) -> DeferredEngineMutationResolution {
+    guard queued.chatID == currentChatID else { return .drop }
+    guard let currentTargetModelID, !currentTargetModelID.isEmpty else { return .drop }
+    guard currentTargetModelID == queued.targetModelID else { return .drop }
+    return .run(modelID: queued.targetModelID)
+  }
+
+  static func replacingDeferredEngineMutation(
+    current: DeferredEngineMutation?,
+    replacement: DeferredEngineMutation
+  ) -> DeferredEngineMutation {
+    replacement
+  }
+
+  private func deferEngineLoadUntilStreamsIdle(_ model: String, for chat: Chat) {
+    deferredEngineMutationGeneration += 1
+    let queued = DeferredEngineMutation.explicitLoad(
+      chatID: chat.id,
+      targetModelID: model,
+      generation: deferredEngineMutationGeneration)
+    deferredEngineMutation = Self.replacingDeferredEngineMutation(
+      current: deferredEngineMutation,
+      replacement: queued)
+    deferredEngineSyncTask?.cancel()
+    deferredEngineSyncTask = Task { @MainActor in
+      defer { deferredEngineSyncTask = nil }
+      while Self.engineMutationDecision(inFlightChatIDs: sendCoordinator.inFlightChatIDs) == .deferUntilIdle {
+        do {
+          try await Task.sleep(nanoseconds: 250_000_000)
+        } catch {
+          return
+        }
+      }
+      guard deferredEngineMutation == queued else { return }
+      deferredEngineMutation = nil
+      switch Self.deferredEngineMutationResolution(
+        queued: queued,
+        currentChatID: chat.id,
+        currentTargetModelID: gateTarget(for: chat)?.modelID
+      ) {
+      case .drop:
+        break
+      case .run(let modelID):
+        loadDefaultModel(modelID, for: chat)
+      }
+    }
+  }
+
+  private func cancelDeferredEngineSync() {
+    deferredEngineSyncTask?.cancel()
+    deferredEngineSyncTask = nil
+    deferredEngineMutation = nil
+  }
+
+  private func cancelStaleDeferredEngineMutation(afterTargetChangeFor chat: Chat,
+                                                 newTargetModelID: String?) {
+    guard let queued = deferredEngineMutation, queued.chatID == chat.id else { return }
+    let currentTarget = Self.gateTarget(selectedModelID: newTargetModelID,
+                                        profileDefaultModel: selectedProfileDefault)?.modelID
+    guard currentTarget != queued.targetModelID else { return }
+    cancelDeferredEngineSync()
+  }
+
   /// #397 F1: re-poll the helper after an unreachable-transport failure.
   /// The 1 Hz loop would catch up anyway; this makes Retry immediate.
   private func refreshEngineStatus() {
@@ -1228,8 +1413,8 @@ struct ChatScaffoldView: View {
   /// pending send there is nothing to settle (the pre-existing NSLog
   /// behavior stands — surfacing the failure in the gate UI is the
   /// deferred FC1). With one armed: first pass earns a backed-off retry;
-  /// the final failure falls back to the residency-free resolution edge
-  /// so the promise settles (fire or disarm) instead of holding forever.
+  /// the final failure explicitly terminates the pending flow instead of
+  /// holding forever on equal `.running` polls that will not re-run reconcile.
   enum ReconcileFailureStep: Equatable {
     case none, retry, fallbackEdge
   }
@@ -1251,8 +1436,33 @@ struct ChatScaffoldView: View {
   static func resolutionProbe(resolvedModelID: String?,
                               residentModelID: String?,
                               requiresResidency: Bool) -> String? {
-    if requiresResidency, residentModelID == nil { return nil }
+    guard let resolvedModelID, !resolvedModelID.isEmpty else { return nil }
+    if let residentModelID {
+      guard residentModelID == resolvedModelID else { return nil }
+    } else if requiresResidency {
+      return nil
+    }
     return resolvedModelID
+  }
+
+  enum PendingSettlementResolution: Equatable {
+    case hold
+    case disarm
+    case model(String)
+  }
+
+  static func pendingSettlementResolution(currentTargetModelID: String?,
+                                          pendingTargetModelID: String?,
+                                          residentModelID: String?) -> PendingSettlementResolution {
+    guard let pendingTargetModelID, !pendingTargetModelID.isEmpty else { return .hold }
+    guard let currentTargetModelID, !currentTargetModelID.isEmpty else { return .disarm }
+    guard currentTargetModelID == pendingTargetModelID else { return .disarm }
+    guard let residentModelID, !residentModelID.isEmpty else { return .hold }
+    return .model(residentModelID)
+  }
+
+  private func terminatePendingSendAfterReconcileFailure(for chat: Chat) {
+    pendingSend.terminate(chatID: chat.id)
   }
 
   /// #516: a model-resolution edge (residency reconciled, or the chat's
@@ -1270,29 +1480,41 @@ struct ChatScaffoldView: View {
       resolvedModelID: currentModelID(for: chat),
       residentModelID: modelLoadCenter.residentModelID,
       requiresResidency: requiresResidency)
+    let pendingResolution = Self.pendingSettlementResolution(
+      currentTargetModelID: gateTarget(for: chat)?.modelID,
+      pendingTargetModelID: pendingSend.pending?.targetModelID,
+      residentModelID: modelLoadCenter.residentModelID)
     // #397: close the gate once a model resolves so the user lands back at
-    // the composer with their draft intact. Review v3 F9: keyed on the SAME
-    // probe result as the verdict below — on a residency-required edge the
-    // sheet must not flash the dismiss-success signal while the fire is
-    // still held pending reconcile (a later disarm/strand would otherwise
-    // read as a silent success).
+    // the composer with their draft intact. Review v3 F9: dismissal stays
+    // keyed on the send-safe probe — on a residency-required edge the sheet
+    // must not flash the dismiss-success signal while pending settlement is
+    // still waiting for resident evidence.
     if showNoModelPrompt, resolved != nil {
       showNoModelPrompt = false
     }
     // Settle the pending: fire-once (cleared before the signal so
     // re-entrant edges can never double-send), disarm on stale, else hold.
     // The transition bookkeeping lives in `PendingSendState` (tested).
-    pendingSend.settle(chatID: chat.id,
-                       resolvedModelID: resolved,
-                       isSending: sendCoordinator.isInFlight(chatID))
+    switch pendingResolution {
+    case .hold:
+      pendingSend.settle(chatID: chat.id,
+                         resolvedModelID: nil,
+                         isSending: sendCoordinator.isInFlight(chatID))
+    case .disarm:
+      pendingSend.disarm()
+    case .model(let modelID):
+      pendingSend.settle(chatID: chat.id,
+                         resolvedModelID: modelID,
+                         isSending: sendCoordinator.isInFlight(chatID))
+    }
   }
 
-  /// Resolve the model a send should target from the chat's SELECTION
-  /// authority (#460): the explicit pin (`selectedModelID` = `Chat.modelID`),
-  /// else the active profile's default, else nil. : no hidden fallback —
-  /// when nothing resolves the caller blocks the send behind the no-model
-  /// confirm rather than asking the engine to load something the user never
-  /// chose. Pure + static so the precedence is unit-tested without a view.
+  /// Resolve the model a send may target only when the chat's SELECTION
+  /// authority (#460) and the helper-observed resident engine state agree.
+  /// The app target is still the explicit pin (`selectedModelID` =
+  /// `Chat.modelID`) else the active profile's default; residency is the
+  /// separate engine fact that proves the running helper can serve it. Nil
+  /// means the caller blocks the send and synchronizes the engine first.
   ///
   /// Pin-over-default precedence routes through the one derivation
   /// (`ModelTarget.resolve`) so the send path can never disagree with the
@@ -1302,10 +1524,14 @@ struct ChatScaffoldView: View {
   /// `PIE_TEST_CHAT_MODEL` bypass).
   static func requestModelID(
     selectedModelID: String?,
-    profileDefaultModel: String?
+    profileDefaultModel: String?,
+    residentModelID: String?
   ) -> String? {
-    ModelTarget.resolve(selectedModelID: selectedModelID,
-                        profileDefault: profileDefaultModel)?.modelID
+    EngineRequestSync(
+      target: ModelTarget.resolve(selectedModelID: selectedModelID,
+                                  profileDefault: profileDefaultModel),
+      resident: EngineResidentState(modelID: residentModelID)
+    ).resolvedModelID
   }
 
   /// #527: final send gate for model identity. The selection authority remains
@@ -1314,9 +1540,9 @@ struct ChatScaffoldView: View {
   /// differs from `residentModelID` is guaranteed to be rejected by the engine,
   /// so block and ask instead of surfacing a bare model_not_found after send.
   ///
-  /// Scoped to explicit pins only. Unpinned profile-default-vs-resident
-  /// recovery is broader request/engine-state reconciliation and remains
-  /// ticket #528.
+  /// Explicit pins get the user-facing mismatch prompt. Unpinned
+  /// profile-default-vs-resident gaps fall through to `.noResolvableModel`,
+  /// where the request/resident sync path can converge the engine before send.
   static func sendGateDecision(
     engineStatus: EngineStatus,
     selectedModelID: String?,
@@ -1324,8 +1550,8 @@ struct ChatScaffoldView: View {
     residentModelID: String?
   ) -> SendGateDecision {
     guard case .running = engineStatus else { return .noResolvableModel }
-    guard let resolved = requestModelID(selectedModelID: selectedModelID,
-                                        profileDefaultModel: profileDefaultModel) else {
+    guard ModelTarget.resolve(selectedModelID: selectedModelID,
+                              profileDefault: profileDefaultModel) != nil else {
       return .noResolvableModel
     }
 
@@ -1336,6 +1562,11 @@ struct ChatScaffoldView: View {
        selected != resident {
       return .pinnedModelMismatch(pinnedModelID: selected,
                                   residentModelID: resident)
+    }
+    guard let resolved = requestModelID(selectedModelID: selectedModelID,
+                                        profileDefaultModel: profileDefaultModel,
+                                        residentModelID: residentModelID) else {
+      return .noResolvableModel
     }
     return .ready(modelID: resolved)
   }
