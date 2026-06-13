@@ -905,7 +905,13 @@ struct ChatScaffoldView: View {
       // #524: seed chat-apc's APC snapshot-retention policy from the latest
       // authoritative pie `model_status` KV counters. Nil/unknown means the
       // inferlet must retain rather than guess.
-      kvUsageSnapshot: engineStatusStore.kvUsageSnapshot(for: modelID)
+      kvUsageSnapshot: engineStatusStore.kvUsageSnapshot(for: modelID),
+      // #572: thread the selected profile's output-constraint mode. A "JSON
+      // Think" profile attaches `response_format: json_object` so chat-apc runs
+      // JSON-grammar-constrained decoding; other profiles carry none. Built
+      // here so both the ToT dispatch and the normal send get it. Ordered last
+      // to match the `ChatSendRequestOptions` init parameter order.
+      responseFormat: profileStore.responseFormat(forProfileID: viewModel.selectedProfileID)
     )
 
     // #413: when the active profile declares `mode = "tree-of-thought"`,
@@ -938,8 +944,9 @@ struct ChatScaffoldView: View {
       engine: engineStore.client,
       modelLoadCenter: modelLoadCenter,
       persistenceStatus: persistenceStatus,
-      // Reuses the `options` built above (now carrying #426 speculation), so
-      // the normal send and the ToT dispatch share one options value.
+      // Reuses the `options` built above (now carrying #426 speculation +
+      // #572 response_format), so the normal send and the ToT dispatch
+      // share one options value.
       options: options,
       // `EngineStatusStore` conforms to `ChatRecoveryGate`; passing it
       // here lets the send pipeline classify a mid-stream
