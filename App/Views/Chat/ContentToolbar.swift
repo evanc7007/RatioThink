@@ -84,6 +84,10 @@ struct ContentToolbar: View {
   /// like the others so snapshot/preview sites stay pip-less; the pip renders
   /// only when it (with center/engineStatus/helperHealth) is wired.
   let engineLifecycle: EngineLifecycle?
+  /// Current selected-profile sampling defaults. Read through a closure so
+  /// Settings saves affect newly opened params popovers even though
+  /// `ProfileStore` does not publish SwiftUI updates.
+  let profileSampling: () -> ChatSampling
   /// Forwarded to the indicator's running/ready popover Unload action.
   let onUnload: () -> Void
   /// Forwarded to the indicator's offline (engine-stopped) popover "Start
@@ -115,6 +119,7 @@ struct ContentToolbar: View {
     engineStatus: EngineStatusStore?,
     helperHealth: HelperHealthController?,
     engineLifecycle: EngineLifecycle?,
+    profileSampling: @escaping () -> ChatSampling = { ChatSampling() },
     onUnload: @escaping () -> Void,
     onStartEngine: @escaping () -> Void = {}
   ) {
@@ -133,6 +138,7 @@ struct ContentToolbar: View {
     self.engineStatus = engineStatus
     self.helperHealth = helperHealth
     self.engineLifecycle = engineLifecycle
+    self.profileSampling = profileSampling
     self.onUnload = onUnload
     self.onStartEngine = onStartEngine
   }
@@ -498,9 +504,27 @@ struct ContentToolbar: View {
     .buttonStyle(.plain)
     .help("Sampling parameters")
     .popover(isPresented: $showParamsPopover, arrowEdge: .top) {
-      ParamsPopover(sampling: $viewModel.sampling)
+      let sourceSampling = profileSampling()
+      ParamsPopover(sampling: viewModel.samplingOverride ?? sourceSampling) { committed in
+        viewModel.samplingOverride = Self.samplingOverrideAfterParamsCommit(
+          currentOverride: viewModel.samplingOverride,
+          sourceSampling: sourceSampling,
+          committed: committed)
+      }
     }
     .accessibilityIdentifier("toolbar.params")
+  }
+
+  static func samplingOverrideAfterParamsCommit(currentOverride: ChatSampling?,
+                                                sourceSampling: ChatSampling,
+                                                committed: ChatSampling) -> ChatSampling? {
+    if committed == sourceSampling {
+      return nil
+    }
+    if committed == currentOverride {
+      return currentOverride
+    }
+    return committed
   }
 
   private var attachButton: some View {
@@ -539,7 +563,8 @@ struct ContentToolbar: View {
 /// ticks and the removed Max-tokens row — can be rendered to a PNG via
 /// `ImageRenderer` in a snapshot test (`SamplingAndIndicatorSnapshotTests`).
 struct ParamsPopover: View {
-  @Binding var sampling: ChatSampling
+  let sampling: ChatSampling
+  let onCommit: (ChatSampling) -> Void
   @State private var temperature: Double
   @State private var topP: Double
   /// Latches once `commit()` runs so the dismissal flush on
@@ -555,10 +580,12 @@ struct ParamsPopover: View {
   /// dismissal. Review v4 F1.
   @State private var didCommit = false
 
-  init(sampling: Binding<ChatSampling>) {
-    self._sampling = sampling
-    _temperature = State(initialValue: sampling.wrappedValue.temperature)
-    _topP = State(initialValue: sampling.wrappedValue.topP)
+  init(sampling: ChatSampling,
+       onCommit: @escaping (ChatSampling) -> Void = { _ in }) {
+    self.sampling = sampling
+    self.onCommit = onCommit
+    _temperature = State(initialValue: sampling.temperature)
+    _topP = State(initialValue: sampling.topP)
   }
 
   var body: some View {
@@ -584,11 +611,14 @@ struct ParamsPopover: View {
     .frame(width: 280)
     // Any post-Apply slider edit re-arms the dismissal flush so an
     // Apply-then-edit-then-Esc sequence does not silently drop the
-    // second edit. Review v4 F1. `commit()` writes to `sampling` only
-    // (not the local @State values), so these `onChange` handlers are
-    // not retriggered by `commit()` itself — no feedback loop.
+    // second edit. Review v4 F1. `commit()` sends the buffered value through
+    // `onCommit` only (not back into the local @State values), so these
+    // `onChange` handlers are not retriggered by `commit()` itself — no
+    // feedback loop. Whether that buffered value is an actual override is
+    // decided by comparing it to the source profile sampling at the toolbar
+    // boundary, not by whether any transient slider event occurred.
     .onChange(of: temperature) { _, _ in didCommit = false }
-    .onChange(of: topP)        { _, _ in didCommit = false }
+    .onChange(of: topP) { _, _ in didCommit = false }
     // macOS popover dismissal (click-outside, Esc) is treated as
     // accept — flush the local buffer so silent edit loss is not a
     // thing. Review v1 F4. Latch prevents double-commit when Apply
@@ -628,11 +658,11 @@ struct ParamsPopover: View {
     // engine-launch concern (#438), not a per-chat knob. Preserve the
     // existing max_tokens (profile default) so dropping the control never
     // silently resets it.
-    sampling = ChatSampling(
+    onCommit(ChatSampling(
       temperature: temperature,
       topP: topP,
       maxTokens: sampling.maxTokens
-    )
+    ))
     didCommit = true
   }
 }

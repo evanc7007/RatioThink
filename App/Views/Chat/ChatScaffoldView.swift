@@ -385,6 +385,7 @@ struct ChatScaffoldView: View {
         engineStatus: engineStatusStore,
         helperHealth: helperHealth,
         engineLifecycle: engineLifecycle,
+        profileSampling: { selectedProfileSamplingDefault },
         onUnload: unloadModel,
         onStartEngine: startEngineForSelectedProfile
       )
@@ -630,6 +631,7 @@ struct ChatScaffoldView: View {
       // Seed the toolbar from the persisted profile so the menu
       // label matches what the chat was created with.
       viewModel.selectedProfileID = chat.profileID
+      clearTransientOverridesForSelectedProfile()
       // #4: covers the case where the engine status already settled before
       // this view appeared (no .onChange fires) — evaluate the launch ask
       // here too; the once-flag keeps it from double-prompting.
@@ -664,6 +666,7 @@ struct ChatScaffoldView: View {
         // write failure (the marker simply stays on the prior profile), so
         // the `try?` does not silently drop the signal.
         try? profileStore.setActiveProfileID(new)
+        clearTransientOverridesForSelectedProfile()
       } catch {
         chat.profileID = previous
         // Also revert the toolbar selection so the menu label
@@ -895,8 +898,12 @@ struct ChatScaffoldView: View {
     }
     let options = ChatSendRequestOptions(
       modelID: modelID,
-      sampling: viewModel.sampling,
-      systemPromptOverride: viewModel.systemPromptOverride,
+      sampling: Self.resolvedSampling(
+        profileDefault: profileStore.sampling(forProfileID: viewModel.selectedProfileID),
+        transientOverride: viewModel.samplingOverride),
+      systemPromptOverride: Self.resolvedSystemPrompt(
+        profileDefault: profileStore.systemPrompt(forProfileID: viewModel.selectedProfileID),
+        transientOverride: viewModel.systemPromptOverride),
       // #426: thread the selected profile's Fast Think (speculative-decoding)
       // settings into the request — a Fast Think profile attaches speculation
       // + forces greedy; a normal or tree-of-thought profile carries none.
@@ -1103,6 +1110,43 @@ struct ChatScaffoldView: View {
   /// the `profileStore` lookup is expressed once rather than four times.
   private var selectedProfileDefault: String? {
     profileStore.model(forProfileID: viewModel.selectedProfileID)
+  }
+
+  private var selectedProfileSamplingDefault: ChatSampling {
+    Self.chatSampling(from: profileStore.sampling(forProfileID: viewModel.selectedProfileID))
+  }
+
+  private func clearTransientOverridesForSelectedProfile() {
+    Self.clearTransientOverridesForProfileSwitch(to: viewModel)
+  }
+
+  /// Profile switches reset per-chat toolbar overrides. Profile defaults are
+  /// not copied into cached view-model state; `sendAssistantTurn` resolves them
+  /// from `ProfileStore` at send time so Settings saves affect open chats.
+  static func clearTransientOverridesForProfileSwitch(to viewModel: ChatTranscriptViewModel) {
+    viewModel.samplingOverride = nil
+    viewModel.systemPromptOverride = nil
+  }
+
+  static func resolvedSampling(profileDefault: Sampling?,
+                               transientOverride: ChatSampling?) -> ChatSampling {
+    transientOverride ?? chatSampling(from: profileDefault)
+  }
+
+  static func chatSampling(from sampling: Sampling?) -> ChatSampling {
+    let defaults = sampling ?? Sampling()
+    return ChatSampling(
+      temperature: defaults.temperature,
+      topP: defaults.topP,
+      maxTokens: defaults.maxTokens)
+  }
+
+  static func resolvedSystemPrompt(profileDefault: String?,
+                                   transientOverride: String?) -> String? {
+    let override = transientOverride?.trimmingCharacters(in: .whitespacesAndNewlines)
+    if let override, !override.isEmpty { return override }
+    let profile = profileDefault?.trimmingCharacters(in: .whitespacesAndNewlines)
+    return (profile?.isEmpty == false) ? profile : nil
   }
 
   /// #496: whether the background-Helper transport axis OWNS the window-level

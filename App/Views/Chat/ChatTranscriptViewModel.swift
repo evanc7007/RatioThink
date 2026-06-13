@@ -2,7 +2,7 @@ import Foundation
 import SwiftUI
 
 /// Transient per-chat toolbar state — profile selection (mirrored into
-/// `Chat.profileID` by `ChatScaffoldView`), sampling knobs and
+/// `Chat.profileID` by `ChatScaffoldView`), explicit sampling override and
 /// system-prompt override. The transcript itself lives in SwiftData as of
 /// Phase 4: `TranscriptView` reads `chat.messages` directly and
 /// `ComposerView` inserts a `Message` row through `ModelContext`.
@@ -16,7 +16,7 @@ import SwiftUI
 /// behave today; persisting them onto `Chat` is a separate follow-up.
 final class ChatTranscriptViewModel: ObservableObject {
   @Published var selectedProfileID: String
-  @Published var sampling: ChatSampling
+  @Published var samplingOverride: ChatSampling?
   @Published var systemPromptOverride: String?
 
   /// Default model surface in the model pull-down until Phase 6 wires
@@ -31,11 +31,11 @@ final class ChatTranscriptViewModel: ObservableObject {
 
   init(
     selectedProfileID: String = "chat",
-    sampling: ChatSampling = ChatSampling(),
+    samplingOverride: ChatSampling? = nil,
     systemPromptOverride: String? = nil
   ) {
     self.selectedProfileID = selectedProfileID
-    self.sampling = sampling
+    self.samplingOverride = samplingOverride
     self.systemPromptOverride = systemPromptOverride
   }
 }
