@@ -175,6 +175,7 @@ async fn dispatch_chat_apc(dispatch: InferletDispatch, res: Responder) -> Finish
         // never asks for JSON-mode answer decoding (#572) — keep this
         // dispatch path unconstrained so ToT is unaffected.
         response_format: None,
+        stream_options: None,
     };
     completions::handle_parsed(request, res).await
 }
