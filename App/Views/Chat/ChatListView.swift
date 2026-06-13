@@ -1,22 +1,24 @@
 import SwiftUI
 import SwiftData
 
-/// Col 2 chat list — backed by SwiftData. Pinned chats sort to the
-/// top, then most-recently-updated. "New Chat" inserts a fresh row
-/// and selects it; per-row delete cascades to its messages via
-/// `Chat.messages`' `.cascade` rule.
+/// Searchable chat list embedded under the left Chat navigation entry. Backed
+/// by SwiftData: pinned chats sort to the top, then most-recently-updated.
+/// "New Chat" inserts a fresh row and selects it; per-row delete cascades to
+/// its messages via `Chat.messages`' `.cascade` rule.
 struct ChatListView: View {
   @Environment(\.modelContext) private var modelContext
   @EnvironmentObject private var persistenceStatus: PersistenceStatus
   /// #507: per-chat in-flight state — streaming rows show a right-aligned
   /// spinner, and deleting a chat first cancels + drops its send pipeline.
   @EnvironmentObject private var sendCoordinator: ChatSendCoordinator
-  /// Sort by `updatedAt` desc at the query layer; pinned-first
-  /// ordering happens client-side in `sortedChats` because `Bool`
-  /// doesn't conform to `Comparable` and SwiftData rejects
+  /// Sort by `updatedAt` desc at the query layer; pinned-first ordering and
+  /// title filtering happen client-side in `ChatListPresentation` because
+  /// `Bool` doesn't conform to `Comparable` and SwiftData rejects
   /// `SortDescriptor(\.pinned)` at compile time.
   @Query(sort: \Chat.updatedAt, order: .reverse) private var chats: [Chat]
   @Binding var selectedItemID: UUID?
+  @State private var searchText = ""
+  @State private var hoveredChatID: UUID?
   /// #512 manual rename: the chat being renamed (drives the alert) and
   /// the in-flight title draft. Kept as the chat's stable UUID, not the
   /// `Chat` reference, so a row deleted while the alert is up can't leave
@@ -24,19 +26,19 @@ struct ChatListView: View {
   @State private var renamingChatID: UUID?
   @State private var renameDraft: String = ""
 
-  private var sortedChats: [Chat] {
-    chats.sorted { lhs, rhs in
-      if lhs.pinned != rhs.pinned { return lhs.pinned }
-      return lhs.updatedAt > rhs.updatedAt
-    }
+  private var visibleChats: [Chat] {
+    ChatListPresentation.visibleChats(chats, searchText: searchText)
   }
 
   var body: some View {
     VStack(spacing: 0) {
       header
+      searchField
       Divider().opacity(0.6)
       if chats.isEmpty {
         emptyState
+      } else if visibleChats.isEmpty {
+        noSearchResults
       } else {
         list
       }
@@ -45,7 +47,7 @@ struct ChatListView: View {
 
   private var header: some View {
     HStack {
-      Text("Chats")
+      Text("Chat List")
         .font(.headline)
       Spacer()
       Button(action: createChat) {
@@ -59,9 +61,37 @@ struct ChatListView: View {
     .padding(.vertical, 8)
   }
 
+  private var searchField: some View {
+    HStack(spacing: 6) {
+      Image(systemName: "magnifyingglass")
+        .foregroundStyle(.secondary)
+      TextField("Search chats", text: $searchText)
+        .textFieldStyle(.plain)
+        .accessibilityIdentifier("chats.searchField")
+      if !searchText.isEmpty {
+        Button {
+          searchText = ""
+        } label: {
+          Image(systemName: "xmark.circle.fill")
+            .foregroundStyle(.secondary)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Clear chat search")
+      }
+    }
+    .padding(.horizontal, 8)
+    .padding(.vertical, 5)
+    .background(
+      RoundedRectangle(cornerRadius: 7)
+        .fill(Color(nsColor: .controlBackgroundColor))
+    )
+    .padding(.horizontal, 12)
+    .padding(.bottom, 8)
+  }
+
   private var list: some View {
     List(selection: $selectedItemID) {
-      ForEach(sortedChats) { chat in
+      ForEach(visibleChats) { chat in
         row(for: chat)
           .tag(chat.id)
           .contextMenu {
@@ -79,7 +109,7 @@ struct ChatListView: View {
           }
       }
       .onDelete { offsets in
-        let snapshot = sortedChats
+        let snapshot = visibleChats
         for index in offsets {
           delete(snapshot[index])
         }
@@ -108,12 +138,31 @@ struct ChatListView: View {
   }
 
   private func row(for chat: Chat) -> some View {
-    ChatRowLabel(title: chat.title,
-                 updatedAt: chat.updatedAt,
-                 pinned: chat.pinned,
-                 // #507: compact waiting indicator after the title while this
-                 // chat's response streams — clears on finish/fail.
-                 isStreaming: sendCoordinator.isInFlight(chat.id))
+    HStack(alignment: .firstTextBaseline, spacing: 6) {
+      ChatRowLabel(title: chat.title,
+                   updatedAt: chat.updatedAt,
+                   pinned: chat.pinned,
+                   // #507: compact waiting indicator after the title while this
+                   // chat's response streams — clears on finish/fail.
+                   isStreaming: sendCoordinator.isInFlight(chat.id))
+      Spacer(minLength: 6)
+      if hoveredChatID == chat.id {
+        Button {
+          delete(chat)
+        } label: {
+          Image(systemName: "trash")
+        }
+        .buttonStyle(.borderless)
+        .foregroundStyle(.secondary)
+        .help("Delete Chat")
+        .accessibilityLabel("Delete \(chat.title)")
+        .accessibilityIdentifier("chats.row.deleteButton")
+      }
+    }
+    .contentShape(Rectangle())
+    .onHover { hovering in
+      hoveredChatID = hovering ? chat.id : (hoveredChatID == chat.id ? nil : hoveredChatID)
+    }
   }
 
   /// Top-aligned per design §5 ("Chats section empty → grayed
@@ -131,6 +180,21 @@ struct ChatListView: View {
       }
       .buttonStyle(.borderless)
       .accessibilityIdentifier("chats.empty.newButton")
+      Spacer(minLength: 0)
+    }
+    .frame(maxWidth: .infinity, alignment: .leading)
+    .padding(.horizontal, 12)
+    .padding(.vertical, 8)
+  }
+
+  private var noSearchResults: some View {
+    VStack(alignment: .leading, spacing: 4) {
+      Text("No matching chats")
+        .font(.subheadline)
+        .foregroundStyle(.secondary)
+      Text("Try a different title search.")
+        .font(.caption)
+        .foregroundStyle(.secondary)
       Spacer(minLength: 0)
     }
     .frame(maxWidth: .infinity, alignment: .leading)
@@ -251,6 +315,7 @@ struct ChatRowLabel: View {
       VStack(alignment: .leading, spacing: 2) {
         Text(title)
           .lineLimit(1)
+          .truncationMode(.tail)
           .accessibilityIdentifier("chats.row.title")
         Text(updatedAt, format: .relative(presentation: .named))
           .font(.caption2)

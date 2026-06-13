@@ -83,7 +83,7 @@ that wrapper, not bare `xcodebuild`.
 
 | Suite | Area | Proves | Boundary / real model? | Run via |
 |---|---|---|---|---|
-| `S5_AppWindowShellGUITests` | settings/shell | 3-column shell vocabulary (Chats + API Endpoints nav, #422), ⌘, → Settings (4 tabs, no API tab) | mock | `test-gui-shell` |
+| `S5_AppWindowShellGUITests` | settings/shell | simplified Chat/API shell vocabulary (Chats + API Endpoints nav, chat search, #422), ⌘, → Settings (4 tabs, no API tab) | mock | `test-gui-shell` |
 | `S7_FirstLaunchWizardGUITests` | first-launch | wizard flow (register / approval-blocked) | mock (faked login-item) | `test-gui-first-launch` |
 | `S7_FirstLaunchWizardPackagedArtifactGUITests` | package/install | Release `.app` first-launch persists across relaunch; launched-artifact path | packaged-signed-app | `test-gui-first-launch-package` |
 | `S7_FirstLaunchWizardPackagedModelDownloadGUITests` | package/install | packaged `.app`: first-launch wizard → Settings model **download** (fixture lands file + probe) → no-model gate offers **Load** (not Download) → Load resolves the **persisted default** (no `PIE_TEST_CHAT_MODEL`) → send streams a reply that survives relaunch (#379) | packaged-app (Debug config) + #381 start→running stub + mock | `test-e2e-package` |

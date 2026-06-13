@@ -102,7 +102,9 @@ run_suite() {
   sandbox_diag_run_with_recovery "$TAG $script" uv run --project "$PYDIR" --with httpx python "$script"
 }
 
-# Baseline first (cheap control-plane smoke), then the full stress suite.
+# Parser unit first (cheap harness regression), then baseline control-plane
+# smoke, then the full stress suite.
+run_suite "Inferlets/chat-apc/e2e_handshake_test.py"
 run_suite "Inferlets/chat-apc/e2e_test.py"
 run_suite "Inferlets/chat-apc/stress_e2e_test.py"
 
