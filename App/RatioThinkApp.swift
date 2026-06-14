@@ -70,6 +70,9 @@ struct RatioThinkApp: App {
   /// observes `pending` to render the non-modal update banner.
   @StateObject private var updateAvailability = UpdateAvailabilityModel()
   @StateObject private var settingsNavigation = SettingsNavigation()
+  // Cross-tab tick so the Profiles-tab ProfileEditor recomputes its
+  // picker over-limit badges when the Models-tab guardrail dial writes (#334).
+  @StateObject private var guardrailRevision = GuardrailRevision()
 
   @MainActor
   init() {
@@ -631,6 +634,7 @@ struct RatioThinkApp: App {
         .environmentObject(modelLibrary)
         .environmentObject(persistenceStatus)
         .environmentObject(engineStatusStore)
+        .environmentObject(guardrailRevision)
     }
   }
 }
