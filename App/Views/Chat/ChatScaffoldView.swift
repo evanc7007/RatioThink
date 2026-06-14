@@ -301,6 +301,13 @@ struct ChatScaffoldView: View {
       return "Couldn't \(verb) the engine. \(problem.message)"
     }
     Log.engine.error("ChatScaffoldView: \(verb) engine failed: \(String(describing: error), privacy: .public)")
+    // #562: the bind-mode rollback failure is a curated `LocalizedError` whose
+    // message is a deliberate, user-facing security warning (the external-access
+    // preference may still be set). Surface its localized copy rather than the
+    // generic line; all other opaque errors stay generic (no raw struct dump).
+    if error is LocalAPIBindModeRollbackError {
+      return "Couldn't \(verb) the engine: \(error.localizedDescription)"
+    }
     return "Couldn't \(verb) the engine."
   }
 

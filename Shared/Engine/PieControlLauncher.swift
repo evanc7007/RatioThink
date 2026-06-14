@@ -218,6 +218,8 @@ public enum PieControlLauncher {
   }
 
   public struct LaunchSpec: Sendable {
+    public static let defaultDaemonBindHost: EngineHTTPBindMode = .loopback
+
     public var pieBinary: URL
     public var wasmURL: URL
     public var manifestURL: URL
@@ -251,6 +253,9 @@ public enum PieControlLauncher {
     /// pass `.dummy`, the resolver passes `.portable(...)` or
     /// `.metal(...)`.
     public var modelConfig: ModelConfig
+    /// Host for the OpenAI-compatible daemon listener. This is distinct from
+    /// the pie control websocket's `[server] host`, which remains loopback.
+    public var daemonBindHost: EngineHTTPBindMode
 
     /// Memory-aware per-request output-token ceiling written as
     /// `[model.scheduler].default_token_limit` (#438). `nil` omits it so
@@ -284,6 +289,7 @@ public enum PieControlLauncher {
                 handshakeTimeout: TimeInterval = 30,
                 pidSink: (@Sendable (pid_t) -> Void)? = nil,
                 profileID: String = "isolated",
+                daemonBindHost: EngineHTTPBindMode = Self.defaultDaemonBindHost,
                 modelConfig: ModelConfig,
                 defaultTokenLimit: Int? = nil,
                 maxNumKvPages: Int? = nil) throws {
@@ -304,6 +310,7 @@ public enum PieControlLauncher {
       self.handshakeTimeout = handshakeTimeout
       self.pidSink = pidSink
       self.profileID = profileID
+      self.daemonBindHost = daemonBindHost
       self.modelConfig = modelConfig
       self.defaultTokenLimit = defaultTokenLimit
       self.maxNumKvPages = maxNumKvPages
@@ -694,7 +701,11 @@ public enum PieControlLauncher {
       try await client.installProgram(wasmURL: spec.wasmURL,
                                       manifestURL: spec.manifestURL,
                                       forceOverwrite: true)
-      try await client.launchDaemon(inferlet: spec.inferletNameAtVersion, port: UInt32(httpPort))
+      try await client.launchDaemon(
+        inferlet: spec.inferletNameAtVersion,
+        port: UInt32(httpPort),
+        host: spec.daemonBindHost.daemonHost
+      )
       await client.close()
     } catch is CancellationError {
       _ = await session.residentMemoryBytes()

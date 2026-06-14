@@ -82,6 +82,7 @@ final class EngineStatusStoreTests: XCTestCase {
     // #326: capture startEngine calls + let tests inject a result.
     private(set) var startCalls = 0
     private(set) var lastStartProfileID: String?
+    private(set) var lastStartBindMode: EngineHTTPBindMode?
     // #459: capture the explicit per-start model override threaded through.
     private(set) var lastStartModelOverride: String?
     private var startResult: Result<Void, Error> = .success(())
@@ -93,6 +94,16 @@ final class EngineStatusStoreTests: XCTestCase {
         startCalls += 1
         lastStartProfileID = profileID
         lastStartModelOverride = modelOverride
+        return startResult
+      }
+      try result.get()
+    }
+
+    func startEngine(profileID: String, daemonBindHost: EngineHTTPBindMode) async throws {
+      let result: Result<Void, Error> = lock.withLock {
+        startCalls += 1
+        lastStartProfileID = profileID
+        lastStartBindMode = daemonBindHost
         return startResult
       }
       try result.get()
@@ -141,6 +152,14 @@ final class EngineStatusStoreTests: XCTestCase {
     }
   }
 
+  private final class MutableBindMode: @unchecked Sendable {
+    var value: EngineHTTPBindMode
+
+    init(_ value: EngineHTTPBindMode) {
+      self.value = value
+    }
+  }
+
   // MARK: - startEngine (#326 fresh-install recovery)
 
   func test_startEngine_forwards_profileID_to_client() async throws {
@@ -150,6 +169,7 @@ final class EngineStatusStoreTests: XCTestCase {
     XCTAssertEqual(client.startCalls, 1,
                    "startEngine must forward to the helper XPC client")
     XCTAssertEqual(client.lastStartProfileID, "chat")
+    XCTAssertEqual(client.lastStartBindMode, .loopback)
     XCTAssertNil(client.lastStartModelOverride,
                  "no override given → nil so the helper boots the profile default")
   }
@@ -165,6 +185,142 @@ final class EngineStatusStoreTests: XCTestCase {
     XCTAssertEqual(client.lastStartProfileID, "tree-of-thought")
     XCTAssertEqual(client.lastStartModelOverride, "Org/New-GGUF/new.gguf",
                    "the explicit pick must be threaded through to the helper start call")
+  }
+
+  func test_startEngine_without_explicit_bind_uses_shared_bind_mode_provider() async throws {
+    let client = StubXPCClient()
+    let store = EngineStatusStore(
+      client: client,
+      daemonBindModeProvider: { .external }
+    )
+
+    try await store.startEngine(profileID: "chat")
+
+    XCTAssertEqual(client.startCalls, 1)
+    XCTAssertEqual(client.lastStartProfileID, "chat")
+    XCTAssertEqual(client.lastStartBindMode, .external,
+                   "every production caller of startEngine(profileID:) must inherit the shared Local API bind preference")
+    XCTAssertEqual(store.runtimeDaemonBindMode, .external)
+  }
+
+  func test_startEngine_explicit_external_bind_is_required_and_recorded() async throws {
+    let client = StubXPCClient()
+    let store = EngineStatusStore(client: client)
+
+    try await store.startEngine(profileID: "chat", daemonBindHost: .external)
+
+    XCTAssertEqual(client.lastStartBindMode, .external)
+    XCTAssertEqual(store.runtimeDaemonBindMode, .external)
+  }
+
+  /// A running snapshot WITHOUT `daemonBindHost` (older helper) must not be
+  /// read as confirmed loopback: with the current preference external, the
+  /// fail-safe keeps reporting external so the 0.0.0.0 exposure warning stays.
+  private func legacyRunningStatus(port: EnginePort, profileID: String = "chat") throws -> EngineStatus {
+    let json = #"{"kind":"running","snapshot":{"generation":0,"port":\#(port),"profileID":"\#(profileID)","servedModelID":"","maxOutputTokens":4096}}"#
+    return try XPCPayload.decode(EngineStatus.self, from: Data(json.utf8))
+  }
+
+  func test_legacy_running_status_with_external_preference_does_not_hide_exposure() throws {
+    let legacyStatus = try legacyRunningStatus(port: 8123)
+    let client = StubXPCClient()
+    let store = EngineStatusStore(
+      client: client,
+      initialDaemonBindMode: .external,
+      daemonBindModeProvider: { .external }
+    )
+
+    store._applyPollForTesting(next: legacyStatus, error: nil)
+
+    if case .running(let snap) = store.status { XCTAssertEqual(snap.port, 8123) }
+    else { XCTFail("expected running, got \(store.status)") }
+    XCTAssertEqual(store.runtimeDaemonBindMode, .external)
+    XCTAssertEqual(store.localAPIBaseURL?.absoluteString, "http://0.0.0.0:8123")
+  }
+
+  func test_legacy_running_after_stop_prefers_current_external_preference_over_stale_confirmed_loopback() throws {
+    let legacyStatus = try legacyRunningStatus(port: 8124)
+    let desiredBindMode = MutableBindMode(.loopback)
+    let client = StubXPCClient()
+    let store = EngineStatusStore(
+      client: client,
+      initialDaemonBindMode: .loopback,
+      daemonBindModeProvider: { desiredBindMode.value }
+    )
+
+    store._applyPollForTesting(
+      next: .running(EngineSessionSnapshot(port: 8123, profileID: "chat", daemonBindHost: .loopback)),
+      error: nil
+    )
+    XCTAssertEqual(store.runtimeDaemonBindMode, .loopback)
+
+    store._applyPollForTesting(next: .stopped, error: nil)
+    desiredBindMode.value = .external
+    store._applyPollForTesting(next: legacyStatus, error: nil)
+
+    if case .running(let snap) = store.status { XCTAssertEqual(snap.port, 8124) }
+    else { XCTFail("expected running, got \(store.status)") }
+    XCTAssertEqual(store.runtimeDaemonBindMode, .external)
+    XCTAssertEqual(store.localAPIBaseURL?.absoluteString, "http://0.0.0.0:8124")
+  }
+
+  func test_engineGone_clears_confirmed_bind_mode_so_legacy_relaunch_over_reports_exposure() throws {
+    // Symmetry to the v10 success-path clear: a confirmed posture must not
+    // outlive its running generation. Sustained transport loss synthesizes
+    // `.engineGone` (the generation ended) — if the confirmed flag survives,
+    // a later legacy running payload (no daemonBindHost) reuses the stale
+    // confirmed `.loopback` and hides the 0.0.0.0 exposure warning for an
+    // externally bound, unauthenticated endpoint.
+    let legacyStatus = try legacyRunningStatus(port: 8125)
+    let client = StubXPCClient()
+    let store = EngineStatusStore(
+      client: client,
+      initialDaemonBindMode: .loopback,
+      daemonBindModeProvider: { .loopback },
+      tierPolicy: StatusTierPolicy(tier1Polls: 2, tier2Polls: 3)
+    )
+
+    store._applyPollForTesting(
+      next: .running(EngineSessionSnapshot(port: 8123, profileID: "chat", daemonBindHost: .loopback)),
+      error: nil
+    )
+    XCTAssertEqual(store.runtimeDaemonBindMode, .loopback)
+
+    for _ in 0..<3 {
+      store._applyPollForTesting(next: nil, error: "NSXPCConnectionInvalid")
+    }
+    guard case .failed(.engineGone, _) = store.status else {
+      return XCTFail("sustained transport loss must escalate to .engineGone; got \(store.status)")
+    }
+
+    // Legacy relaunch without daemonBindHost while desired stays loopback:
+    // with the confirmed flag cleared, fail-safe over-reports as external.
+    store._applyPollForTesting(next: legacyStatus, error: nil)
+
+    if case .running(let snap) = store.status { XCTAssertEqual(snap.port, 8125) }
+    else { XCTFail("expected running, got \(store.status)") }
+    XCTAssertEqual(store.runtimeDaemonBindMode, .external,
+                   "engineGone must clear confirmed bind mode so a legacy relaunch cannot claim stale loopback safety")
+    XCTAssertEqual(store.localAPIBaseURL?.absoluteString, "http://0.0.0.0:8125")
+  }
+
+  func test_running_status_poll_updates_runtime_daemon_bind_mode_from_helper() {
+    let client = StubXPCClient()
+    let store = EngineStatusStore(client: client, initialDaemonBindMode: .loopback)
+
+    store._applyPollForTesting(
+      next: .running(EngineSessionSnapshot(port: 8123, profileID: "chat", daemonBindHost: .external)),
+      error: nil
+    )
+
+    if case .running(let snap) = store.status {
+      XCTAssertEqual(snap.port, 8123)
+      XCTAssertEqual(snap.daemonBindHost, .external)
+    } else {
+      XCTFail("expected running, got \(store.status)")
+    }
+    XCTAssertEqual(store.runtimeDaemonBindMode, .external)
+    XCTAssertEqual(store.localAPIBaseURL?.absoluteString, "http://0.0.0.0:8123")
   }
 
   func test_startEngine_propagates_real_failure() async {

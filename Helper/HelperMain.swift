@@ -794,6 +794,7 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
         ("model", snapshot.servedModelID),
         ("maxOutputTokens", String(snapshot.maxOutputTokens)),
         ("generation", String(snapshot.generation)),
+        ("daemonBindHost", snapshot.daemonBindHost?.rawValue ?? "unknown"),
       ])
     case let .failed(code, _):
       Diag.helper.event("engine.fail", [("code", code.rawValue)])
@@ -981,7 +982,14 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
       // fraction per resolve so a dial change takes effect on the next
       // launch with no Helper restart; it's the same derivation the
       // ProfileEditor picker badge uses, so the gate and the badge agree.
-      memoryPolicy: { ModelMemoryGuardrail.livePolicy() }
+      memoryPolicy: { ModelMemoryGuardrail.livePolicy() },
+      // Local API exposure is security-sensitive and must cross the
+      // App↔Helper process boundary. Read the file-backed shared preference
+      // from the real PieDirs root rather than this helper process's
+      // UserDefaults domain.
+      daemonBindMode: {
+        EngineHTTPBindMode.persistedLocalAPIBindMode()
+      }
     )
     let closure = resolver.asClosure
     self.launchSpecResolver = closure

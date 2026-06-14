@@ -67,6 +67,30 @@ final class XPCProtocolTests: XCTestCase {
     }
   }
 
+  func test_engineStatus_roundtrip_running_carries_external_bind_mode() throws {
+    let original = EngineStatus.running(EngineSessionSnapshot(
+      port: 51234, profileID: "chat", daemonBindHost: .external))
+    let data = try XPCPayload.encode(original)
+    let decoded = try XPCPayload.decode(EngineStatus.self, from: data)
+    XCTAssertEqual(decoded, original)
+    if case .running(let snap) = decoded {
+      XCTAssertEqual(snap.daemonBindHost, .external)
+    } else {
+      XCTFail("expected .running, got \(decoded)")
+    }
+  }
+
+  func test_engineStatus_legacy_running_payload_preserves_missing_daemon_bind_mode() throws {
+    let data = Data(#"{"kind":"running","snapshot":{"generation":0,"maxOutputTokens":4096,"port":51234,"profileID":"chat","servedModelID":""}}"#.utf8)
+    let decoded = try XPCPayload.decode(EngineStatus.self, from: data)
+    if case .running(let snap) = decoded {
+      XCTAssertNil(snap.daemonBindHost,
+                   "a snapshot without daemonBindHost decodes to nil (unknown), not a claimed loopback")
+    } else {
+      XCTFail("expected .running, got \(decoded)")
+    }
+  }
+
   func test_engineStatus_running_port_zero_is_rejected() throws {
     // Hand-craft the wire bytes so the decoder is what's under test.
     // `EnginePort = UInt16` makes negative/oversized values

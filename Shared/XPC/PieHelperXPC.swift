@@ -117,6 +117,13 @@ public protocol PieHelperXPC {
                    modelOverride: String?,
                    reply: @escaping (_ successData: Data?, _ errorData: Data?) -> Void)
 
+  /// Bind-host-aware start used by the Local API settings surface. `daemonBindHost`
+  /// is the OpenAI-compatible daemon host (`127.0.0.1` or `0.0.0.0`), not the
+  /// pie control websocket host.
+  func startEngine(profileID: String,
+                   daemonBindHost: String,
+                   reply: @escaping (_ successData: Data?, _ errorData: Data?) -> Void)
+
   /// Strict active-profile rebuild. Same reply tuple as `startEngine`,
   /// but the helper owns real engine state: it waits for any live
   /// engine to reach helper-confirmed terminal stop before starting

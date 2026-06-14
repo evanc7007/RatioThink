@@ -940,7 +940,12 @@ final class StartEngineXPCIntegrationTests: IsolatedTestCase {
       inferletsDir: { self.tempDir.appendingPathComponent("inferlets") },
       pieControlResources: { resources },
       pieHome: { self.tempDir },
-      subprocessEnvironment: { [:] }
+      subprocessEnvironment: { [:] },
+      // Pin the daemon bind mode: the default reads the machine-global
+      // `persistedLocalAPIBindMode()` file, which other tests in the same
+      // process mutate. The snapshot now carries `daemonBindHost`, so an
+      // unpinned read would make route-convergence assertions flaky.
+      daemonBindMode: { .loopback }
     )
   }
 

@@ -44,16 +44,25 @@ public struct EngineSessionSnapshot: Codable, Equatable, Sendable {
   /// before the first send, with no `/v1/models` round-trip race.
   public let maxOutputTokens: Int
 
+  /// Effective Local API daemon bind mode for this session — `loopback`
+  /// (`127.0.0.1`) or `external` (`0.0.0.0`). A `nil` means the field was
+  /// absent from an older helper payload, NOT confirmed loopback: the App's
+  /// exposure-warning path fails safe (over-reports external) on an
+  /// unconfirmed bind so it never claims loopback-only safety it can't prove.
+  public let daemonBindHost: EngineHTTPBindMode?
+
   public init(generation: UInt64,
               port: EnginePort,
               profileID: String,
               servedModelID: String,
-              maxOutputTokens: Int) {
+              maxOutputTokens: Int,
+              daemonBindHost: EngineHTTPBindMode? = nil) {
     self.generation = generation
     self.port = port
     self.profileID = profileID
     self.servedModelID = servedModelID
     self.maxOutputTokens = maxOutputTokens
+    self.daemonBindHost = daemonBindHost
   }
 
   /// Minimal-snapshot convenience for the few non-production construction
@@ -67,12 +76,14 @@ public struct EngineSessionSnapshot: Codable, Equatable, Sendable {
               profileID: String,
               generation: UInt64 = 0,
               servedModelID: String = "",
-              maxOutputTokens: Int = KVCacheBudget.defaultPoolCapacityTokens) {
+              maxOutputTokens: Int = KVCacheBudget.defaultPoolCapacityTokens,
+              daemonBindHost: EngineHTTPBindMode? = nil) {
     self.init(generation: generation,
               port: port,
               profileID: profileID,
               servedModelID: servedModelID,
-              maxOutputTokens: maxOutputTokens)
+              maxOutputTokens: maxOutputTokens,
+              daemonBindHost: daemonBindHost)
   }
 
   /// Whether `self` and `other` describe the SAME engine incarnation — same

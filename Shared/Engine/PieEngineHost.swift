@@ -145,7 +145,11 @@ public final class PieEngineHost: @unchecked Sendable {
       servedModelID: spec.modelConfig.servedModelID,
       maxOutputTokens: KVCacheBudget.effectiveOutputCeiling(
         defaultTokenLimit: spec.defaultTokenLimit,
-        maxNumKvPages: spec.maxNumKvPages))
+        maxNumKvPages: spec.maxNumKvPages),
+      // #562: carry the launched listener mode so the App's exposure-warning
+      // path reads a confirmed bind host off the running snapshot instead of
+      // inferring it from preferences.
+      daemonBindHost: spec.daemonBindHost)
   }
 
   // MARK: - Launcher seam

@@ -166,6 +166,7 @@ final class PieEngineHostTests: XCTestCase {
   }
 
   private func makeSpec(profileID: String = "chat",
+                        daemonBindHost: EngineHTTPBindMode = .loopback,
                         handshakeTimeout: TimeInterval = 30) -> PieControlLauncher.LaunchSpec {
     let tmp = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
     return try! PieControlLauncher.LaunchSpec(
@@ -177,6 +178,7 @@ final class PieEngineHostTests: XCTestCase {
       shmemName: "/pie_test_\(UUID().uuidString.prefix(8))",
       handshakeTimeout: handshakeTimeout,
       profileID: profileID,
+      daemonBindHost: daemonBindHost,
       modelConfig: .dummy
     )
   }
@@ -200,6 +202,29 @@ final class PieEngineHostTests: XCTestCase {
     if case .failure = result {
       XCTFail("start must succeed on a fresh host")
     }
+    wait(for: [exp], timeout: 2)
+    token.cancel()
+  }
+
+  func test_start_publishes_launch_spec_daemon_bind_mode_in_running_status() {
+    let host = PieEngineHost(launcher: { _ in
+      return (port: EnginePort(42425), session: FakeSession())
+    })
+    let exp = expectation(description: "host reaches external .running")
+    let token = host.observe { status, _ in
+      if case .running(let snap) = status {
+        XCTAssertEqual(snap.port, 42425)
+        XCTAssertEqual(snap.profileID, "chat")
+        XCTAssertEqual(snap.daemonBindHost, .external)
+        exp.fulfill()
+      }
+    }
+
+    let result = host.start(makeSpec(profileID: "chat", daemonBindHost: .external))
+    if case .failure(let err) = result {
+      XCTFail("start must succeed on a fresh host: \(err)")
+    }
+
     wait(for: [exp], timeout: 2)
     token.cancel()
   }

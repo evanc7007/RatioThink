@@ -49,6 +49,11 @@ public protocol AppXPCClient: Sendable {
   /// pick (#459 repro 1); `nil` boots the profile default. Callers with no
   /// override use the `startEngine(profileID:)` convenience below.
   func startEngine(profileID: String, modelOverride: String?) async throws
+  /// Start the engine with an explicit Local API daemon bind mode (the
+  /// settings external-access toggle). Boots the profile default model; the
+  /// bind host (`127.0.0.1`/`0.0.0.0`) decides whether the OpenAI-compatible
+  /// daemon is reachable off-box.
+  func startEngine(profileID: String, daemonBindHost: EngineHTTPBindMode) async throws
   /// Strict restart for active-profile default-model changes. Unlike
   /// `startEngine(profileID:)`, `.alreadyRunning` is a failure signal:
   /// the helper did not complete a stop→start registry rebuild.
@@ -81,6 +86,14 @@ public extension AppXPCClient {
   /// `restartEngine` gained the `modelOverride` parameter (#469).
   func restartEngine(profileID: String) async throws {
     try await restartEngine(profileID: profileID, modelOverride: nil)
+  }
+
+  /// Default: a conformer that does not model the Local API bind host treats a
+  /// bind-mode start as a plain (profile-default) start. The production
+  /// `HelperXPCClient` overrides this to push the explicit bind host over the
+  /// wire; bind-asserting test stubs override it to record the requested mode.
+  func startEngine(profileID: String, daemonBindHost: EngineHTTPBindMode) async throws {
+    try await startEngine(profileID: profileID, modelOverride: nil)
   }
 
   /// Default: memory unavailable. Test stubs that don't model the
@@ -132,11 +145,18 @@ public enum HelperProtocolCompatibility {
   /// helper would not implement `kvUsageWithReply:` and the call would time
   /// out instead of returning a diagnostic result.
   ///
+  /// Version 7: helper exports `startEngine(profileID:daemonBindHost:reply:)`
+  /// (#562) — the Local API external-access toggle pushes an explicit bind
+  /// host so the engine relaunches on the requested listener mode. A stale v6
+  /// helper does not implement `startEngineWithProfileID:daemonBindHost:reply:`
+  /// so the toggle start would time out; the `>= currentVersion` repair gate
+  /// reregisters it before the Local API path runs.
+  ///
   /// BUMP THIS whenever a new REQUIRED selector is added to `PieHelperXPC`,
   /// or an in-place upgrade leaves a running old helper that passes the
   /// reachability gate yet cannot service the new call (incl. a reply/status
   /// BYTE-format change like #476).
-  public static let currentVersion = 6
+  public static let currentVersion = 7
 
   public static func isCompatible(client: any AppXPCClient) async -> Bool {
     do {
@@ -563,6 +583,18 @@ public final class HelperXPCClient: AppXPCClient, @unchecked Sendable {
     }
   }
 
+  public func startEngine(profileID: String, daemonBindHost: EngineHTTPBindMode) async throws {
+    let connection = ensureConnection()
+    do {
+      try await startEngine(profileID: profileID, daemonBindHost: daemonBindHost, on: connection)
+    } catch let error as AppXPCClientError {
+      if case .replyTimeout = error {
+        invalidateIfCurrent(connection)
+      }
+      throw error
+    }
+  }
+
   private func startEngine(profileID: String,
                            modelOverride: String?,
                            on connection: NSXPCConnection) async throws {
@@ -607,6 +639,59 @@ public final class HelperXPCClient: AppXPCClient, @unchecked Sendable {
         // caller relies on the engine-status poll for the live `.running`
         // signal; the wrapper only needs to surface a refusal. A
         // wire-contract violation decodes to EngineError(.wireContractViolation).
+        do {
+          switch try PieHelperXPCWire.decodeStartEngineReply(
+            successData: successData, errorData: errorData
+          ) {
+          case .success:
+            resumeOnce(.success(()))
+          case .failure(let engineError):
+            resumeOnce(.failure(engineError))
+          }
+        } catch {
+          resumeOnce(.failure(error))
+        }
+      }
+    }
+  }
+
+  private func startEngine(profileID: String,
+                           daemonBindHost: EngineHTTPBindMode,
+                           on connection: NSXPCConnection) async throws {
+    // A bind-mode start is also a full cold engine launch, so it rides the
+    // same start-sized budget as the modelOverride path (#461) rather than the
+    // 2 s generic `replyTimeout`.
+    let timeout = startReplyTimeout
+    try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+      let resumed = OSAllocatedUnfairLock<Bool>(initialState: false)
+      func resumeOnce(_ result: Result<Void, Error>) {
+        let shouldResume = resumed.withLock { fired -> Bool in
+          if fired { return false }
+          fired = true
+          return true
+        }
+        guard shouldResume else { return }
+        switch result {
+        case .success: continuation.resume(returning: ())
+        case .failure(let e): continuation.resume(throwing: e)
+        }
+      }
+      if timeout > 0 {
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeout) {
+          resumeOnce(.failure(AppXPCClientError.replyTimeout(
+            selector: "startEngine",
+            timeout: timeout
+          )))
+        }
+      }
+      let proxy = connection.remoteObjectProxyWithErrorHandler { err in
+        resumeOnce(.failure(AppXPCClientError.proxyError(err as NSError)))
+      }
+      guard let api = proxy as? PieHelperXPC else {
+        resumeOnce(.failure(AppXPCClientError.proxyTypeMismatch))
+        return
+      }
+      api.startEngine(profileID: profileID, daemonBindHost: daemonBindHost.daemonHost) { successData, errorData in
         do {
           switch try PieHelperXPCWire.decodeStartEngineReply(
             successData: successData, errorData: errorData

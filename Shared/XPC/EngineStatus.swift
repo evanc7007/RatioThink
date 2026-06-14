@@ -15,10 +15,12 @@ public typealias EnginePort = UInt16
 /// Engine lifecycle state observed by `PieSupervisor`. Single source of
 /// truth for menu-bar dot color and chat startup gating. The `running`
 /// case carries the full `EngineSessionSnapshot` (#476) — port, active
-/// profile id, served model id, effective `max_tokens` ceiling, and the
-/// launch generation — so the App reads the whole session off ONE channel
-/// instead of reconciling served-model + request limits through `/v1/models`
-/// and transient view state.
+/// profile id, served model id, effective `max_tokens` ceiling, the launch
+/// generation, and the effective Local API daemon bind mode — so the App
+/// reads the whole session off ONE channel instead of reconciling
+/// served-model + request limits through `/v1/models` and transient view
+/// state. A nil `daemonBindHost` inside the snapshot means an older helper
+/// payload, not confirmed loopback.
 ///
 /// `failed` carries a discriminator (`EngineErrorCode`) plus a bounded
 /// message so the GUI can route on the code rather than substring-match

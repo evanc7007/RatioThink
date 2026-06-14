@@ -26,6 +26,10 @@ final class LocalAPIStateTests: XCTestCase {
     XCTAssertNil(s.port)
     XCTAssertTrue(s.toggleOn, "show 'on' while coming up so the control doesn't flicker")
     XCTAssertFalse(s.toggleEnabled, "no flipping mid-transition")
+    XCTAssertFalse(s.externalAccessToggleEnabled,
+                   "security posture changes must not persist while an external-bound daemon may still be starting")
+    XCTAssertFalse(s.profileSelectionEnabled,
+                   "profile picker must be disabled during in-flight restarts so a selection is not silently lost")
     XCTAssertEqual(s.statusLabel, "Starting…")
   }
 
@@ -33,6 +37,10 @@ final class LocalAPIStateTests: XCTestCase {
     let s = LocalAPIState.make(status: .stopping, hasActiveProfile: true)
     XCTAssertFalse(s.toggleOn)
     XCTAssertFalse(s.toggleEnabled)
+    XCTAssertFalse(s.externalAccessToggleEnabled,
+                   "security posture changes must not persist while an exposed daemon may still be stopping")
+    XCTAssertFalse(s.profileSelectionEnabled,
+                   "profile picker must be disabled during in-flight restarts so a selection is not silently lost")
     XCTAssertEqual(s.statusLabel, "Stopping…")
   }
 
@@ -41,8 +49,17 @@ final class LocalAPIStateTests: XCTestCase {
     XCTAssertFalse(s.isServing)
     XCTAssertFalse(s.toggleOn)
     XCTAssertTrue(s.toggleEnabled, "a selected model means we can start the engine")
+    XCTAssertTrue(s.externalAccessToggleEnabled)
+    XCTAssertTrue(s.profileSelectionEnabled)
     XCTAssertEqual(s.statusLabel, "Off")
     XCTAssertEqual(s.detail, "Turn on to start the engine and serve requests on 127.0.0.1.")
+  }
+
+  func test_bind_modes_carry_explicit_daemon_hosts() {
+    XCTAssertEqual(EngineHTTPBindMode.loopback.daemonHost, "127.0.0.1")
+    XCTAssertEqual(EngineHTTPBindMode.external.daemonHost, "0.0.0.0")
+    XCTAssertEqual(EngineHTTPBindMode.loopback.baseURLHost, "127.0.0.1")
+    XCTAssertEqual(EngineHTTPBindMode.external.baseURLHost, "0.0.0.0")
   }
 
   func test_stopped_without_profile_is_disabled_with_guidance() {
@@ -161,19 +178,283 @@ final class LocalAPIStateTests: XCTestCase {
 
   // MARK: - posture drift guard (binds UI claims to the real launch config)
 
-  func test_posture_matches_real_engine_launch_config() {
-    // The view's read-only "Security" rows claim loopback-only + no-auth.
-    // Those claims are only honest if the app actually launches the engine
-    // that way. Pin them to `renderConfigBody`'s preamble so a future TOML
-    // change can't silently make the UI lie.
+  func test_loopback_posture_matches_default_daemon_launch_contract() {
+    // The view's default "Security" rows claim loopback-only + no-auth.
+    // Those claims are only honest if the app actually launches the daemon
+    // that way. Pin them to the typed launch default and the config preamble
+    // so a future drift can't silently make the UI lie.
     let body = PieControlLauncher.renderConfigBody(modelConfig: .dummy)
+    let posture = EngineHTTPPosture.make(bindMode: .loopback)
 
-    XCTAssertEqual(EngineHTTPPosture.loopbackOnly, true)
+    XCTAssertEqual(posture.loopbackOnly, true)
+    XCTAssertEqual(PieControlLauncher.LaunchSpec.defaultDaemonBindHost, .loopback)
     XCTAssertTrue(body.contains("host = \"127.0.0.1\""),
-                  "EngineHTTPPosture.loopbackOnly claims 127.0.0.1 — config must bind there")
+                  "pie control websocket remains loopback-only; the OpenAI daemon host is configured separately")
 
-    XCTAssertEqual(EngineHTTPPosture.authenticated, false)
+    XCTAssertEqual(posture.authenticated, false)
     XCTAssertTrue(body.contains("[auth]\nenabled = false"),
                   "EngineHTTPPosture.authenticated=false claims no auth — config must disable it")
+  }
+
+  func test_external_posture_warns_about_lan_exposure() {
+    let posture = EngineHTTPPosture.make(bindMode: .external)
+
+    XCTAssertFalse(posture.loopbackOnly)
+    XCTAssertEqual(posture.networkSummary, "External access enabled (0.0.0.0). Other devices on reachable networks can connect to this Mac’s local API port.")
+    XCTAssertEqual(posture.warningTitle, "Network exposure risk")
+    XCTAssertEqual(posture.warningDetail?.contains("unauthenticated"), true)
+  }
+
+  func test_bind_mode_change_does_not_clear_external_preference_when_stop_fails() async {
+    var preferenceEnabled = true
+    var stopCalls = 0
+    var startCalls = 0
+
+    do {
+      try await LocalAPIBindModeChange.apply(
+        enabled: false,
+        phase: .serving(port: 8123),
+        profileID: "chat",
+        setPreference: { preferenceEnabled = $0 },
+        stopEngine: {
+          stopCalls += 1
+          throw EngineError(code: .killRejected, message: "still running")
+        },
+        startEngine: { _ in startCalls += 1 }
+      )
+      XCTFail("disabling external access must throw when the exposed daemon could not be stopped")
+    } catch let error as EngineError {
+      XCTAssertEqual(error.code, .killRejected)
+    } catch {
+      XCTFail("unexpected error: \(error)")
+    }
+
+    XCTAssertTrue(preferenceEnabled,
+                  "preference/warning must stay external while a 0.0.0.0 daemon may still be running")
+    XCTAssertEqual(stopCalls, 1)
+    XCTAssertEqual(startCalls, 0)
+  }
+
+  func test_bind_mode_change_commits_preference_after_successful_restart() async throws {
+    var preferenceEnabled = false
+    var requestedStarts: [EngineHTTPBindMode] = []
+
+    try await LocalAPIBindModeChange.apply(
+      enabled: true,
+      phase: .serving(port: 8123),
+      profileID: "chat",
+      setPreference: { preferenceEnabled = $0 },
+      stopEngine: {},
+      startEngine: { requestedStarts.append($0) }
+    )
+
+    XCTAssertTrue(preferenceEnabled)
+    XCTAssertEqual(requestedStarts, [.external])
+  }
+
+  func test_bind_mode_change_enable_write_failure_does_not_launch_external_daemon() async {
+    struct StubError: Error {}
+    var stopCalls = 0
+    var preferenceWrites: [Bool] = []
+    var requestedStarts: [EngineHTTPBindMode] = []
+
+    do {
+      try await LocalAPIBindModeChange.apply(
+        enabled: true,
+        phase: .serving(port: 8123),
+        profileID: "chat",
+        setPreference: {
+          preferenceWrites.append($0)
+          throw StubError()
+        },
+        stopEngine: { stopCalls += 1 },
+        startEngine: { requestedStarts.append($0) }
+      )
+      XCTFail("enabling external access must throw when the helper-visible preference cannot be persisted")
+    } catch is StubError {
+      // expected
+    } catch {
+      XCTFail("unexpected error: \(error)")
+    }
+
+    XCTAssertEqual(stopCalls, 1)
+    XCTAssertEqual(preferenceWrites, [true])
+    XCTAssertTrue(requestedStarts.isEmpty,
+                  "never launch an external listener while the helper-visible preference still says loopback")
+  }
+
+  func test_bind_mode_change_enable_start_failure_rolls_back_preference() async {
+    struct StubError: Error {}
+    var preferenceEnabled = false
+    var preferenceWrites: [Bool] = []
+    var requestedStarts: [EngineHTTPBindMode] = []
+
+    do {
+      try await LocalAPIBindModeChange.apply(
+        enabled: true,
+        phase: .serving(port: 8123),
+        profileID: "chat",
+        setPreference: {
+          preferenceEnabled = $0
+          preferenceWrites.append($0)
+        },
+        stopEngine: {},
+        startEngine: {
+          requestedStarts.append($0)
+          throw StubError()
+        }
+      )
+      XCTFail("start failure after enabling external access must surface")
+    } catch is StubError {
+      // expected
+    } catch {
+      XCTFail("unexpected error: \(error)")
+    }
+
+    XCTAssertFalse(preferenceEnabled,
+                   "rollback restores loopback preference when the external daemon did not start")
+    XCTAssertEqual(preferenceWrites, [true, false])
+    XCTAssertEqual(requestedStarts, [.external])
+  }
+
+  func test_bind_mode_change_enable_start_failure_surfaces_rollback_failure() async {
+    struct StartError: Error {}
+    struct RollbackError: Error {}
+    var preferenceWrites: [Bool] = []
+    var requestedStarts: [EngineHTTPBindMode] = []
+
+    do {
+      try await LocalAPIBindModeChange.apply(
+        enabled: true,
+        phase: .serving(port: 8123),
+        profileID: "chat",
+        setPreference: {
+          preferenceWrites.append($0)
+          if $0 == false { throw RollbackError() }
+        },
+        stopEngine: {},
+        startEngine: {
+          requestedStarts.append($0)
+          throw StartError()
+        }
+      )
+      XCTFail("rollback write failure must be surfaced when external start fails")
+    } catch let error as LocalAPIBindModeRollbackError {
+      XCTAssertTrue(error.startError is StartError)
+      XCTAssertTrue(error.rollbackError is RollbackError)
+      XCTAssertEqual(error.errorDescription?.contains("could not be restored"), true)
+    } catch {
+      XCTFail("expected rollback composite error, got: \(error)")
+    }
+
+    XCTAssertEqual(preferenceWrites, [true, false])
+    XCTAssertEqual(requestedStarts, [.external])
+  }
+
+  func test_bind_mode_change_propagates_preference_write_failure() async {
+    struct StubError: Error {}
+    let preferenceEnabled = true
+    var requestedStarts: [EngineHTTPBindMode] = []
+
+    do {
+      try await LocalAPIBindModeChange.apply(
+        enabled: false,
+        phase: .serving(port: 8123),
+        profileID: "chat",
+        setPreference: { _ in throw StubError() },
+        stopEngine: {},
+        startEngine: { requestedStarts.append($0) }
+      )
+      XCTFail("shared preference write failure must surface to the UI")
+    } catch is StubError {
+      // expected
+    } catch {
+      XCTFail("unexpected error: \(error)")
+    }
+
+    XCTAssertTrue(preferenceEnabled,
+                  "preference state must stay external when the helper-visible write fails")
+    XCTAssertEqual(requestedStarts, [.loopback])
+  }
+
+  func test_bind_mode_change_does_not_mutate_preference_while_starting() async throws {
+    var preferenceEnabled = true
+    var stopCalls = 0
+    var startCalls: [EngineHTTPBindMode] = []
+
+    try await LocalAPIBindModeChange.apply(
+      enabled: false,
+      phase: .starting,
+      profileID: "chat",
+      setPreference: { preferenceEnabled = $0 },
+      stopEngine: { stopCalls += 1 },
+      startEngine: { startCalls.append($0) }
+    )
+
+    XCTAssertTrue(preferenceEnabled,
+                  "do not persist loopback posture while an external-bound daemon may still come up")
+    XCTAssertEqual(stopCalls, 0)
+    XCTAssertTrue(startCalls.isEmpty)
+  }
+
+  func test_profile_switch_gate_rejects_second_selection_while_restart_in_flight() {
+    let state = LocalAPIState.make(status: .running(EngineSessionSnapshot(port: 8123, profileID: "chat")),
+                                   hasActiveProfile: true)
+    var restartInFlight = false
+
+    XCTAssertTrue(LocalAPIProfileSwitchGate.acceptSelection(
+      selectedProfileID: "beta",
+      runtimeProfileID: "chat",
+      state: state,
+      restartInFlight: &restartInFlight
+    ))
+    XCTAssertTrue(restartInFlight,
+                  "the first profile switch must synchronously mark a restart in flight before spawning async stop/start")
+
+    XCTAssertFalse(LocalAPIProfileSwitchGate.acceptSelection(
+      selectedProfileID: "gamma",
+      runtimeProfileID: "chat",
+      state: state,
+      restartInFlight: &restartInFlight
+    ))
+    XCTAssertTrue(restartInFlight)
+  }
+
+  func test_profile_options_ignore_invalid_entries_and_mark_runtime_profile() throws {
+    let chat = try Profile.parse(toml: """
+    id = "chat"
+    name = "Chat"
+    model = "Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf"
+    inferlet = "chat-apc"
+    """)
+    let fast = try Profile.parse(toml: """
+    id = "fast-think"
+    name = "Fast Think"
+    model = "Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf"
+    inferlet = "chat-apc"
+    """)
+
+    let options = LocalAPIProfileOption.make(
+      entries: [
+        ProfileLoadResult(url: URL(fileURLWithPath: "/profiles/bad.toml"),
+                          profile: nil,
+                          error: .missingField("id"),
+                          warnings: []),
+        ProfileLoadResult(url: URL(fileURLWithPath: "/profiles/chat.toml"),
+                          profile: chat,
+                          error: nil,
+                          warnings: []),
+        ProfileLoadResult(url: URL(fileURLWithPath: "/profiles/fast-think.toml"),
+                          profile: fast,
+                          error: nil,
+                          warnings: []),
+      ],
+      runtimeProfileID: "fast-think"
+    )
+
+    XCTAssertEqual(options.map(\.id), ["chat", "fast-think"])
+    XCTAssertEqual(options.map(\.title), ["Chat", "Fast Think"])
+    XCTAssertEqual(options.map(\.modelDisplayName), ["Qwen3-0.6B-Q8_0.gguf", "Qwen3-0.6B-Q8_0.gguf"])
+    XCTAssertEqual(options.map(\.isRuntimeProfile), [false, true])
   }
 }

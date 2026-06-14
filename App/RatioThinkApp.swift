@@ -134,7 +134,10 @@ struct RatioThinkApp: App {
                                        servedModelID: servedModelID),
         initialStatus: .running(EngineSessionSnapshot(port: pinnedRunningPort,
                                                       profileID: "chat",
-                                                      servedModelID: servedModelID))
+                                                      servedModelID: servedModelID,
+                                                      daemonBindHost: prefs.localAPIBindMode)),
+        initialDaemonBindMode: prefs.localAPIBindMode,
+        daemonBindModeProvider: { prefs.localAPIBindMode }
       )
     } else if let startToRunningPort {
       statusStore = EngineStatusStore(
@@ -142,7 +145,11 @@ struct RatioThinkApp: App {
         initialStatus: .stopped
       )
     } else {
-      statusStore = EngineStatusStore(client: HelperXPCClient())
+      statusStore = EngineStatusStore(
+        client: HelperXPCClient(),
+        initialDaemonBindMode: prefs.localAPIBindMode,
+        daemonBindModeProvider: { prefs.localAPIBindMode }
+      )
     }
     if pinnedRunningPort != nil,
        let pinnedResident = ProcessInfo.processInfo.environment["PIE_TEST_CHAT_MODEL_PIN"]?
@@ -157,7 +164,11 @@ struct RatioThinkApp: App {
       center.reconcileEngineResident(pinnedResident)
     }
     #else
-    statusStore = EngineStatusStore(client: HelperXPCClient())
+    statusStore = EngineStatusStore(
+      client: HelperXPCClient(),
+      initialDaemonBindMode: prefs.localAPIBindMode,
+      daemonBindModeProvider: { prefs.localAPIBindMode }
+    )
     #endif
     //  wire-in completed by : `HTTPEngineClient.baseURLProvider`
     // resolves `EngineStatusStore.requireBaseURL()` on each request.

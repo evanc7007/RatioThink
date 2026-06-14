@@ -373,6 +373,9 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
       reply(nil, Self.notImplementedErrorData)
       return
     }
+    // No explicit bind host on this path: the resolver injects the
+    // file-backed persisted Local API bind mode into the spec, so a
+    // model-pick start still inherits the user's exposure preference.
     guard let spec = resolveLaunchSpec(profileID: profileID,
                                        explicitModel: modelOverride,
                                        engineHost: engineHost,
@@ -380,6 +383,52 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
                                        reply: reply) else {
       return
     }
+    let replied = OSAllocatedUnfairLock<Bool>(initialState: false)
+    func fireOnce(_ result: Result<EngineSessionSnapshot, EngineError>) {
+      let already = replied.withLock { (fired: inout Bool) -> Bool in
+        defer { fired = true }
+        return fired
+      }
+      if already { return }
+      PieHelperXPCWire.replyStartEngine(result, via: reply)
+    }
+    beginStart(engineHost: engineHost, spec: spec, fireOnce: fireOnce)
+  }
+
+  public func startEngine(profileID: String,
+                          daemonBindHost: String,
+                          reply: @escaping (Data?, Data?) -> Void) {
+    guard let engineHost else {
+      Self.log.error("startEngine: no engineHost wired (early boot or unit test)")
+      reply(nil, Self.notImplementedErrorData)
+      return
+    }
+    // The Local API settings toggle pushes an explicit bind host so the
+    // engine relaunches on exactly the requested listener mode without
+    // waiting for the helper to re-read the persisted preference. Validate
+    // it against the known hosts before overriding the resolver default.
+    let bindMode: EngineHTTPBindMode
+    switch daemonBindHost {
+    case EngineHTTPBindMode.loopback.daemonHost:
+      bindMode = .loopback
+    case EngineHTTPBindMode.external.daemonHost:
+      bindMode = .external
+    default:
+      PieHelperXPCWire.replyStartEngine(
+        .failure(EngineError(code: .invalidInput,
+                             message: "Unsupported Local API bind host: \(daemonBindHost)")),
+        via: reply
+      )
+      return
+    }
+    guard var spec = resolveLaunchSpec(profileID: profileID,
+                                       explicitModel: nil,
+                                       engineHost: engineHost,
+                                       operation: "startEngine",
+                                       reply: reply) else {
+      return
+    }
+    spec.daemonBindHost = bindMode
     let replied = OSAllocatedUnfairLock<Bool>(initialState: false)
     func fireOnce(_ result: Result<EngineSessionSnapshot, EngineError>) {
       let already = replied.withLock { (fired: inout Bool) -> Bool in
@@ -997,6 +1046,13 @@ public final class DegradedHelperAPI: NSObject, PieHelperXPC {
                           modelOverride: String?,
                           reply: @escaping (Data?, Data?) -> Void) {
     Self.log.error("startEngine refused in degraded mode (profileID=\(profileID, privacy: .public))")
+    reply(nil, degradedErrorData)
+  }
+
+  public func startEngine(profileID: String,
+                          daemonBindHost: String,
+                          reply: @escaping (Data?, Data?) -> Void) {
+    Self.log.error("startEngine refused in degraded mode (profileID=\(profileID, privacy: .public) daemonBindHost=\(daemonBindHost, privacy: .public))")
     reply(nil, degradedErrorData)
   }
 

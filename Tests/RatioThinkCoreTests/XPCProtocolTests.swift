@@ -23,6 +23,7 @@ final class XPCProtocolTests: XCTestCase {
       "engineStatusWithReply:",
       "kvUsageWithReply:",
       "startEngineWithProfileID:modelOverride:reply:",
+      "startEngineWithProfileID:daemonBindHost:reply:",
       "restartEngineWithProfileID:modelOverride:reply:",
       "stopEngineWithReply:",
       "downloadModelWithRepo:file:reply:",
@@ -67,6 +68,31 @@ final class XPCProtocolTests: XCTestCase {
       XCTAssertEqual(snap.servedModelID, "Qwen/Qwen3-0.6B")
       XCTAssertEqual(snap.maxOutputTokens, 8000)
       XCTAssertEqual(snap.generation, 3)
+      XCTAssertNil(snap.daemonBindHost)
+    } else {
+      XCTFail("expected .running, got \(decoded)")
+    }
+  }
+
+  func test_engineStatus_roundtrip_running_carries_external_bind_mode() throws {
+    let original = EngineStatus.running(EngineSessionSnapshot(
+      port: 51234, profileID: "chat", daemonBindHost: .external))
+    let data = try XPCPayload.encode(original)
+    let decoded = try XPCPayload.decode(EngineStatus.self, from: data)
+    XCTAssertEqual(decoded, original)
+    if case .running(let snap) = decoded {
+      XCTAssertEqual(snap.daemonBindHost, .external)
+    } else {
+      XCTFail("expected .running, got \(decoded)")
+    }
+  }
+
+  func test_engineStatus_legacy_running_payload_preserves_missing_daemon_bind_mode() throws {
+    let data = Data(#"{"kind":"running","port":51234,"profileID":"chat","snapshot":{"generation":0,"port":51234,"profileID":"chat","servedModelID":"","maxOutputTokens":4096}}"#.utf8)
+    let decoded = try XPCPayload.decode(EngineStatus.self, from: data)
+    if case .running(let snap) = decoded {
+      XCTAssertNil(snap.daemonBindHost,
+                   "a snapshot without daemonBindHost decodes to nil (unknown), not a claimed loopback")
     } else {
       XCTFail("expected .running, got \(decoded)")
     }
@@ -582,9 +608,11 @@ final class XPCProtocolTests: XCTestCase {
     // v4 helper would answer with old-shape bytes that fail the App's snapshot
     // decode, so the repair gate must fire. #517 then added the required
     // `kvUsageWithReply:` selector, so stale v5 helpers must also be repaired
-    // before the App calls the selector. Pin the version so a future
-    // wire/selector change fails here until it is bumped.
-    XCTAssertEqual(HelperProtocolCompatibility.currentVersion, 6,
+    // before the App calls the selector. #562 then added the required
+    // `startEngineWithProfileID:daemonBindHost:reply:` selector (Local API
+    // external-access toggle), so stale v6 helpers must also be repaired. Pin
+    // the version so a future wire/selector change fails here until it is bumped.
+    XCTAssertEqual(HelperProtocolCompatibility.currentVersion, 7,
                    "bump currentVersion whenever a REQUIRED PieHelperXPC selector is added OR reply/status wire BYTES change")
   }
 

@@ -27,6 +27,13 @@ public final class EngineStatusStore: ObservableObject {
   /// placeholder before the first poll completes).
   @Published public private(set) var status: EngineStatus
 
+  /// Effective Local API daemon bind mode for the currently launched engine.
+  /// This is a runtime fact recorded at the shared start boundary, not merely
+  /// the user's desired preference. Views that warn about external exposure
+  /// read this while `.running` so they do not claim loopback-only posture for
+  /// a daemon that was actually launched on `0.0.0.0`.
+  @Published public private(set) var runtimeDaemonBindMode: EngineHTTPBindMode
+
   /// Most recent error string from a failed `engineStatus()` poll.
   /// `nil` after a successful poll. Surfaces helper-down vs
   /// supervisor-running-but-still-starting in the UI without forcing
@@ -81,6 +88,16 @@ public final class EngineStatusStore: ObservableObject {
     return nil
   }
 
+  /// User-facing Local API URL for the effective runtime bind mode. In-app
+  /// clients keep using `baseURL` (loopback), but the endpoint explorer should
+  /// render the listener mode the engine was actually launched with.
+  public var localAPIBaseURL: URL? {
+    if case .running(let snapshot) = status {
+      return URL(string: "http://\(runtimeDaemonBindMode.baseURLHost):\(snapshot.port)")
+    }
+    return nil
+  }
+
   /// The active engine session's `EngineSessionSnapshot` while `.running`,
   /// else `nil` (#476). The single authoritative view of the launched
   /// session — served model id, effective `max_tokens` ceiling, launch
@@ -96,6 +113,7 @@ public final class EngineStatusStore: ObservableObject {
   }
 
   private let client: any AppXPCClient
+  private let daemonBindModeProvider: @MainActor @Sendable () -> EngineHTTPBindMode
   private let pollInterval: TimeInterval
   private var task: Task<Void, Never>?
   private nonisolated static let log = Logger(subsystem: "com.ratiothink.app", category: "engine-status")
@@ -148,19 +166,41 @@ public final class EngineStatusStore: ObservableObject {
   /// `tierPolicy.firstLoadFailureGracePolls`.
   private var heldFailurePolls = 0
 
+  /// True only when `runtimeDaemonBindMode` came from an explicit app start
+  /// request or a helper status payload that carried `daemonBindHost`. Legacy
+  /// running payloads lack that field, so they must not silently certify a
+  /// loopback-only posture.
+  private var runtimeDaemonBindModeIsConfirmed = false
+
   public init(
     client: any AppXPCClient,
     pollInterval: TimeInterval = 1.0,
     initialStatus: EngineStatus = .starting,
+    initialDaemonBindMode: EngineHTTPBindMode = .loopback,
+    daemonBindModeProvider: @escaping @MainActor @Sendable () -> EngineHTTPBindMode = { .loopback },
     tierPolicy: StatusTierPolicy = StatusTierPolicy(),
     now: @escaping @Sendable () -> Date = { Date() }
   ) {
     self.client = client
+    self.daemonBindModeProvider = daemonBindModeProvider
     self.pollInterval = pollInterval
     self.tierPolicy = tierPolicy
     self.now = now
     self.status = initialStatus
-    if case .running = initialStatus { self.wasEverRunning = true }
+    self.runtimeDaemonBindMode = initialDaemonBindMode
+    if case .running(let snapshot) = initialStatus {
+      self.wasEverRunning = true
+      if let daemonBindHost = snapshot.daemonBindHost {
+        self.runtimeDaemonBindMode = daemonBindHost
+        self.runtimeDaemonBindModeIsConfirmed = true
+      } else {
+        self.runtimeDaemonBindMode = Self.failSafeLegacyBindMode(
+          current: initialDaemonBindMode,
+          currentIsConfirmed: false,
+          desired: daemonBindModeProvider()
+        )
+      }
+    }
     if case .starting = initialStatus { self.startingSince = now() }
   }
 
@@ -387,13 +427,38 @@ public final class EngineStatusStore: ObservableObject {
   /// toolbar / model-list pick). Non-nil boots that model regardless of the
   /// profile's persisted default, so a no-default profile starts cleanly
   /// from an explicit pick (#459 repro 1).
-  public func startEngine(profileID: String, modelOverride: String? = nil) async throws {
+  ///
+  /// `daemonBindHost` overrides the shared Local API bind preference for this
+  /// start (the settings external-access toggle); `nil` inherits
+  /// `daemonBindModeProvider()`.
+  ///
+  /// Same-profile idempotency is owned by the helper's `startOrAttach`
+  /// boundary, so an `.alreadyRunning` that reaches here is an incompatible
+  /// start (different profile, stopping, …) and surfaces to the caller rather
+  /// than being swallowed.
+  public func startEngine(profileID: String,
+                          modelOverride: String? = nil,
+                          daemonBindHost: EngineHTTPBindMode? = nil) async throws {
     try requireHelperAvailable()
+    let requestedBindMode = daemonBindHost ?? daemonBindModeProvider()
     do {
-      try await client.startEngine(profileID: profileID, modelOverride: modelOverride)
+      if let modelOverride {
+        // Model-pick start: the helper resolver injects the persisted Local
+        // API bind mode into the spec, so this start still honors the user's
+        // exposure preference even though the model-override wire selector
+        // carries no explicit bind host. Record the shared preference as the
+        // optimistic runtime posture (it matches what the resolver injects).
+        try await client.startEngine(profileID: profileID, modelOverride: modelOverride)
+      } else {
+        try await client.startEngine(profileID: profileID, daemonBindHost: requestedBindMode)
+      }
+      runtimeDaemonBindMode = requestedBindMode
+      runtimeDaemonBindModeIsConfirmed = true
     } catch let error as AppXPCClientError {
       if case .replyTimeout = error {
         Self.log.notice("startEngine(profileID=\(profileID, privacy: .public)) reply timed out — start in flight; status poll will surface the outcome")
+        runtimeDaemonBindMode = requestedBindMode
+        runtimeDaemonBindModeIsConfirmed = true
         return
       }
       throw error
@@ -537,6 +602,7 @@ public final class EngineStatusStore: ObservableObject {
         // grace exhausted — surface the failure below.
       }
       heldFailurePolls = 0
+      updateRuntimeDaemonBindMode(from: next)
       engineGoneSynthesized = false
       setStatusAndTrackStarting(next)
       if case .running = next { wasEverRunning = true }
@@ -564,6 +630,14 @@ public final class EngineStatusStore: ObservableObject {
             code: .engineGone,
             message: "Can’t reach the engine — it stopped responding (\(cause)). Use Restart Engine to reconnect."
           ))
+          // Symmetric to the success non-running clear in
+          // `updateRuntimeDaemonBindMode`: leaving a running generation must
+          // invalidate the confirmed bind posture, or a later legacy running
+          // payload (no `daemonBindHost`) would reuse the stale confirmed
+          // `.loopback` and hide the 0.0.0.0 exposure warning for an
+          // externally bound endpoint. Keep `runtimeDaemonBindMode` as the
+          // last-known value so the fail-safe still over-reports on doubt.
+          runtimeDaemonBindModeIsConfirmed = false
         }
         if self.lastError != nil { self.lastError = nil }
       }
@@ -601,6 +675,41 @@ public final class EngineStatusStore: ObservableObject {
   /// #2 hold predicate: a held-eligible transient failure is an explicit
   /// `.spawnFailed`/`.engineGone` while the engine has NEVER run this
   /// session and is still inside its `.starting` window.
+  private func updateRuntimeDaemonBindMode(from next: EngineStatus) {
+    guard case .running(let snapshot) = next else {
+      runtimeDaemonBindModeIsConfirmed = false
+      return
+    }
+    if let daemonBindHost = snapshot.daemonBindHost {
+      runtimeDaemonBindMode = daemonBindHost
+      runtimeDaemonBindModeIsConfirmed = true
+      return
+    }
+
+    runtimeDaemonBindMode = Self.failSafeLegacyBindMode(
+      current: runtimeDaemonBindMode,
+      currentIsConfirmed: runtimeDaemonBindModeIsConfirmed,
+      desired: daemonBindModeProvider()
+    )
+  }
+
+  private static func failSafeLegacyBindMode(
+    current: EngineHTTPBindMode,
+    currentIsConfirmed: Bool,
+    desired: EngineHTTPBindMode
+  ) -> EngineHTTPBindMode {
+    if desired == .external { return .external }
+    if currentIsConfirmed { return current }
+    if current == .external { return .external }
+    // Missing daemonBindHost is unknown, not proof of loopback. Prefer the
+    // current desired external posture over stale confirmed state from an
+    // earlier running generation. When no
+    // confirmed app start or persisted external preference can explain the
+    // running daemon, over-report exposure so the Local API UI keeps the
+    // network warning visible instead of claiming loopback-only safety.
+    return .external
+  }
+
   private func shouldHoldTransientFailure(_ next: EngineStatus) -> Bool {
     guard !wasEverRunning, startingSince != nil else { return false }
     guard case let .failed(code, _) = next else { return false }
