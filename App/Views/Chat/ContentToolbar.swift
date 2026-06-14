@@ -314,19 +314,48 @@ struct ContentToolbar: View {
   private var modelMenu: some View {
     Menu {
       // #459's richer option list (checkmark on current, profile-default
-      // annotation, unavailable reasons, "Manage Models…") kept; the write
-      // is routed to `Chat.modelID` (the #460 authority) in `selectModel`.
-      ForEach(modelOptions) { option in
-        Button {
-          selectModel(option)
-        } label: {
-          modelOptionLabel(option)
+      // annotation, unavailable reasons, "Manage Models…") kept; the write is
+      // routed to `Chat.modelID` (the #460 authority) in `selectModel`.
+      // #580: structured identity — cluster all quants of a family under one
+      // base-name header (a disabled `Text` row, NOT a SwiftUI `Section`: a
+      // Section header in a `.borderlessButton` Menu breaks the NSMenu so it
+      // never opens, verified via the profile picker's S365). The row's text is
+      // the quant TAG (Q1: base prominent in the header + quant as the row tag;
+      // Q3: GGUF format dropped), with the unverified shield (#580 #5) via
+      // `modelOptionLabel`. Each row carries `ModelRow-<slug>` as its
+      // accessibility IDENTIFIER (which DOES surface on an NSMenuItem, unlike
+      // `.accessibilityValue`) so automation (S486/S260) can target a concrete
+      // model without depending on the no-longer-leaf row text.
+      // Long lists scroll natively: a SwiftUI `Menu` renders an NSMenu, which
+      // auto-scrolls past a screen-height threshold (a `ScrollView` cannot be
+      // embedded in a `Menu`), so a long grouped list never runs off-screen.
+      // The grouped pipeline that feeds it is guarded against truncation by
+      // `ModelIdentityGroupingTests.test_long_multi_family_list_is_never_truncated`.
+      // `prefer: \.isCurrent` keeps the persisted/served row on an identity
+      // tie (app-managed bare slug vs served full-path copy) so the surviving
+      // row's slug matches `selectedModelID` — checkmark renders and the tap
+      // writes the persisted slug, not the sort-first duplicate.
+      ForEach(ModelIdentityGrouping.grouped(
+        ModelIdentityGrouping.deduped(modelOptions, slug: \.slug, prefer: { $0.isCurrent }),
+        slug: \.slug)) { group in
+        Text(group.base)
+        ForEach(group.items) { option in
+          Button {
+            selectModel(option)
+          } label: {
+            modelOptionLabel(option)
+          }
+          .help(option.unavailableReason.map { "\(option.slug) — \($0)" } ?? option.slug)
+          .accessibilityIdentifier("ModelRow-\(option.slug)")
+          .disabled(!option.isSelectable)
         }
-        .help(option.unavailableReason.map { "\(option.slug) — \($0)" } ?? option.slug)
-        .accessibilityValue(option.unavailableReason.map { "\(option.slug), \($0)" } ?? option.slug)
-        .disabled(!option.isSelectable)
       }
-      if !modelOptions.isEmpty { Divider() }
+      // No heavy Divider before the action: an NSMenu separator (what
+      // SwiftUI's `Divider` becomes in a `.borderlessButton` Menu) is the
+      // OS-standard line and is NOT restylable to a lighter weight, so the
+      // subtlest option the operator asked for is to drop it — the disabled
+      // base-name headers already structure the list, and the gearshape icon
+      // sets "Manage Models…" apart from the model rows.
       Button {
         openModelsSettings()
       } label: {
@@ -358,17 +387,31 @@ struct ContentToolbar: View {
   @ViewBuilder
   private func modelOptionLabel(_ option: ToolbarModelOptions.Option) -> some View {
     let text = modelOptionText(option)
+    // One systemImage per native menu row: current (checkmark) wins, then a
+    // blocking reason (triangle), then the unverified shield (#580 #5).
     if option.isCurrent {
       Label(text, systemImage: "checkmark")
     } else if option.unavailableReason != nil {
       Label(text, systemImage: "exclamationmark.triangle")
+    } else if option.isUnverified {
+      Label(text, systemImage: "exclamationmark.shield")
     } else {
       Text(text)
     }
   }
 
+  /// Row text is the quant TAG (#580 Q1/Q3: the base-name header supplies the
+  /// family name, the row distinguishes by quant, GGUF format dropped), falling
+  /// back to the full leaf when there is no clean quant (a safetensors dir / a
+  /// split GGUF). Keeps the profile-default annotation + any unavailable reason.
+  /// The concrete model stays automation-targetable via the row's
+  /// `ModelRow-<slug>` accessibility identifier.
   private func modelOptionText(_ option: ToolbarModelOptions.Option) -> String {
-    var text = option.displayName + (option.isProfileDefault ? " (profile default)" : "")
+    // Quant tag is the primary text; an HF-cache source suffix disambiguates
+    // a same-quant app-vs-cache pair that the full-slug dedup keeps as two rows.
+    var text = option.parts.quantOrLeaf
+    if let tag = option.sourceTag { text += " (\(tag))" }
+    if option.isProfileDefault { text += " (profile default)" }
     if let reason = option.unavailableReason { text += " — \(reason)" }
     return text
   }
@@ -410,6 +453,10 @@ struct ContentToolbar: View {
     // (nothing pinned or defaulted) keeps the generic "Profile default" text.
     if let target = ModelTarget.resolve(selectedModelID: selectedModelID,
                                         profileDefault: profileDefaultModel) {
+      // Leaf — consistent with the live collapsed label (#459
+      // `currentModelSummary` / `modelMenuTitle`, also leaf-derived). #580's
+      // structured base+quant rendering applies to the DROPDOWN ROWS, not this
+      // collapsed-title contract.
       return ModelDisplayName.leaf(target.modelID)
     }
     return "Profile default"
