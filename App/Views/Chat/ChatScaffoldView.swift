@@ -241,27 +241,30 @@ struct ChatScaffoldView: View {
     }
   }
 
-  /// True when the slug's app-staged model file exists — the engine's
-  /// primary model source. A miss means the prompt offers Download
-  /// instead of Load.
+  /// True when `slug` resolves to a loadable model — the engine's primary
+  /// app-staged models dir OR, failing that, the HuggingFace cache. A miss
+  /// means the prompt offers Download instead of Load.
   ///
-  /// Intentionally checks ONLY the app-staged path, not the HF cache
-  /// (the resolver's secondary fallback). A model present only in
-  /// `~/.cache/huggingface` is offered a Download here, which simply
-  /// stages a second copy into the app models dir before it resolves —
-  /// benign redundancy, not a wrong result. Mirroring the resolver's
-  /// two-stage check would couple this UI gate to resolver internals.
+  /// Delegates to `LaunchSpecResolver.isModelResolvable`, which mirrors the
+  /// launcher's own two-stage resolution. Checking ONLY the app-staged path
+  /// (the prior behavior) misreported a genuinely-loadable HF-cached model —
+  /// e.g. a safetensors snapshot the dropdown lists as selectable — as
+  /// "isn't available", because the launcher resolves it from the cache but
+  /// this gate could not see it. Sharing one predicate keeps the gate and the
+  /// launcher from disagreeing about what is loadable.
   static func isModelInstalled(_ slug: String) -> Bool {
-    // Read-only existence check that runs on the render path (the live
-    // `noModelAction` / the download CTA): resolve the models dir path
-    // WITHOUT creating it or touching xattrs. The mutating `PieDirs
-    // .models()` does `createDirectory` + `setResourceValues
-    // (isExcludedFromBackup)` on every call, so calling it here would emit
-    // main-thread filesystem WRITES on every render while the no-model
-    // sheet is open. `modelsURL()` is pure path composition; the
-    // download/staging writers still call the mutating `models()`.
-    let path = LaunchSpecResolver.joinModelPath(modelsRoot: PieDirs.modelsURL(), slug: slug)
-    return FileManager.default.fileExists(atPath: path)
+    // Read-only check that runs on the render path (the live `noModelAction` /
+    // the download CTA): resolve the models dir path WITHOUT creating it or
+    // touching xattrs. The mutating `PieDirs.models()` does `createDirectory` +
+    // `setResourceValues(isExcludedFromBackup)` on every call, so calling it
+    // here would emit main-thread filesystem WRITES on every render while the
+    // no-model sheet is open. `modelsURL()` is pure path composition, and
+    // `isModelResolvable` performs existence reads only; the download/staging
+    // writers still call the mutating `models()`.
+    LaunchSpecResolver.isModelResolvable(
+      slug: slug,
+      modelsRoot: PieDirs.modelsURL(),
+      hfHome: LaunchSpecResolver.defaultHFHome())
   }
 
   /// Kick the helper to (re)start the engine on this chat's profile —

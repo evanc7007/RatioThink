@@ -1385,6 +1385,53 @@ final class LaunchSpecResolverTests: XCTestCase {
     return url
   }
 
+  // MARK: - isModelResolvable (send-gate availability mirrors the launcher)
+
+  /// The release blocker: an HF-cached safetensors model (slug = bare repo id,
+  /// no file segment → a snapshot DIRECTORY) is genuinely loadable — the
+  /// launcher resolves it from the cache — so the send-gate must report it
+  /// resolvable, not "isn't available". Before the fix the gate only checked
+  /// the app-staged path and returned false for this exact case.
+  func test_isModelResolvable_true_for_HFCached_safetensors_directory() throws {
+    let modelsRoot = tempDir.appendingPathComponent("models-empty", isDirectory: true)
+    let hfHome = tempDir.appendingPathComponent("hf-home-st", isDirectory: true)
+    // A complete snapshot (config + tokenizer + safetensors weight) — what a
+    // real `huggingface_hub` download of a safetensors model leaves on disk.
+    try writeHFCacheSnapshot(
+      hfHome: hfHome,
+      repo: "Qwen/Qwen3-0.6B",
+      files: [
+        "config.json": "{\"torch_dtype\": \"bfloat16\"}",
+        "tokenizer.json": "{}",
+        "model.safetensors": "weights",
+      ])
+    XCTAssertTrue(
+      LaunchSpecResolver.isModelResolvable(
+        slug: "Qwen/Qwen3-0.6B", modelsRoot: modelsRoot, hfHome: hfHome),
+      "an HF-cached safetensors snapshot must be reported resolvable (it is loadable)")
+  }
+
+  /// Symmetry with the launcher's primary source: a plainly app-staged file
+  /// resolves without consulting the cache.
+  func test_isModelResolvable_true_for_appStaged_file() throws {
+    let modelsRoot = tempDir.appendingPathComponent("models-staged", isDirectory: true)
+    try stageModel(named: "Org/Local-GGUF/local.gguf", in: modelsRoot)
+    XCTAssertTrue(
+      LaunchSpecResolver.isModelResolvable(
+        slug: "Org/Local-GGUF/local.gguf",
+        modelsRoot: modelsRoot,
+        hfHome: tempDir.appendingPathComponent("hf-home-staged", isDirectory: true)))
+  }
+
+  /// A slug present in neither source is genuinely unavailable.
+  func test_isModelResolvable_false_when_absent_from_both_sources() throws {
+    let modelsRoot = tempDir.appendingPathComponent("models-none", isDirectory: true)
+    let hfHome = tempDir.appendingPathComponent("hf-home-none", isDirectory: true)
+    XCTAssertFalse(
+      LaunchSpecResolver.isModelResolvable(
+        slug: "Ghost/Not-Real", modelsRoot: modelsRoot, hfHome: hfHome))
+  }
+
   private func makeSparseFile(at url: URL, sizeBytes: Int64) throws {
     _ = FileManager.default.createFile(atPath: url.path, contents: nil)
     let handle = try FileHandle(forWritingTo: url)

@@ -373,6 +373,46 @@ public struct LaunchSpecResolver {
     return .success(true)
   }
 
+  /// Read-only check of whether `slug` resolves to an on-disk model artifact
+  /// through the SAME two stages the launch path uses (`resolveModelRef`): the
+  /// app-staged models dir, else the HuggingFace cache. Mirrors that control
+  /// flow exactly, MINUS the `ModelMemoryGuardrail` step — a present-but-too-
+  /// large model is a load-time `.memoryRisk`, not a missing one, so existence
+  /// is the right question for an availability gate. Performs no directory
+  /// creation and no xattr writes, so it is safe to call on the SwiftUI render
+  /// path.
+  ///
+  /// The send-gate (`ChatScaffoldView.isModelInstalled`) consults this so a
+  /// genuinely-loadable HF-cached model (e.g. a safetensors snapshot) is
+  /// offered Load instead of being misreported "isn't available". Keeping the
+  /// predicate here, beside `resolveModelRef`, stops the gate and the launcher
+  /// from drifting apart — the bug it fixes was exactly that drift.
+  public static func isModelResolvable(slug: String,
+                                       modelsRoot: URL,
+                                       hfHome: URL?,
+                                       fileManager: FileManager = .default) -> Bool {
+    let localPath = joinModelPath(modelsRoot: modelsRoot, slug: slug)
+    switch validateAppStagedModel(at: localPath, fileManager: fileManager) {
+    case .success(true):
+      return true
+    case .failure:
+      // A present-but-invalid app-staged artifact fails the launch outright:
+      // `resolveModelRef` returns a `modelMissing` error here and never falls
+      // through to the HF cache. Mirror that — not resolvable.
+      return false
+    case .success(false):
+      break  // not app-staged → try the HF cache, exactly as the launcher does
+    }
+    guard let hfHome, let identity = hfIdentity(forModelSlug: slug) else {
+      return false
+    }
+    if case .hit = HFCacheResolver(hfHome: hfHome, fileManager: fileManager)
+      .resolve(repo: identity.repo, file: identity.file) {
+      return true
+    }
+    return false
+  }
+
   /// Effective boot model: the user's explicit per-start selection when
   /// present (blank/whitespace ignored), otherwise the profile's persisted
   /// default. `nil` means neither is set → `noDefaultModelError`. Returns the
