@@ -26,17 +26,14 @@ Feel free to report any issues you find!
 ## Why Rational
 
 **Local models, with thinking modes.** Ollama and LM Studio hand you a model and
-a prompt box. Rational adds **profiles** — named *thinking modes* you switch in
+a prompt box. Rational adds **thinking modes**, named _profiles_, you switch in
 one click, each a saved preset bundling a model, sampling, a system prompt, and a
 chat workflow.
 
-- **Repeat Boost — speculative decoding by switching a profile.** Runs the same
+- **Repeat Boost — speculative decoding.** Runs the same
   model greedily with a speculative drafter: the output is identical, but a
   *repetitive* answer — code, JSON, structured edits — lands with less waiting.
-  The win scales with how much the output repeats, so it shines on a prompt
-  whose output repeats by construction, e.g. *"Write a poem where every line
-  begins with the words 'Quiet falling snow'."* No flags, no separate model:
-  just pick it. It currently implements the
+  It currently implements the
   [Cacheback algorithm](https://www.yecl.org/publications/ma2025emnlp.pdf).
 - **Tree of Thought — a search tree, in one click.** The Tree of Thought profile
   turns one question into a scored search: the engine branches, scores each branch
