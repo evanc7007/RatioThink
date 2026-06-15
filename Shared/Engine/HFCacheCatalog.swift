@@ -115,7 +115,10 @@ public enum HFCacheCatalog {
         isPartial: false,
         isUnverified: false,
         metadataUnreadable: false,
-        source: .huggingFaceCache
+        source: .huggingFaceCache,
+        precision: dirModelPrecision(snapshot: snapshot,
+                                     weights: weights,
+                                     fileManager: fileManager)
       ))
     }
     return rows
@@ -269,6 +272,90 @@ public enum HFCacheCatalog {
       ))
     }
     return out
+  }
+
+  /// Best-effort weight precision for a directory-loaded model, from REAL
+  /// metadata only (never fabricated):
+  ///   1. `config.json` `torch_dtype` (the HF-canonical field), else
+  ///   2. the dtype of the first tensor in the first `.safetensors` header.
+  /// Returns a short tag (`bf16`/`f16`/`f32`/…), or `nil` when neither source
+  /// yields one — the caller then shows a neutral label, not a guess.
+  private static func dirModelPrecision(snapshot: URL,
+                                        weights: [WeightArtifact],
+                                        fileManager: FileManager) -> String? {
+    if let dtype = torchDtypeFromConfig(snapshot, fileManager: fileManager),
+       let tag = Self.precisionTag(fromTorchDtype: dtype) {
+      return tag
+    }
+    if let st = weights.first(where: { $0.relativePath.lowercased().hasSuffix(".safetensors") }),
+       let dtype = safetensorsHeaderDtype(st.url),
+       let tag = Self.precisionTag(fromSafetensorsDtype: dtype) {
+      return tag
+    }
+    return nil
+  }
+
+  private static func torchDtypeFromConfig(_ snapshot: URL,
+                                           fileManager: FileManager) -> String? {
+    let cfg = snapshot.appendingPathComponent("config.json").resolvingSymlinksInPath()
+    guard let data = try? Data(contentsOf: cfg),
+          let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+    else { return nil }
+    if let dtype = obj["torch_dtype"] as? String { return dtype }
+    // Multimodal configs sometimes nest the dtype under a text sub-config.
+    if let text = obj["text_config"] as? [String: Any],
+       let dtype = text["torch_dtype"] as? String { return dtype }
+    return nil
+  }
+
+  /// Dtype of the first real tensor in a `.safetensors` header. Layout: an
+  /// 8-byte little-endian header length, then that many bytes of JSON whose
+  /// tensor entries each carry a `dtype` (`BF16`/`F16`/`F32`/…). `__metadata__`
+  /// is skipped. Reads only the header, never the (multi-GB) weights.
+  private static func safetensorsHeaderDtype(_ url: URL) -> String? {
+    let resolved = url.resolvingSymlinksInPath()
+    guard let handle = try? FileHandle(forReadingFrom: resolved) else { return nil }
+    defer { try? handle.close() }
+    guard let lenData = try? handle.read(upToCount: 8), lenData.count == 8 else { return nil }
+    var headerLen: UInt64 = 0
+    for (i, b) in lenData.enumerated() { headerLen |= UInt64(b) << (8 * i) }
+    guard headerLen > 0, headerLen < 50_000_000 else { return nil }
+    guard let json = try? handle.read(upToCount: Int(headerLen)),
+          let obj = try? JSONSerialization.jsonObject(with: json) as? [String: Any]
+    else { return nil }
+    for (key, value) in obj where key != "__metadata__" {
+      if let tensor = value as? [String: Any], let dtype = tensor["dtype"] as? String {
+        return dtype
+      }
+    }
+    return nil
+  }
+
+  /// HF `torch_dtype` string → short tag. `nil` for unrecognized values so an
+  /// unknown precision is shown as a neutral label, never invented.
+  static func precisionTag(fromTorchDtype dtype: String) -> String? {
+    switch dtype.lowercased() {
+    case "bfloat16", "bf16": return "bf16"
+    case "float16", "fp16", "half": return "f16"
+    case "float32", "fp32", "float": return "f32"
+    case "float64", "fp64", "double": return "f64"
+    case "int8", "qint8": return "int8"
+    case "uint8": return "uint8"
+    default: return nil
+    }
+  }
+
+  /// safetensors header dtype token → short tag. `nil` for unrecognized.
+  static func precisionTag(fromSafetensorsDtype dtype: String) -> String? {
+    switch dtype.uppercased() {
+    case "BF16": return "bf16"
+    case "F16": return "f16"
+    case "F32": return "f32"
+    case "F64": return "f64"
+    case "I8": return "int8"
+    case "U8": return "uint8"
+    default: return nil
+    }
   }
 
   /// `models--Qwen--Qwen3-0.6B` → `Qwen/Qwen3-0.6B`. Returns `nil` for

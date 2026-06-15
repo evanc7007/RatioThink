@@ -87,7 +87,7 @@ final class S459_ProfileSwapKeepCurrentGUITests: XCTestCase {
                   "Keep Current must still commit the profile switch to repeat-boost; title=\(profileMenu.title)")
     // The chat's pinned model X is kept as `Chat.modelID` — toolbar.model must
     // still reflect X, never the repeat-boost profile's default.
-    let modelMenu = app.menuButtons["toolbar.model"]
+    let modelMenu = app.buttons["toolbar.model"]
     XCTAssertTrue(waitForElementValueContaining(modelMenu, "ghost-pinned", timeout: 10),
                   "Keep Current must keep the chat's pinned model X (Chat.modelID); toolbar.model value=\(String(describing: modelMenu.value))")
   }
@@ -176,7 +176,7 @@ final class S459_ProfileSwapKeepCurrentGUITests: XCTestCase {
                    "default explicit-model mode should not ask to swap to the destination profile default")
     XCTAssertTrue(waitForMenuButtonTitleContaining(profileMenu, "repeat-boost", timeout: 10),
                   "default explicit-model mode still commits the profile switch; title=\(profileMenu.title)")
-    let modelMenu = app.menuButtons["toolbar.model"]
+    let modelMenu = app.buttons["toolbar.model"]
     XCTAssertTrue(waitForElementValueContaining(modelMenu, "ghost-pinned", timeout: 10),
                   "default explicit-model mode must keep the chat's pinned model X; toolbar.model value=\(String(describing: modelMenu.value))")
   }
@@ -217,7 +217,7 @@ final class S459_ProfileSwapKeepCurrentGUITests: XCTestCase {
               "Rational.app did not reach runningForeground")
     app.activate()
     openFreshChat(in: app)
-    let modelMenu = app.menuButtons["toolbar.model"]
+    let modelMenu = app.buttons["toolbar.model"]
     XCTAssertTrue(waitForElementValueContaining(modelMenu, "ghost-pinned", timeout: 10),
                   "fresh chat did not expose the debug-pinned model before profile swap; toolbar.model value=\(String(describing: modelMenu.value)); app tree=\(app.debugDescription)")
     return app
@@ -295,8 +295,12 @@ final class S459_ProfileSwapKeepCurrentGUITests: XCTestCase {
     let deadline = Date().addingTimeInterval(timeout)
     while Date() < deadline {
       let value = (element.value as? String) ?? ""
+      // The redesigned `toolbar.model` is a Button (custom popover), not a
+      // native Menu; it surfaces the current model in its label as well as its
+      // value, so check both (+ title) for the slug.
       if value.localizedCaseInsensitiveContains(needle)
-        || element.title.localizedCaseInsensitiveContains(needle) { return true }
+        || element.title.localizedCaseInsensitiveContains(needle)
+        || element.label.localizedCaseInsensitiveContains(needle) { return true }
       RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.3))
     }
     return false

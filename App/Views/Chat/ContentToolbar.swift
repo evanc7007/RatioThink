@@ -99,6 +99,14 @@ struct ContentToolbar: View {
 
   @State private var showParamsPopover = false
   @State private var showSystemPopover = false
+  /// Drives the model dropdown. The picker is a custom `.popover` (not a native
+  /// `Menu`) so each row can render the model NAME as the primary element and
+  /// the quant as a secondary, dimmer, smaller detail — AppKit's NSMenu fixes
+  /// the row font and only dims *disabled* items, so the requested name-primary
+  /// / quant-secondary hierarchy is not expressible in a native menu.
+  @State private var showModelMenu = false
+  /// Hovered model row slug, for the native-menu-style row highlight.
+  @State private var hoveredModelSlug: String?
 
   init(
     viewModel: ChatTranscriptViewModel,
@@ -327,108 +335,206 @@ struct ContentToolbar: View {
   }
 
   private var modelMenu: some View {
-    Menu {
-      // #459's richer option list (checkmark on current, profile-default
-      // annotation, unavailable reasons, "Manage Models…") kept; the write is
-      // routed to `Chat.modelID` (the #460 authority) in `selectModel`.
-      // #580: structured identity — cluster all quants of a family under one
-      // base-name header (a disabled `Text` row, NOT a SwiftUI `Section`: a
-      // Section header in a `.borderlessButton` Menu breaks the NSMenu so it
-      // never opens, verified via the profile picker's S365). The row's text is
-      // the quant TAG (Q1: base prominent in the header + quant as the row tag;
-      // Q3: GGUF format dropped), with the unverified shield (#580 #5) via
-      // `modelOptionLabel`. Each row carries `ModelRow-<slug>` as its
-      // accessibility IDENTIFIER (which DOES surface on an NSMenuItem, unlike
-      // `.accessibilityValue`) so automation (S486/S260) can target a concrete
-      // model without depending on the no-longer-leaf row text.
-      // Long lists scroll natively: a SwiftUI `Menu` renders an NSMenu, which
-      // auto-scrolls past a screen-height threshold (a `ScrollView` cannot be
-      // embedded in a `Menu`), so a long grouped list never runs off-screen.
-      // The grouped pipeline that feeds it is guarded against truncation by
-      // `ModelIdentityGroupingTests.test_long_multi_family_list_is_never_truncated`.
-      // `prefer: \.isCurrent` keeps the persisted/served row on an identity
-      // tie (app-managed bare slug vs served full-path copy) so the surviving
-      // row's slug matches `selectedModelID` — checkmark renders and the tap
-      // writes the persisted slug, not the sort-first duplicate.
-      ForEach(ModelIdentityGrouping.grouped(
-        ModelIdentityGrouping.deduped(modelOptions, slug: \.slug, prefer: { $0.isCurrent }),
-        slug: \.slug)) { group in
-        Text(group.base)
-        ForEach(group.items) { option in
-          Button {
-            selectModel(option)
-          } label: {
-            modelOptionLabel(option)
-          }
-          .help(option.unavailableReason.map { "\(option.slug) — \($0)" } ?? option.slug)
-          .accessibilityIdentifier("ModelRow-\(option.slug)")
-          .disabled(!option.isSelectable)
-        }
-      }
-      // No heavy Divider before the action: an NSMenu separator (what
-      // SwiftUI's `Divider` becomes in a `.borderlessButton` Menu) is the
-      // OS-standard line and is NOT restylable to a lighter weight, so the
-      // subtlest option the operator asked for is to drop it — the disabled
-      // base-name headers already structure the list, and the gearshape icon
-      // sets "Manage Models…" apart from the model rows.
-      Button {
-        openModelsSettings()
-      } label: {
-        Label("Manage Models…", systemImage: "gearshape")
-      }
-      .help("Open Settings → Models")
-      .accessibilityIdentifier("toolbar.model.manageModels")
+    Button {
+      showModelMenu.toggle()
     } label: {
       HStack(spacing: 4) {
         Image(systemName: "shippingbox")
         // #462: bound the title so a long model name truncates rather than
         // pushing the toolbar past the window edge. No `.fixedSize()` — it
         // would pin the label non-compressible and re-break layout. The full
-        // id stays inspectable via the menu-level `.help(modelMenuHelp)` +
-        // accessibility value below. #460: `modelMenuTitle` reads
-        // `currentModelSummary`, which `ChatScaffoldView` builds from
-        // `Chat.modelID` (the authority).
+        // id stays inspectable via `.help(modelMenuHelp)` + accessibility value
+        // below. #460: `modelMenuTitle` reads `currentModelSummary`, which
+        // `ChatScaffoldView` builds from `Chat.modelID` (the authority).
         Text("Model: \(modelMenuTitle)")
           .boundedModelName()
       }
     }
-    .menuStyle(.borderlessButton)
+    .buttonStyle(.plain)
     .help(modelMenuHelp)
     .accessibilityIdentifier("toolbar.model")
     .accessibilityLabel("Model")
     .accessibilityValue(modelMenuAccessibilityValue)
-  }
-
-  @ViewBuilder
-  private func modelOptionLabel(_ option: ToolbarModelOptions.Option) -> some View {
-    let text = modelOptionText(option)
-    // One systemImage per native menu row: current (checkmark) wins, then a
-    // blocking reason (triangle), then the unverified shield (#580 #5).
-    if option.isCurrent {
-      Label(text, systemImage: "checkmark")
-    } else if option.unavailableReason != nil {
-      Label(text, systemImage: "exclamationmark.triangle")
-    } else if option.isUnverified {
-      Label(text, systemImage: "exclamationmark.shield")
-    } else {
-      Text(text)
+    .popover(isPresented: $showModelMenu, arrowEdge: .bottom) {
+      modelDropdownContent
     }
   }
 
-  /// Row text is the quant TAG (#580 Q1/Q3: the base-name header supplies the
-  /// family name, the row distinguishes by quant, GGUF format dropped), falling
-  /// back to the full leaf when there is no clean quant (a safetensors dir / a
-  /// split GGUF). Keeps the profile-default annotation + any unavailable reason.
-  /// The concrete model stays automation-targetable via the row's
-  /// `ModelRow-<slug>` accessibility identifier.
-  private func modelOptionText(_ option: ToolbarModelOptions.Option) -> String {
-    // Quant tag is the primary text; an HF-cache source suffix disambiguates
-    // a same-quant app-vs-cache pair that the full-slug dedup keeps as two rows.
-    var text = option.parts.quantOrLeaf
-    if let tag = option.sourceTag { text += " (\(tag))" }
-    if option.isProfileDefault { text += " (profile default)" }
-    if let reason = option.unavailableReason { text += " — \(reason)" }
-    return text
+  /// Custom dropdown content (a `.popover`, NOT a native `Menu`) so each row can
+  /// render the model NAME as the primary element (`.primary`, body) and the
+  /// quant as a secondary, dimmer, smaller detail (`.secondary`, caption) — the
+  /// hierarchy a native NSMenu can't express (it fixes the row font and only
+  /// dims disabled rows). Behavior is unchanged: `selectModel` still routes to
+  /// `Chat.modelID`, and each row keeps `ModelRow-<slug>` so automation
+  /// (S486/S260) targets a concrete model.
+  ///
+  /// `prefer: \.isCurrent` keeps the persisted/served row on an identity tie
+  /// (app-managed bare slug vs served full-path copy) so the checkmark row's
+  /// slug matches `selectedModelID`. The grouped pipeline is truncation-guarded
+  /// by `ModelIdentityGroupingTests`; the `ScrollView` keeps a long list on
+  /// screen.
+  private var modelDropdownContent: some View {
+    let groups = ModelIdentityGrouping.grouped(
+      ModelIdentityGrouping.deduped(modelOptions, slug: \.slug, prefer: { $0.isCurrent }),
+      slug: \.slug)
+    return ScrollView {
+      VStack(alignment: .leading, spacing: 1) {
+        ForEach(Array(groups.enumerated()), id: \.offset) { index, group in
+          // Subtle separation between model groups so categories are
+          // distinguishable (a hairline + a little breathing room), skipped
+          // before the first group.
+          if index > 0 {
+            Divider()
+              .padding(.horizontal, 10)
+              .padding(.top, 5)
+              .padding(.bottom, 1)
+          }
+          // #580 grouping: the base model NAME is the PROMINENT section header
+          // (primary, `.headline` — bold/larger), with its quant variants as
+          // visually subordinate rows beneath. A header is not a Button (not a
+          // load target); the rows carry `ModelRow-<slug>` + selection.
+          // Header == quant rows in SIZE (`.subheadline`); differentiated only
+          // by weight (semibold) and color (primary vs the rows' secondary).
+          Text(group.base)
+            .font(.subheadline.weight(.semibold))
+            .foregroundStyle(.primary)
+            .lineLimit(1)
+            .truncationMode(.middle)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 2)
+            .accessibilityAddTraits(.isHeader)
+          ForEach(group.items) { option in
+            modelRow(option)
+          }
+        }
+        Divider().padding(.horizontal, 10).padding(.vertical, 4)
+        Button {
+          showModelMenu = false
+          openModelsSettings()
+        } label: {
+          Label("Manage Models…", systemImage: "gearshape")
+            .font(.subheadline)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 5)
+        .help("Open Settings → Models")
+        .accessibilityIdentifier("toolbar.model.manageModels")
+      }
+      // Extra breathing room above the first model section.
+      .padding(.top, 16)
+      .padding(.bottom, 6)
+    }
+    // Native macOS feel: system vibrancy material behind the rows + the
+    // popover's own standard shape/corner radius/shadow (no bespoke surface).
+    .scrollContentBackground(.hidden)
+    // A long model list is bounded by `maxHeight` and stays reachable by
+    // scrolling, with the scroller visible so the overflow is discoverable.
+    .scrollIndicators(.visible)
+    .frame(minWidth: 280, maxHeight: 440)
+    .background(.regularMaterial)
+  }
+
+  /// One quant-variant row beneath its base-name header: the quant tag is the
+  /// row's selectable label; KV-cache/source/profile-default/unavailable details
+  /// are a secondary gray, smaller line. Indented under the header so the
+  /// grouping reads visually. A fixed-width leading glyph column keeps the quant
+  /// labels aligned whether or not a row carries a checkmark/warning/shield.
+  @ViewBuilder
+  private func modelRow(_ option: ToolbarModelOptions.Option) -> some View {
+    let isHovered = hoveredModelSlug == option.slug && option.isSelectable
+    Button {
+      selectModel(option)
+      showModelMenu = false
+    } label: {
+      HStack(spacing: 6) {
+        rowLeadingMarker(option)
+          .frame(width: 12, alignment: .center)
+          .accessibilityHidden(true)
+        VStack(alignment: .leading, spacing: 0) {
+          // Variant label is the row's selectable distinguisher — subordinate
+          // to the name header: smaller AND lighter (`.subheadline`, `.secondary`).
+          Text(modelVariantLabel(option))
+            .font(.subheadline)
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
+            .truncationMode(.middle)
+          if let detail = modelRowDetailText(option) {
+            Text(detail)
+              .font(.caption2)
+              .foregroundStyle(.tertiary)
+              .lineLimit(1)
+          }
+        }
+        Spacer(minLength: 8)
+      }
+      // Shallow indent (~7pt): the leading bullet, not depth, carries the
+      // sub-item meaning under the name header.
+      .padding(.leading, 7)
+      .padding(.trailing, 8)
+      .padding(.vertical, 3)
+      .frame(maxWidth: .infinity, alignment: .leading)
+      .background(
+        RoundedRectangle(cornerRadius: 5)
+          .fill(isHovered ? Color.primary.opacity(0.09) : .clear)
+      )
+      .contentShape(Rectangle())
+    }
+    .buttonStyle(.plain)
+    .padding(.horizontal, 5)
+    .disabled(!option.isSelectable)
+    .onHover { hovering in
+      hoveredModelSlug = hovering ? option.slug
+        : (hoveredModelSlug == option.slug ? nil : hoveredModelSlug)
+    }
+    .help(option.unavailableReason.map { "\(option.slug) — \($0)" } ?? option.slug)
+    .accessibilityIdentifier("ModelRow-\(option.slug)")
+  }
+
+  /// Leading marker for a quant row. Status wins (current → checkmark, blocked
+  /// → triangle, unverified → shield); otherwise a small bullet dot so the
+  /// variant reads as a sub-item of its name header without deep indentation.
+  @ViewBuilder
+  private func rowLeadingMarker(_ option: ToolbarModelOptions.Option) -> some View {
+    if option.isCurrent {
+      Image(systemName: "checkmark").imageScale(.small).foregroundStyle(.primary)
+    } else if option.unavailableReason != nil {
+      Image(systemName: "exclamationmark.triangle").imageScale(.small).foregroundStyle(.orange)
+    } else if option.isUnverified {
+      Image(systemName: "exclamationmark.shield").imageScale(.small).foregroundStyle(.orange)
+    } else {
+      Circle().fill(Color.secondary).frame(width: 4, height: 4)
+    }
+  }
+
+  /// Variant label under a name header: the GGUF quant, else the derived
+  /// weight precision for a safetensors/HF-cached model (`bf16`/`f16`/`f32`),
+  /// else — only for such a model with no derivable precision — a neutral
+  /// "safetensors" kind label rather than repeating the base name (the bug
+  /// this fixes). GGUF / app-managed rows keep their existing leaf fallback.
+  private func modelVariantLabel(_ option: ToolbarModelOptions.Option) -> String {
+    if let quant = option.parts.quant { return quant }
+    if let precision = option.precision { return precision }
+    if option.parts.format == nil, option.source == .huggingFaceCache {
+      return "safetensors"
+    }
+    return option.parts.quantOrLeaf
+  }
+
+  /// Secondary detail line under a quant row: HF-cache source suffix, the
+  /// profile-default annotation, and any unavailable reason — the quant itself
+  /// is the row's primary label, so it is not repeated here. Nil when there is
+  /// nothing to show, so the row collapses to a single quant line.
+  private func modelRowDetailText(_ option: ToolbarModelOptions.Option) -> String? {
+    var parts: [String] = []
+    if let tag = option.sourceTag { parts.append(tag) }
+    if option.isProfileDefault { parts.append("profile default") }
+    if let reason = option.unavailableReason { parts.append(reason) }
+    let text = parts.joined(separator: " · ")
+    return text.isEmpty ? nil : text
   }
 
   private var modelMenuTitle: String {

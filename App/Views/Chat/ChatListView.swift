@@ -44,7 +44,6 @@ struct ChatListView: View {
   var body: some View {
     VStack(spacing: 0) {
       header
-      Divider().opacity(0.6)
       if chats.isEmpty {
         emptyState
       } else {
@@ -62,7 +61,10 @@ struct ChatListView: View {
         .foregroundStyle(.secondary)
       Spacer()
     }
-    .padding(.horizontal, SidebarMetrics.rowHorizontalPadding)
+    // Section-level header: shifts inward with the nav rows (+50%). The
+    // conversation rows below keep `rowHorizontalPadding` so their on-screen
+    // margin is unchanged.
+    .padding(.horizontal, SidebarMetrics.sectionHorizontalPadding)
     .padding(.vertical, SidebarMetrics.rowVerticalPadding)
   }
 

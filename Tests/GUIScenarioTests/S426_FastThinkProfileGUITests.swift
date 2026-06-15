@@ -74,7 +74,8 @@ final class S426_FastThinkProfileGUITests: XCTestCase {
     // it waits for the unannotated toolbar accessibility value to equal the
     // served model id. A seeded-leaf menu row can exist earlier from the
     // profile-default option, so row appearance alone is not the barrier.
-    let modelMenu = app.menuButtons["toolbar.model"]
+    // The redesigned `toolbar.model` is a Button (custom popover), not a Menu.
+    let modelMenu = app.buttons["toolbar.model"]
     XCTAssertTrue(modelMenu.waitForExistence(timeout: 10),
                   "model menu missing after creating chat; app tree: \(app.debugDescription)")
 
@@ -215,9 +216,12 @@ final class S426_FastThinkProfileGUITests: XCTestCase {
     let deadline = Date().addingTimeInterval(timeout)
     while Date() < deadline {
       let value = element.value as? String ?? ""
+      let label = element.label
       let title = element.title
-      if value == expectedModelID,
+      // The Button surfaces the reconciled served slug in its value or label.
+      if (value == expectedModelID || label == expectedModelID),
          !value.localizedCaseInsensitiveContains("profile default"),
+         !label.localizedCaseInsensitiveContains("profile default"),
          !title.localizedCaseInsensitiveContains("(Default)") {
         return true
       }
@@ -243,13 +247,13 @@ final class S426_FastThinkProfileGUITests: XCTestCase {
   }
 
   private func menuItem(containingModelLeaf leaf: String, in app: XCUIApplication) -> XCUIElement {
-    // #580: rows render the structured quant tag (not the leaf); target the
-    // row's `ModelRow-<slug>` accessibility IDENTIFIER (the slug contains the
-    // leaf), which surfaces on the NSMenuItem where `value` does not.
+    // The redesigned dropdown is a custom `.popover`: rows are Buttons carrying
+    // the `ModelRow-<slug>` identifier (the slug contains the leaf), not native
+    // NSMenuItems. #580: the row renders the structured quant tag, never the
+    // raw leaf, so target the stable identifier.
     let predicate = NSPredicate(
-      format: "identifier CONTAINS[c] %@ OR title CONTAINS[c] %@ OR label CONTAINS[c] %@ OR value CONTAINS[c] %@",
-      leaf, leaf, leaf, leaf)
-    return app.menuItems.matching(predicate).firstMatch
+      format: "identifier BEGINSWITH %@ AND identifier CONTAINS[c] %@", "ModelRow-", leaf)
+    return app.buttons.matching(predicate).firstMatch
   }
 
   /// Shared with S258: `Scripts/run-chat-gui-e2e.sh` writes this fixed

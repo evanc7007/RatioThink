@@ -39,7 +39,7 @@ struct SidebarView: View {
       // only the View > Hide List command collapses it.
       if !isItemListHidden {
         Divider()
-          .padding(.horizontal, 10)
+          .padding(.horizontal, SidebarMetrics.sectionHorizontalPadding)
           .padding(.vertical, 2)
         ChatListView(
           selectedItemID: $selectedItemID,
@@ -64,11 +64,18 @@ struct SidebarView: View {
           .foregroundStyle(.primary)
         Spacer()
       }
-      .padding(.horizontal, SidebarMetrics.rowHorizontalPadding)
+      .padding(.horizontal, SidebarMetrics.sectionHorizontalPadding)
       .padding(.vertical, SidebarMetrics.rowVerticalPadding)
       .background(
+        // Match the Conversations list's `.sidebar` selection exactly: that
+        // capsule is the row frame inset by the list's per-row horizontal
+        // inset (`rowHorizontalPadding`) on each side. Inset the nav highlight
+        // by the SAME amount (not the row content, which stays at
+        // `sectionHorizontalPadding`) so a selected nav row and a selected
+        // conversation get identically positioned, identically wide highlights.
         RoundedRectangle(cornerRadius: 6)
           .fill(selection == section ? Color.accentColor.opacity(0.18) : Color.clear)
+          .padding(.horizontal, SidebarMetrics.rowHorizontalPadding)
       )
       .contentShape(Rectangle())
     }
