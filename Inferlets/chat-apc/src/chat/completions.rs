@@ -3616,7 +3616,7 @@ async fn handle_streaming(
     if json_constrained {
         let mut in_reasoning = false;
         let mut reason_dec = ReasoningDecoder::new(&model);
-        let (outcome, error_diag, disconnected) = {
+        let (outcome, error_diag, disconnected, completion_tokens) = {
             let mut sink = JsonSink::Stream {
                 em: &mut em,
                 id: &id,
@@ -3647,9 +3647,9 @@ async fn handle_streaming(
             )
             .await;
             if r1.disconnected {
-                (Outcome::Aborted, None, true)
+                (Outcome::Aborted, None, true, r1.tokens_generated)
             } else if let Some(diag) = r1.error_diag {
-                (Outcome::Aborted, Some(diag), false)
+                (Outcome::Aborted, Some(diag), false, r1.tokens_generated)
             } else {
                 // Phase 2: JSON-grammar-constrained answer. The fresh chat
                 // decoder + fresh generator continue the open assistant
@@ -3682,7 +3682,13 @@ async fn handle_streaming(
                 )
                 .await;
                 // F3: a clean-but-empty JSON answer is a contract failure.
-                json_phase2_finalize(r2)
+                // Capture both phases' generated counts before `r2` is moved
+                // into the finalizer — the usage block needs the full
+                // completion total (mirrors `handle_non_streaming`).
+                let r1_tokens = r1.tokens_generated;
+                let r2_tokens = r2.tokens_generated;
+                let (outcome, error_diag, disconnected) = json_phase2_finalize(r2);
+                (outcome, error_diag, disconnected, r1_tokens + r2_tokens)
             }
         };
         if disconnected {
@@ -3733,6 +3739,23 @@ async fn handle_streaming(
             };
             if let Err(EmitError::Serialize(e)) = em.emit_json(&frame).await {
                 eprintln!("[chat-apc] json spec_metrics serialize bug: {e}");
+            }
+        }
+        // OpenAI `stream_options.include_usage: true` — the JSON Think path
+        // returns its own terminal frames above, so the shared usage-chunk
+        // emit below is unreachable here; mirror it so structured-output
+        // streaming honors the opt-in too (completion = phase1 + phase2).
+        if req.stream_options.as_ref().is_some_and(|o| o.include_usage) {
+            let usage_chunk = ChatCompletionChunk {
+                id: &id,
+                object: "chat.completion.chunk",
+                created,
+                model: &req.model,
+                choices: Vec::new(),
+                usage: Some(Usage::build(prompt_tokens, completion_tokens, cached_tokens)),
+            };
+            if let Err(EmitError::Serialize(e)) = em.emit_json(&usage_chunk).await {
+                eprintln!("[chat-apc] json usage-chunk serialize bug: {e}");
             }
         }
         sse::emit_done_logged(&mut em, "json_stream_exit").await;
@@ -6326,6 +6349,62 @@ mod tests {
             validate_sampling(&req, DEFAULT_MAX_TOKENS + 1).unwrap(),
             DEFAULT_MAX_TOKENS
         );
+    }
+
+    #[test]
+    fn max_completion_tokens_is_max_tokens_fallback() {
+        // OpenAI/Codex-style clients send `max_completion_tokens` and omit
+        // `max_tokens`. The effective budget must come from the alias
+        // rather than silently collapsing to DEFAULT_MAX_TOKENS.
+        let req: ChatCompletionsRequest = serde_json::from_str(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "max_completion_tokens":2048}"#,
+        )
+        .unwrap();
+        assert_eq!(validate_sampling(&req, 8192).unwrap(), 2048);
+        // Still range-checked against the runtime ceiling like `max_tokens`.
+        assert_eq!(validate_sampling(&req, 1024).unwrap_err().0, "max_tokens");
+
+        // When both are present, `max_tokens` wins (the alias is only a
+        // fallback for its absence).
+        let both: ChatCompletionsRequest = serde_json::from_str(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "max_tokens":256,"max_completion_tokens":2048}"#,
+        )
+        .unwrap();
+        assert_eq!(validate_sampling(&both, 8192).unwrap(), 256);
+    }
+
+    #[test]
+    fn usage_block_shape_and_totals() {
+        // `total_tokens` is the sum of prompt + completion, and
+        // `cached_tokens` nests under `prompt_tokens_details` exactly like
+        // OpenAI's prompt-caching shape.
+        let usage = Usage::build(100, 40, 30);
+        assert_eq!(usage.total_tokens, 140);
+        let v = serde_json::to_value(&usage).unwrap();
+        assert_eq!(v["prompt_tokens"], 100);
+        assert_eq!(v["completion_tokens"], 40);
+        assert_eq!(v["total_tokens"], 140);
+        assert_eq!(v["prompt_tokens_details"]["cached_tokens"], 30);
+    }
+
+    #[test]
+    fn stream_options_include_usage_parses_and_defaults_off() {
+        // Opt-in flag round-trips; absence of `stream_options` leaves the
+        // stream byte-identical (no usage chunk emitted).
+        let on: ChatCompletionsRequest = serde_json::from_str(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "stream":true,"stream_options":{"include_usage":true}}"#,
+        )
+        .unwrap();
+        assert!(on.stream_options.as_ref().is_some_and(|o| o.include_usage));
+
+        let off: ChatCompletionsRequest = serde_json::from_str(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"stream":true}"#,
+        )
+        .unwrap();
+        assert!(off.stream_options.is_none());
     }
 
     #[test]
