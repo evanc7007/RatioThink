@@ -539,23 +539,52 @@ public final class ChatSendController: ObservableObject {
   ///  · `HTTPEngineError.engineGone` thrown synchronously by
   ///    `baseURLProvider` when the cached status is already
   ///    `.failed(.engineGone)` — the post-poll engine-death case.
-  ///  · A streaming throw (URLError, `.http`, `.stream`, …) that races ahead
-  ///    of the 1Hz poll: force a fresh helper poll and re-check. The retried
-  ///    classification covers BOTH (a) the engine died with a live helper
-  ///    (`isEngineGone`), and (b) the HELPER itself died mid-stream
-  ///    (`isHelperUnreachable`) — the App's helper-restart ladder will bring
-  ///    it back, so the turn waits for `.running` and retries instead of
-  ///    surfacing a raw transport error (#393/#412). A non-death fault leaves
-  ///    a reachable helper reporting a non-gone state, so neither flag trips
-  ///    and the error surfaces normally.
+  ///  · An engine-ANSWERED fault (`HTTPEngineError.api` / `.stream`) surfaces
+  ///    immediately via `engineAnswered` BEFORE the poll: the engine emitted a
+  ///    deliberate `{code,message}` envelope or error meta-frame, so it was not
+  ///    gone at request time and must never be reclassified as engine-gone by a
+  ///    coincident, independent death the refresh happens to observe (#335).
+  ///  · A transport-shaped throw (URLError, `.http`, `.nonHTTPResponse`, raw
+  ///    exceptions from the SSE reader, …) that races ahead of the 1Hz poll:
+  ///    force a fresh helper poll and re-check. The retried classification
+  ///    covers BOTH (a) the engine died with a live helper (`isEngineGone`),
+  ///    and (b) the HELPER itself died mid-stream (`isHelperUnreachable`) — the
+  ///    App's helper-restart ladder will bring it back, so the turn waits for
+  ///    `.running` and retries instead of surfacing a raw transport error
+  ///    (#393/#412). A non-death fault leaves a reachable helper reporting a
+  ///    non-gone state, so neither flag trips and the error surfaces normally.
   private static func classifyRecoverable(
     error: Error,
     gate: ChatRecoveryGate?
   ) async -> Bool {
     if case HTTPEngineError.engineGone = error { return true }
+    // A semantic error the engine deliberately emitted — an `.api`
+    // `{code,message}` envelope (pre-stream HTTP) or a `.stream` error
+    // meta-frame (mid-stream) — proves the engine ANSWERED, so it was not
+    // gone at request time. Key the classification on the error SHAPE, not on
+    // the engine's state now: without this guard, an independent engine death
+    // that races the forced gate refresh (so it reports `isEngineGone`) would
+    // reclassify a deterministic semantic fault as engine-gone — wasting a
+    // relaunch/retry cycle and delaying the real error by one round-trip
+    // (#335). Only transport-shaped faults (URLError, `.http`,
+    // `.nonHTTPResponse`, raw stream throws) — where the engine may NOT have
+    // answered — fall through to the gate refresh.
+    if Self.engineAnswered(error) { return false }
     guard let gate else { return false }
     await gate.refreshStatus()
     return gate.isEngineGone || gate.isHelperUnreachable
+  }
+
+  /// True for the two `HTTPEngineError` shapes the engine emits only when it
+  /// answered the request: the pre-stream `.api` envelope and the mid-stream
+  /// `.stream` meta-frame. Both carry an engine-authored `code`/`message`, so
+  /// the engine was demonstrably alive at request time — these are never
+  /// engine-death faults regardless of the engine's state now (#335).
+  private static func engineAnswered(_ error: Error) -> Bool {
+    switch error {
+    case HTTPEngineError.api, HTTPEngineError.stream: return true
+    default: return false
+    }
   }
 
   /// Clamp a profile `max_tokens` DOWN to the launched engine's effective
