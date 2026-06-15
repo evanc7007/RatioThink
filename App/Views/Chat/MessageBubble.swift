@@ -28,17 +28,40 @@ struct MessageBubble: View {
   /// (retry waits for the active stream to end) and `TranscriptView` passes
   /// nil for rows where no retained prefix exists to resend.
   var onRetry: (() -> Void)? = nil
+  /// Edit-and-resend hook (#624), user rows only. Non-nil only for an
+  /// editable prior user turn (the transcript passes `nil` while a turn is
+  /// streaming), which is what gates the Edit affordance. The closure
+  /// receives the new text and forks the conversation from here.
+  var onEdit: ((String) -> Void)? = nil
+
+  @State private var isEditing = false
+  @State private var editText = ""
 
   var body: some View {
     switch message.role {
     case .user:
       HStack {
         Spacer(minLength: 60)
-        bubble(background: Color.accentColor,
-               foreground: .white,
-               alignment: .trailing)
+        if isEditing {
+          editor
+        } else {
+          bubble(background: Color.accentColor,
+                 foreground: .white,
+                 alignment: .trailing)
+        }
       }
-      .contextMenu { copyMenuItems }
+      .contextMenu {
+        copyMenuItems
+        // #624: edit-and-fork from this user turn. Hidden while editing or
+        // when the scaffold withholds the hook (a stream is in flight).
+        if !isEditing, onEdit != nil {
+          Divider()
+          Button(action: beginEditing) {
+            Label("Edit", systemImage: "pencil")
+          }
+          .accessibilityIdentifier("message.user.edit")
+        }
+      }
     case .assistant:
       HStack {
         VStack(alignment: .leading, spacing: 6) {
@@ -131,6 +154,46 @@ struct MessageBubble: View {
     }
   }
 
+  // MARK: - inline edit (#624)
+
+  private func beginEditing() {
+    editText = message.content
+    isEditing = true
+  }
+
+  private func commitEdit() {
+    let trimmed = editText.trimmingCharacters(in: .whitespacesAndNewlines)
+    isEditing = false
+    guard !trimmed.isEmpty else { return }
+    onEdit?(trimmed)
+  }
+
+  /// Inline editor that replaces the user bubble while editing. Saving
+  /// forks the conversation from this turn and re-runs it; Cancel restores
+  /// the bubble untouched. Right-aligned to match the user bubble.
+  private var editor: some View {
+    VStack(alignment: .trailing, spacing: 6) {
+      TextEditor(text: $editText)
+        .font(.body)
+        .frame(minHeight: 60, maxHeight: 200)
+        .padding(6)
+        .background(
+          RoundedRectangle(cornerRadius: 10, style: .continuous)
+            .strokeBorder(Color.accentColor.opacity(0.6))
+        )
+        .accessibilityIdentifier("message.edit.field")
+      HStack(spacing: 8) {
+        Button("Cancel") { isEditing = false }
+          .accessibilityIdentifier("message.edit.cancel")
+        Button("Save & Resend") { commitEdit() }
+          .keyboardShortcut(.return, modifiers: .command)
+          .buttonStyle(.borderedProminent)
+          .accessibilityIdentifier("message.edit.save")
+      }
+    }
+    .frame(maxWidth: .infinity, alignment: .trailing)
+  }
+
   private func bubble(background: Color, foreground: Color, alignment: HorizontalAlignment) -> some View {
     Markdown(message.content)
       .markdownTextStyle(\.text) { ForegroundColor(foreground) }
@@ -148,7 +211,6 @@ struct MessageBubble: View {
       .frame(maxWidth: .infinity, alignment: alignment == .trailing ? .trailing : .leading)
   }
 }
-
 
 // MARK: - layout frame reporting
 

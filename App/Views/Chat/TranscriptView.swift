@@ -21,6 +21,11 @@ struct TranscriptView: View {
   /// passes nil while this chat has a stream in flight, so retry waits for
   /// the active stream to end.
   var onRetryTurn: ((UUID) -> Void)? = nil
+  /// #624: invoked with a prior USER message id + its edited text to fork
+  /// the conversation from there and re-run it. Nil (the default) hides the
+  /// edit affordance — the scaffold passes nil while a stream is in flight,
+  /// so an edit can't race the active turn.
+  var onEditUserTurn: ((UUID, String) -> Void)? = nil
 
   var body: some View {
     let snapshot = TranscriptSnapshot(messages: chat.messages)
@@ -42,7 +47,8 @@ struct TranscriptView: View {
           }
           ForEach(snapshot.items) { item in
             MessageBubble(message: item,
-                          onRetry: retryAction(for: item, retryableIDs: retryableIDs))
+                          onRetry: retryAction(for: item, retryableIDs: retryableIDs),
+                          onEdit: editAction(for: item))
               .id(item.id)
           }
           // Sentinel row so `scrollTo(.bottomSentinel)` lands at the
@@ -69,6 +75,14 @@ struct TranscriptView: View {
     guard let onRetryTurn, retryableIDs.contains(item.id) else { return nil }
     let id = item.id
     return { onRetryTurn(id) }
+  }
+
+  /// #624: the row's edit-and-fork closure, or nil for non-user rows / when
+  /// the scaffold withholds the hook (a stream is in flight).
+  private func editAction(for item: ChatMessageItem) -> ((String) -> Void)? {
+    guard let onEditUserTurn, item.role == .user else { return nil }
+    let id = item.id
+    return { newText in onEditUserTurn(id, newText) }
   }
 
   private func scrollToBottom(_ proxy: ScrollViewProxy) {
