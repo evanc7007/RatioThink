@@ -33,7 +33,7 @@ final class EngineTerminationWiringTests: XCTestCase {
         got.fulfill()
       },
       tailWriter: { lines in capturedTail.withLock { $0 = lines } },
-      guardrailBytes: 8_000_000_000)
+      guardrailBytes: { 8_000_000_000 })
 
     _ = host.start(makeSpec())
     await fulfillment(of: [got], timeout: 3)
@@ -56,11 +56,47 @@ final class EngineTerminationWiringTests: XCTestCase {
       livenessInterval: 0.02, livenessFailureThreshold: 1,
       relaunchPolicy: PieEngineHost.RelaunchPolicy(maxAttempts: 0),
       terminationSink: { t in captured.withLock { $0 = t }; got.fulfill() },
-      guardrailBytes: 8_000_000_000)
+      guardrailBytes: { 8_000_000_000 })
     _ = host.start(makeSpec())
     await fulfillment(of: [got], timeout: 3)
     host.stop()
     XCTAssertEqual(captured.withLock { $0 }?.cause, .oom)
+  }
+
+  // #604: the OOM ceiling is a provider read at DEATH time, not a value
+  // snapshotted at construction OR at monitor start. The dial is lowered below
+  // the engine's RSS AFTER `start()` returns and the liveness monitor is
+  // already ticking, so the verdict flipping to `.oom` proves the live
+  // provider is consulted at the moment of death — guarding against both an
+  // eager-at-construction capture and a future eager-snapshot-at-start
+  // regression. With the original initial ceiling (above RSS) this SIGKILL
+  // would classify as `.killed`.
+  func test_guardrailProvider_isReadAtDeathTime_notConstruction() async throws {
+    let captured = OSAllocatedUnfairLock<EngineTermination?>(initialState: nil)
+    let got = expectation(description: "termination captured")
+    // ExitingSession is alive on tick 1 and dies on tick 2, so the dial change
+    // below lands while the monitor is genuinely running mid-lifetime.
+    let session = ExitingSession(snapshot: (.uncaughtSignal, SIGKILL),
+                                 tail: [], rss: 9_000_000_000)
+    // Both construction- and start-time ceilings sit ABOVE the 9 GB RSS ⇒
+    // would be `.killed` if the provider were evaluated at either moment.
+    let ceiling = OSAllocatedUnfairLock<Int64>(initialState: 100_000_000_000)
+    let host = PieEngineHost(
+      launcher: { _ in (port: EnginePort(61013), session: session) },
+      livenessInterval: 0.02, livenessFailureThreshold: 1,
+      relaunchPolicy: PieEngineHost.RelaunchPolicy(maxAttempts: 0),
+      terminationSink: { t in captured.withLock { $0 = t }; got.fulfill() },
+      guardrailBytes: { ceiling.withLock { $0 } })
+    _ = host.start(makeSpec())
+    // Operator lowers the dial mid-run, AFTER the monitor is ticking, BELOW
+    // the RSS — no Helper restart.
+    ceiling.withLock { $0 = 8_000_000_000 }
+    await fulfillment(of: [got], timeout: 3)
+    host.stop()
+
+    let t = try XCTUnwrap(captured.withLock { $0 })
+    XCTAssertEqual(t.cause, .oom)
+    XCTAssertEqual(t.guardrailBytes, 8_000_000_000)
   }
 
   func test_livenessFirstTickGone_SIGKILL_aboveGuardrail_isLikelyOOM() async throws {
@@ -73,7 +109,7 @@ final class EngineTerminationWiringTests: XCTestCase {
       livenessInterval: 0.02, livenessFailureThreshold: 1,
       relaunchPolicy: PieEngineHost.RelaunchPolicy(maxAttempts: 0),
       terminationSink: { t in captured.withLock { $0 = t }; got.fulfill() },
-      guardrailBytes: 8_000_000_000)
+      guardrailBytes: { 8_000_000_000 })
     _ = host.start(makeSpec())
     await fulfillment(of: [got], timeout: 3)
     host.stop()
@@ -94,7 +130,7 @@ final class EngineTerminationWiringTests: XCTestCase {
       livenessInterval: 0.02, livenessFailureThreshold: 1,
       relaunchPolicy: PieEngineHost.RelaunchPolicy(maxAttempts: 0),
       terminationSink: { t in captured.withLock { $0 = t }; got.fulfill() },
-      guardrailBytes: 8_000_000_000)
+      guardrailBytes: { 8_000_000_000 })
     _ = host.start(makeSpec())
     await fulfillment(of: [got], timeout: 3)
     host.stop()
@@ -134,7 +170,7 @@ final class EngineTerminationWiringTests: XCTestCase {
       relaunchPolicy: PieEngineHost.RelaunchPolicy(maxAttempts: 0),
       terminationSink: { t in captured.withLock { $0 = t }; got.fulfill() },
       tailWriter: { lines in tail.withLock { $0 = lines } },
-      guardrailBytes: 8_000_000_000)
+      guardrailBytes: { 8_000_000_000 })
     _ = host.start(makeSpec())
     await fulfillment(of: [got], timeout: 3)
     let t = try XCTUnwrap(captured.withLock { $0 })
@@ -157,7 +193,7 @@ final class EngineTerminationWiringTests: XCTestCase {
       launcher: launcher, livenessInterval: 0,
       relaunchPolicy: PieEngineHost.RelaunchPolicy(maxAttempts: 0),
       terminationSink: { t in captured.withLock { $0 = t }; got.fulfill() },
-      guardrailBytes: 8_000_000_000)
+      guardrailBytes: { 8_000_000_000 })
     _ = host.start(makeSpec())
     await fulfillment(of: [got], timeout: 3)
 
@@ -540,7 +576,7 @@ final class EngineTerminationWiringTests: XCTestCase {
         termContinuation.yield(t)
         termContinuation.finish()
       },
-      guardrailBytes: 8_000_000_000)
+      guardrailBytes: { 8_000_000_000 })
     let spec = try PieControlLauncher.LaunchSpec(
       pieBinary: script,
       wasmURL: tmp.appendingPathComponent("chat-apc.wasm"),
