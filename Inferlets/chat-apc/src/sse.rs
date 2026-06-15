@@ -123,8 +123,8 @@ impl Emitter {
 // "eta_s":…}` is part of the wire schema but not emitted in v1 —
 // pie loads models at engine boot, so the inferlet has no in-process
 // progress source. The frame returns when pie surfaces a load-progress
-// WIT import (tracked in 's follow-up); until then handlers skip
-// directly to `ModelReady`. Re-add `ModelLoading` here when that lands.
+// WIT import (a follow-up); until then handlers skip directly to
+// `ModelReady`. Re-add `ModelLoading` here when that lands.
 
 /// `data: {"event":"model_ready"}` — terminal meta-frame; transitions
 /// the GUI's loading indicator to "ready" and (for chat-completions)
@@ -168,9 +168,9 @@ pub struct SseError<'a> {
     pub event: &'static str,
     pub code: &'a str,
     pub message: &'a str,
-    /// See `SseWarning::distinct_modes`. Same N3 motivation: surface
-    /// raw counts as structured fields when the diag carries dedup-
-    /// capped state, so log shippers / dashboards don't parse the
+    /// Set via [`SseError::with_dedup_counts`]. Same N3 motivation:
+    /// surface raw counts as structured fields when the diag carries
+    /// dedup-capped state, so log shippers / dashboards don't parse the
     /// message string.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub distinct_modes: Option<usize>,
@@ -208,7 +208,7 @@ pub async fn emit_done(em: &mut Emitter) -> Result<(), EmitError> {
 /// OpenAI/JS SDK iterator pinned on `[DONE]` hangs until socket
 /// timeout with zero host signal.
 ///
-/// ## Embedder contract for diagnostic visibility (G6 / H5, )
+/// ## Embedder contract for diagnostic visibility (G6 / H5)
 ///
 /// Every `eprintln!` in this crate — here, `now_unix_secs` (clock
 /// skew), `id_seed` (entropy fallback), the F7 body-read site, the
@@ -216,7 +216,7 @@ pub async fn emit_done(em: &mut Emitter) -> Result<(), EmitError> {
 /// dropped-on-disconnect site, and the F6 serialize-recover
 /// sites — emits to wasm `stderr` via `wasi:cli/stderr`.
 ///
-/// **Verified embedder reality (, vs Vendor/pie @ b4601f5):** the
+/// **Verified embedder reality (vs Vendor/pie @ b4601f5):** the
 /// daemon request path does NOT route component stderr to operators.
 /// `runtime/src/daemon.rs::handle_request` instantiates each
 /// per-request component with `capture_outputs = false`
@@ -231,7 +231,8 @@ pub async fn emit_done(em: &mut Emitter) -> Result<(), EmitError> {
 /// deployment. The earlier "subscribe to `ProcessEvent::Stderr` in
 /// PieControlLauncher" plan is INFEASIBLE for daemons: there are no
 /// such events to subscribe to. Fixing this at the source (route
-/// daemon stderr to pie-server's own log) is tracked in .
+/// daemon stderr to pie-server's own log) is tracked as a pie-side
+/// follow-up.
 ///
 /// ## In-band path is the production contract (I5)
 ///
@@ -262,10 +263,10 @@ pub async fn emit_done(em: &mut Emitter) -> Result<(), EmitError> {
 /// instantiating the guest, so a real transport-read failure surfaces
 /// as pie's host-level error at `daemon.rs:209`, never reaching
 /// `read_body` -> `BodyError::Transport`. Daemon-side visibility of
-/// such failures is the pie-side  work.
+/// such failures is the pie-side follow-up work.
 ///
 /// Residual stderr-ONLY sites — structurally undeliverable in-band,
-/// so dev-only by nature (NOT blocked on ):
+/// so dev-only by nature (not blocked on the pie-side follow-up):
 /// - `emit_done_logged` Serialize failures (post-stream; the SSE
 ///   channel is already closed). NOTE: post-stream *IO* write failures
 ///   do NOT reach stderr either — `From<io::Error>` (above) collapses
@@ -277,7 +278,7 @@ pub async fn emit_done(em: &mut Emitter) -> Result<(), EmitError> {
 /// - The H4 `tool_decode_disabled` meta-frame Disconnected branch
 ///   (peer is gone by definition).
 ///
-///  (pie-side daemon stderr surfacing) would make even these
+/// The pie-side daemon-stderr surfacing would make even these
 /// dev-only sites operator-visible without any chat-apc change, and
 /// fix the same gap for every other inferlet.
 pub async fn emit_done_logged(em: &mut Emitter, site: &str) {
@@ -331,7 +332,7 @@ pub fn json_error(
 /// `Transport` carries the underlying `io::ErrorKind` so operators
 /// debugging slowloris vs TLS reset vs mid-body abort can tell them
 /// apart — collapsing all transport failures into a single opaque
-/// variant made root cause untraceable. : the kind maps to a
+/// variant made root cause untraceable. The kind maps to a
 /// stable `error.code` in the in-band 400 envelope (`body_error_response`
 /// → `transport_error_code`) on the streaming-guest path. On the
 /// pie-mac daemon path this arm is unreachable — pie collects the
@@ -375,14 +376,14 @@ pub async fn read_body(
                 let kind = e.kind();
                 // F7: log the full error to stderr for dev/CLI triage
                 // (`pie run` only — discarded for daemons, see
-                // emit_done_logged doc + ). The discriminating
+                // emit_done_logged doc). The discriminating
                 // `io::ErrorKind` rides in-band in the 400 envelope via
                 // `body_error_response` on the streaming-guest path. On
                 // the daemon path this arm is unreachable: pie collects
                 // the body host-side before instantiating the guest
                 // (`Vendor/pie/runtime/src/daemon.rs:207`), so a
                 // transport failure becomes pie's host-level error, not
-                // this 400 ( covers daemon-side visibility).
+                // this 400 (daemon-side visibility is a pie-side follow-up).
                 eprintln!("[chat-apc] body read failed: kind={kind:?} err={e}");
                 return Err(BodyError::Transport(kind));
             }
@@ -414,7 +415,7 @@ pub fn body_error_response(err: BodyError) -> Response<wstd::http::body::Bounded
 /// guarantee, so we pin the kinds we care about to fixed snake_case
 /// codes and collapse everything else to `transport_error`.
 ///
-/// : this only fires on the streaming-guest path (`pie run` / a
+/// This only fires on the streaming-guest path (`pie run` / a
 /// guest that reads its own body). It does NOT reach the pie-mac
 /// daemon path: pie pre-collects the request body host-side
 /// (`Vendor/pie/runtime/src/daemon.rs:207`) before the guest runs, so
@@ -447,7 +448,7 @@ mod tests {
 
     #[test]
     fn transport_error_code_is_stable_and_machine_branchable() {
-        // : SDKs discriminate transport modes on `error.code`, NOT on
+        // SDKs discriminate transport modes on `error.code`, NOT on
         // free-text in `message`. Pin each known kind to its stable
         // snake_case code so a future refactor can't silently drift the
         // wire contract.
