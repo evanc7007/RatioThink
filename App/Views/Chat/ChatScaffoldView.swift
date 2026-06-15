@@ -38,7 +38,7 @@ struct ChatScaffoldView: View {
   /// popover so they derive the resident/offline distinction from the single
   /// published `indicator`.
   @EnvironmentObject private var engineLifecycle: EngineLifecycle
-  /// #621: per-profile speculation telemetry sink. Each "Fast Think" turn's
+  /// #621: per-profile speculation telemetry sink. Each "Repeat Boost" turn's
   /// terminal `spec_metrics` is recorded here for the ProfileEditor badge.
   @EnvironmentObject private var specMetricsStore: SpecMetricsStore
   /// #616: the app-scoped engine coordinator — owns the engine-action
@@ -869,8 +869,8 @@ struct ChatScaffoldView: View {
         profileDefault: profileStore.systemPrompt(forProfileID: viewModel.selectedProfileID),
         transientOverride: viewModel.systemPromptOverride),
       profileID: viewModel.selectedProfileID,
-      // #426: thread the selected profile's Fast Think (speculative-decoding)
-      // settings into the request — a Fast Think profile attaches speculation
+      // #426: thread the selected profile's Repeat Boost (speculative-decoding)
+      // settings into the request — a Repeat Boost profile attaches speculation
       // + forces greedy; a normal or tree-of-thought profile carries none.
       // Built once here so both the ToT dispatch and the normal send get it.
       speculation: profileStore.speculation(forProfileID: viewModel.selectedProfileID),
@@ -1142,7 +1142,7 @@ struct ChatScaffoldView: View {
   /// Profile ids the toolbar picker offers — the SAME set the Settings
   /// editor lists (every valid `*.toml`), derived live from the store so a
   /// user can actually switch to a non-`chat` profile (e.g. the seeded
-  /// `tree-of-thought` or a `fast-think`). The previous default `["chat"]`
+  /// `tree-of-thought` or a `repeat-boost`). The previous default `["chat"]`
   /// was never wired to `ProfileStore`, so the picker only ever showed
   /// `chat`. Re-read each render: `ProfileStore` publishes nothing, but
   /// this view re-renders on the ~1 Hz engine-status publishes, so a newly
