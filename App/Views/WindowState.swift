@@ -36,6 +36,33 @@ final class WindowState: ObservableObject {
   @Published var isItemListHidden: Bool = false
   @Published var selectedSection: SidebarSection? = .chats
   @Published var selectedItemID: UUID? = nil
+  /// One-shot handoff for the edit→fork flow (#624). Set to the new
+  /// forked chat's id alongside `selectedItemID`; the freshly-mounted
+  /// `ChatScaffoldView` for that id consumes it once to kick off the
+  /// resent assistant turn, then clears it. Lives here (not on the fork
+  /// primitive) because the send must run in the NEW scaffold instance —
+  /// the one that owns the resent chat's `ChatSendController`.
+  @Published var pendingForkResendChatID: UUID? = nil
+
+  /// Route the shell to a freshly-forked chat and arm its one-shot resend
+  /// (#624). The new scaffold consumes the signal via
+  /// `consumePendingForkResend(_:)` on mount.
+  func beginForkResend(to chatID: UUID) {
+    pendingForkResendChatID = chatID
+    selectedSection = .chats
+    selectedItemID = chatID
+  }
+
+  /// Consume the fork-resend handoff for `chatID`, exactly once. Returns
+  /// `true` (and clears the flag) on the first call whose id matches the
+  /// armed chat; every later call — re-mounts, sibling scaffolds, the
+  /// source chat — returns `false`. This is what guarantees the resend
+  /// fires a single time. (#624)
+  func consumePendingForkResend(_ chatID: UUID) -> Bool {
+    guard pendingForkResendChatID == chatID else { return false }
+    pendingForkResendChatID = nil
+    return true
+  }
 
   func toggleSidebar() {
     columnVisibility = (columnVisibility == .all) ? .doubleColumn : .all

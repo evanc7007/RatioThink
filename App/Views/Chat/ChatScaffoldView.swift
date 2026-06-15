@@ -49,6 +49,9 @@ struct ChatScaffoldView: View {
   /// state (`engineActionError` / `helperBlock`) stays here; the coordinator
   /// performs the engine call and re-throws.
   @EnvironmentObject private var engineCoordinator: ChatEngineCoordinator
+  /// App-scoped navigation state — set on an edit→fork (#624) to route the
+  /// shell to the new chat and hand it the one-shot resend signal.
+  @EnvironmentObject private var windowState: WindowState
   /// Shown when a send is blocked because no model resolves yet. #326
   /// decides the model-availability action (Load / Download / unavailable
   /// via the live `noModelAction`); #397 layers the engine/model lifecycle
@@ -472,7 +475,13 @@ struct ChatScaffoldView: View {
           // chat's stream.
           onRetryTurn: sendCoordinator.isInFlight(chatID)
             ? nil
-            : { messageID in requestRetry(for: chat, messageID: messageID) }
+            : { messageID in requestRetry(for: chat, messageID: messageID) },
+          // #624: edit a prior user turn → non-destructive fork-and-resend.
+          // Withheld (nil) while this chat is streaming, same as retry, so an
+          // edit can't race the active turn.
+          onEditUserTurn: sendCoordinator.isInFlight(chatID)
+            ? nil
+            : { messageID, newText in forkAndResend(messageID: messageID, newContent: newText, in: chat) }
         )
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         ComposerView(
@@ -637,6 +646,25 @@ struct ChatScaffoldView: View {
       // this view appeared (no .onChange fires) — evaluate the launch ask
       // here too; the once-flag keeps it from double-prompting.
       maybePromptEngineStartOnLaunch()
+    }
+    // #624: a fork-and-resend navigates here (a freshly-mounted scaffold,
+    // keyed `.id(chatID)` by `DetailView`). Consume the one-shot handoff
+    // once per mount and kick off the resent assistant turn through the
+    // SAME `sendAssistantTurn` path a normal send uses (recovery-gate and
+    // no-model gate ride it for free). Runs in THIS scaffold so the turn is
+    // owned by the new chat's app-scoped controller.
+    .task(id: chat.id) {
+      guard windowState.consumePendingForkResend(chat.id) else { return }
+      // Seed the toolbar profile from the persisted chat BEFORE the resend.
+      // `sendAssistantTurn` resolves every profile-derived field (sampling,
+      // system prompt, speculation, response format) from
+      // `viewModel.selectedProfileID`, and SwiftUI does NOT guarantee
+      // `.onAppear` (which also seeds it) runs before this sibling `.task`.
+      // Without this, a forked chat on a non-default profile (e.g. Fast
+      // Think) could resolve against the default "chat" profile and silently
+      // lose its speculation. Seeding here makes the resend race-free.
+      viewModel.selectedProfileID = chat.profileID
+      sendAssistantTurn(for: chat)
     }
     .onChange(of: viewModel.selectedProfileID) { _, new in
       // Mirror toolbar swaps back into the persistent chat — the
@@ -843,6 +871,32 @@ struct ChatScaffoldView: View {
     }
   }
 
+  /// Edit a prior user turn and re-run the conversation from there (#624).
+  /// Non-destructive FORK: copy `chat` up to and including the edited message
+  /// (with `newContent` substituted) into a new chat, navigate to it, and let
+  /// the freshly-mounted scaffold fire the resend via the `pendingForkResend`
+  /// handoff. The source chat is left fully intact.
+  private func forkAndResend(messageID: UUID, newContent: String, in chat: Chat) {
+    // Defensive: the affordance is already hidden mid-stream (the scaffold
+    // passes a nil hook then), but never fork while this chat is in flight.
+    guard !sendCoordinator.isInFlight(chatID) else { return }
+    let trimmed = newContent.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return }
+    guard let message = chat.messages.first(where: { $0.id == messageID }) else { return }
+    guard let newID = ChatFork.fork(
+      chat: chat,
+      at: message,
+      newContent: trimmed,
+      in: modelContext,
+      persistenceStatus: persistenceStatus,
+      contextLabel: "ChatScaffoldView.forkAndResend"
+    ) else { return }
+    // Hand the resend to the new scaffold, then navigate. `DetailView`
+    // remounts `ChatScaffoldView` for `newID`, whose `.task(id:)` consumes
+    // the signal and sends.
+    windowState.beginForkResend(to: newID)
+  }
+
   private func sendAssistantTurn(for chat: Chat) {
     // Defensive: ComposerView only invokes this after `shouldAllowSend`
     // passed, but never ask the engine to load a model the user did not
@@ -927,7 +981,11 @@ struct ChatScaffoldView: View {
       // Reuses the `options` built above (now carrying #426 speculation +
       // #572 response_format and the selected profile id for Cacheback
       // sidecar scoping), so the normal send and the ToT dispatch share one
-      // options value.
+      // options value. The forked-resend profile race (#624) is fixed at the
+      // source: the resend `.task` seeds `viewModel.selectedProfileID =
+      // chat.profileID` before calling this, so every profile-derived field
+      // here (sampling, system prompt, speculation, response format) resolves
+      // against the forked chat's real profile.
       options: options,
       // `EngineStatusStore` conforms to `ChatRecoveryGate`; passing it
       // here lets the send pipeline classify a mid-stream
