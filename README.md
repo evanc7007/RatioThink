@@ -8,7 +8,7 @@
 
 ![macOS 14+](https://img.shields.io/badge/macOS-14%2B-black?logo=apple)
 ![Apple Silicon](https://img.shields.io/badge/Apple%20Silicon-arm64-black)
-![Version](https://img.shields.io/badge/version-v0.1.4-blue)
+![Version](https://img.shields.io/badge/version-v0.1.5-blue)
 ![License](https://img.shields.io/badge/license-Apache--2.0-green)
 
 </div>
@@ -121,11 +121,8 @@ metadata only. Flags: `--window <dur>` (Unified Logging look-back, default
 
 ## Known issues
 
-A few known issues in the v0.1.4 release, with workarounds:
+A few known issues in the v0.1.5 release, with workarounds:
 
-- **Deleting a model that a profile uses as its default may need a restart to fully settle.**
-  If a deleted model still appears selected, restart RatioThink and choose a new profile model
-  ([tracking PR](https://github.com/shsym/RatioThink/pull/62)).
 - **Some first-install chat polish is still pending.** If the initial prompt or composer layout
   looks odd, resize the window or start a new chat; the follow-up polish is tracked in
   [PR #59](https://github.com/shsym/RatioThink/pull/59).

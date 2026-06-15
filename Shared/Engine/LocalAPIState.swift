@@ -316,7 +316,7 @@ public struct LocalAPIRoute: Equatable, Identifiable {
 ///    requests are blocked by the browser.
 ///
 /// These are constants because they are fixed by the app's launch contract
-/// for 0.1.4 (no per-endpoint configuration). If the launch contract gains
+/// for 0.1.5 (no per-endpoint configuration). If the launch contract gains
 /// a knob, this type becomes a computed projection of it.
 public struct EngineHTTPPosture: Equatable {
   public let bindMode: EngineHTTPBindMode
