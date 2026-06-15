@@ -167,6 +167,7 @@ async fn dispatch_chat_apc(dispatch: InferletDispatch, res: Responder) -> Finish
         temperature: input.temperature,
         top_p: input.top_p,
         max_tokens: input.max_tokens,
+        max_completion_tokens: None,
         tools: input.tools,
         tool_choice: input.tool_choice,
         speculation: input.speculation,

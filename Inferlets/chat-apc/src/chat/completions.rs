@@ -164,6 +164,12 @@ pub struct ChatCompletionsRequest {
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
     pub max_tokens: Option<usize>,
+    /// OpenAI's newer alias for `max_tokens` (the only field current
+    /// OpenAI/Codex-style clients send). Used as a fallback when
+    /// `max_tokens` is absent so those clients don't silently fall back
+    /// to `DEFAULT_MAX_TOKENS`.
+    #[serde(default)]
+    pub max_completion_tokens: Option<usize>,
     /// OpenAI-shape tool list. Each entry is `{type:"function",
     /// function:{name, description?, parameters}}`. Forwarded through
     /// the chat template via `inferlet::tools::equip_prefix`.
@@ -3160,7 +3166,7 @@ fn validate_sampling(
             return Err(("top_p", format!("top_p must be in (0.0, {MAX_TOP_P}]")));
         }
     }
-    let effective_max_tokens = match req.max_tokens {
+    let effective_max_tokens = match req.max_tokens.or(req.max_completion_tokens) {
         Some(n) if n == 0 || n > max_output_ceiling => {
             return Err((
                 "max_tokens",
