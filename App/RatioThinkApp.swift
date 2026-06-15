@@ -81,6 +81,13 @@ struct RatioThinkApp: App {
   /// reads it for the read-only "last run" badge.
   @StateObject private var specMetricsStore = SpecMetricsStore()
 
+  /// #587 resume trigger: re-arm the (possibly paused) engine-status poll
+  /// loop when the app returns to the foreground, so the user always sees a
+  /// fresh status the moment they look at the window. A no-op when the loop
+  /// is already running; one extra poll then re-pause when no session is
+  /// expected.
+  @Environment(\.scenePhase) private var scenePhase
+
   @MainActor
   init() {
     Self.writeArtifactPathProbeIfRequested()
@@ -599,6 +606,12 @@ struct RatioThinkApp: App {
         // #420: route the menu-bar Helper's `ratiothink://settings` deep
         // link straight to the Settings scene (not just app-foreground).
         .handlesSettingsDeepLink(settingsNavigation: settingsNavigation)
+        // #587: re-arm the adaptive poll loop on foreground. `start()` is
+        // idempotent, so this is free when the loop is already running and
+        // wakes it from a paused (stopped/idle) state to refresh status.
+        .onChange(of: scenePhase) { _, phase in
+          if phase == .active { engineStatusStore.start() }
+        }
         .frame(minWidth: 900, minHeight: 600)
     }
     .modelContainer(chatContainer)
