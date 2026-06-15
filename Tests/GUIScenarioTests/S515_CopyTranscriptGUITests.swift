@@ -4,14 +4,14 @@ import XCTest
 /// #515: canonical copy path for a rendered transcript turn.
 ///
 /// MarkdownUI fragments one assistant message into multiple native `Text`
-/// blocks (paragraph / list / fenced code), and macOS `.textSelection`
-/// cannot drag-select across them — so the supported copy path is the
-/// bubble's context menu, backed by the message's canonical source text
-/// (`MessageCopyPlan`). This seated GUI E2E drives the real app against the
-/// deterministic stream harness (mode=normal) whose reply IS multi-section
-/// Markdown, invokes context-menu "Copy Answer" on the rendered bubble, and
-/// asserts `NSPasteboard.general` holds the verbatim source spanning every
-/// section — code fence included.
+/// blocks (paragraph / list / fenced code), and a right-click on the
+/// selectable text surfaces AppKit's own menu — so the supported source-copy
+/// path is the explicit "Copy" button under the answer (`message.copyAnswer`),
+/// which copies the message's verbatim canonical source. This seated GUI E2E
+/// drives the real app against the deterministic stream harness (mode=normal)
+/// whose reply IS multi-section Markdown, clicks that Copy button on the
+/// rendered bubble, and asserts `NSPasteboard.general` holds the verbatim
+/// source spanning every section — code fence included.
 ///
 /// Run via `Scripts/run-copy-gui-e2e.sh` (starts the harness, writes the
 /// config file, runs this suite).

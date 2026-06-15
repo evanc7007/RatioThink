@@ -15,7 +15,7 @@ import XCTest
 final class SelectableMarkdownTextTests: XCTestCase {
 
   /// The exact multi-section shape MarkdownUI split into separate selectable
-  /// blocks (mirrors `MessageCopyPlanTests`).
+  /// blocks — now rendered into one selectable surface.
   private let multiSection = """
     Intro paragraph.
 
@@ -133,6 +133,22 @@ final class SelectableMarkdownTextTests: XCTestCase {
     XCTAssertGreaterThan(wide, 0)
     XCTAssertGreaterThanOrEqual(narrow, wide, "a narrower width must wrap at least as tall")
     XCTAssertEqual(SelectableMarkdownText.contentHeight(forAttributed: attributed, containerWidth: 0), 0)
+  }
+
+  func test_layoutWidth_hugsShortContentAndCapsLongContent() {
+    let short = MarkdownAttributedString.build("hello", foreground: .labelColor)
+    let shortWidth = SelectableMarkdownText.layoutWidth(forAttributed: short, maxWidth: 400)
+    XCTAssertGreaterThan(shortWidth, 0)
+    XCTAssertLessThan(shortWidth, 100,
+                      "a short word must hug to a small width, not stretch to the cap")
+
+    let long = MarkdownAttributedString.build(
+      String(repeating: "wide unwrapped content ", count: 40), foreground: .labelColor)
+    XCTAssertEqual(SelectableMarkdownText.layoutWidth(forAttributed: long, maxWidth: 400), 400,
+                   "content wider than the cap clamps to maxWidth, then wraps")
+
+    XCTAssertEqual(SelectableMarkdownText.layoutWidth(forAttributed: short, maxWidth: 0), 1,
+                   "a non-positive cap floors to 1")
   }
 
   // MARK: parse-failure fallback

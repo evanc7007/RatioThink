@@ -27,13 +27,12 @@ struct SelectableMarkdownText: View {
   /// primary on fill). Applied as the default text color for every non-link
   /// run so the attributed string honors the role styling.
   let foreground: NSColor
-
-  /// The view's live laid-out width, captured from SwiftUI via a background
-  /// `GeometryReader`. Height is derived from the rendered attributed string
-  /// measured at this width — computed where both inputs are known, avoiding
-  /// the `NSTextView` round-trip whose width isn't valid yet at
-  /// `updateNSView` time (the same timing trap `ComposerView` documents).
-  @State private var width: CGFloat = 0
+  /// Upper bound on the surface's laid-out width. The view hugs its content's
+  /// intrinsic (unwrapped) width and only grows to `maxWidth`, then wraps — so
+  /// a short message ("hello") renders a small bubble, not a full-width one,
+  /// and a long one wraps at `maxWidth`. The bubble alignment (left/right) is
+  /// owned by the enclosing row's `HStack` + `Spacer`.
+  let maxWidth: CGFloat
 
   private var attributed: NSAttributedString {
     MarkdownAttributedString.build(markdown, foreground: foreground)
@@ -41,14 +40,29 @@ struct SelectableMarkdownText: View {
 
   var body: some View {
     let rendered = attributed
+    // Drive width explicitly so the surface hugs content: the NSTextView is a
+    // greedy NSViewRepresentable that would otherwise fill the proposed width.
+    // Height is the rendered string's real wrapped height at that same width
+    // (the `contentHeight` measurement the live text view reproduces).
+    let width = Self.layoutWidth(forAttributed: rendered, maxWidth: maxWidth)
     return SelectableMarkdownTextView(attributed: rendered)
-      .frame(height: Self.contentHeight(forAttributed: rendered, containerWidth: width))
-      .background(
-        GeometryReader { geo in
-          Color.clear.preference(key: SelectableMarkdownWidthKey.self, value: geo.size.width)
-        }
-      )
-      .onPreferenceChange(SelectableMarkdownWidthKey.self) { width = $0 }
+      .frame(width: width,
+             height: Self.contentHeight(forAttributed: rendered, containerWidth: width))
+  }
+
+  /// The surface's laid-out width: the content's intrinsic single-line
+  /// (unwrapped) width clamped to `(0, maxWidth]`. Wrapping happens only when
+  /// the content is wider than `maxWidth`, so short text yields a snug bubble.
+  /// A hard newline in the content makes the unwrapped width the longest
+  /// line's width (still capped at `maxWidth`).
+  static func layoutWidth(forAttributed attributed: NSAttributedString,
+                          maxWidth: CGFloat) -> CGFloat {
+    guard attributed.length > 0, maxWidth > 1 else { return max(1, maxWidth) }
+    let ideal = attributed.boundingRect(
+      with: CGSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude),
+      options: [.usesLineFragmentOrigin, .usesFontLeading]
+    ).width
+    return min(maxWidth, max(1, ceil(ideal)))
   }
 
   /// The attributed string's real laid-out height at a given container width —
@@ -69,15 +83,6 @@ struct SelectableMarkdownText: View {
     layout.addTextContainer(container)
     layout.ensureLayout(for: container)
     return ceil(layout.usedRect(for: container).height)
-  }
-}
-
-/// Carries the surface's measured width up so `SelectableMarkdownText` can
-/// wrap-measure the rendered message at the real laid-out width.
-private struct SelectableMarkdownWidthKey: PreferenceKey {
-  static let defaultValue: CGFloat = 0
-  static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
-    value = max(value, nextValue())
   }
 }
 
