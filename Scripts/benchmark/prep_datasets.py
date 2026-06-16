@@ -46,6 +46,15 @@ LOCK_PATH = HERE / "datasets.lock"
 # --- prompt builders -------------------------------------------------------
 # Each builder maps one raw dataset record to a single greedy-decodable user
 # prompt string (or None to skip a malformed row — never used to subsample).
+#
+# A `ref_builder` (added for the #657 graded-accuracy axis) maps the SAME raw
+# record to a deterministic grading reference (gold answer / shipped unit tests /
+# the schema to validate against). It is emitted as an extra `reference` field on
+# graded datasets only, so ungraded rows (mtbench/cnndm) stay byte-identical and
+# keep their #652 lock hashes. The reference is the ground truth the #657
+# accuracy harness (`Inferlets/chat-apc/tot_accuracy_real.py`) grades against; it
+# is pinned by the same revision hash + content_sha256, so the correctness axis
+# is as reproducible as the prompt set.
 
 
 def _mtbench_prompt(rec: dict) -> str:
@@ -106,6 +115,52 @@ def _jsonschema_prompt(rec: dict) -> str:
     )
 
 
+# --- grading-reference builders (#657) -------------------------------------
+# Each maps a raw record to the ground truth its dataset is graded against. The
+# grader that consumes each shape lives in `Inferlets/chat-apc/grade.py`.
+
+
+def _as_list(v) -> list:
+    """MBPP/HumanEval list fields arrive as a real list from `datasets`, but a
+    cached/streamed export can stringify them — accept both, never `eval`."""
+    if isinstance(v, str):
+        return list(ast.literal_eval(v))
+    return list(v)
+
+
+def _gsm8k_reference(rec: dict) -> dict:
+    # GSM8K gold is the number after the final `####` marker; numeric exact-match.
+    answer = rec["answer"]
+    if "####" not in answer:
+        raise ValueError("gsm8k answer missing '####' final-answer marker")
+    gold = answer.split("####")[-1].strip().replace(",", "").replace("$", "")
+    return {"final_answer": gold}
+
+
+def _humaneval_reference(rec: dict) -> dict:
+    # pass@1 by executing the shipped `check(entry_point)`. The canonical prompt
+    # (signature + docstring + imports) is needed to assemble a runnable program
+    # when the model returns only the body; carry it explicitly.
+    return {
+        "canonical_prompt": rec["prompt"],
+        "test": rec["test"],
+        "entry_point": rec["entry_point"],
+    }
+
+
+def _mbpp_reference(rec: dict) -> dict:
+    # pass@1 by running the shipped asserts after the optional setup code.
+    return {
+        "test_setup_code": rec.get("test_setup_code") or "",
+        "test_list": _as_list(rec["test_list"]),
+    }
+
+
+def _jsonschema_reference(rec: dict) -> dict:
+    # Schema-conformance: validate the emitted JSON against this exact schema.
+    return {"json_schema": rec["json_schema"]}
+
+
 # --- dataset registry ------------------------------------------------------
 # `splits` lists every split concatenated, in order, to form the emitted set.
 # For MBPP the four `full`-config splits sum to the ticket's 974 (the whole
@@ -139,6 +194,8 @@ REGISTRY: dict[str, dict] = {
         "think": False,
         "id_field": "task_id",
         "builder": _humaneval_prompt,
+        "grader": "humaneval_exec",
+        "ref_builder": _humaneval_reference,
     },
     "mbpp": {
         "hf_repo": "google-research-datasets/mbpp",
@@ -156,6 +213,8 @@ REGISTRY: dict[str, dict] = {
         "think": False,
         "id_field": "task_id",
         "builder": _mbpp_prompt,
+        "grader": "mbpp_exec",
+        "ref_builder": _mbpp_reference,
     },
     "gsm8k": {
         "hf_repo": "openai/gsm8k",
@@ -170,6 +229,8 @@ REGISTRY: dict[str, dict] = {
         "think": True,
         "id_field": None,
         "builder": _gsm8k_prompt,
+        "grader": "gsm8k_numeric",
+        "ref_builder": _gsm8k_reference,
     },
     "cnndm": {
         "hf_repo": "abisee/cnn_dailymail",
@@ -203,6 +264,8 @@ REGISTRY: dict[str, dict] = {
         "think": False,
         "id_field": "unique_id",
         "builder": _jsonschema_prompt,
+        "grader": "jsonschema_validate",
+        "ref_builder": _jsonschema_reference,
     },
 }
 
@@ -213,6 +276,7 @@ def _records(key: str) -> list[dict]:
 
     spec = REGISTRY[key]
     builder: Callable[[dict], str] = spec["builder"]
+    ref_builder: Callable[[dict], dict] | None = spec.get("ref_builder")
     id_field = spec["id_field"]
     out: list[dict] = []
     seq = 0
@@ -227,14 +291,17 @@ def _records(key: str) -> list[dict]:
                 # silent skip that would change the count.
                 raise ValueError(f"{key}: empty prompt at split={split} seq={seq}")
             rid = str(row[id_field]) if id_field else f"{split}-{seq}"
-            out.append(
-                {
-                    "id": rid,
-                    "prompt": prompt,
-                    "category": spec["category"],
-                    "think": spec["think"],
-                }
-            )
+            rec = {
+                "id": rid,
+                "prompt": prompt,
+                "category": spec["category"],
+                "think": spec["think"],
+            }
+            if ref_builder is not None:
+                # Graded datasets (#657) carry their ground truth inline; ungraded
+                # rows omit the key entirely so their #652 bytes/hash are unchanged.
+                rec["reference"] = ref_builder(row)
+            out.append(rec)
             seq += 1
     return out
 
@@ -243,18 +310,18 @@ def _emit_bytes(records: list[dict]) -> bytes:
     """Deterministic JSONL bytes: fixed key order, no trailing whitespace."""
     lines = []
     for r in records:
+        rec = {
+            "id": r["id"],
+            "prompt": r["prompt"],
+            "category": r["category"],
+            "think": r["think"],
+        }
+        if "reference" in r:
+            rec["reference"] = r["reference"]
+        # sort_keys keeps the bytes deterministic; for ungraded records (no
+        # `reference`) the four-key object is byte-identical to the #652 emission.
         lines.append(
-            json.dumps(
-                {
-                    "id": r["id"],
-                    "prompt": r["prompt"],
-                    "category": r["category"],
-                    "think": r["think"],
-                },
-                ensure_ascii=True,
-                separators=(",", ":"),
-                sort_keys=True,
-            )
+            json.dumps(rec, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
         )
     return ("\n".join(lines) + "\n").encode("utf-8")
 
@@ -300,6 +367,10 @@ def emit(key: str) -> dict:
         "count": len(records),
         "content_sha256": hashlib.sha256(blob).hexdigest(),
     }
+    if spec.get("grader"):
+        # #657 graded-accuracy axis: names the deterministic grader in
+        # Inferlets/chat-apc/grade.py that scores this dataset's `reference`.
+        entry["grader"] = spec["grader"]
     lock = _load_lock()
     lock["datasets"][key] = entry
     _write_lock(lock)
