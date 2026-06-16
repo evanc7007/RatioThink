@@ -1,71 +1,46 @@
-"""ToT task-ACCURACY matrix: single-chain CoT vs ToT(width=k, depth=1) (#657).
+"""FAITHFUL Tree-of-Thoughts task-accuracy harness (#657, Yao 2023 §3, Alg. 1).
 
-Extends the #652 spec-decode benefit matrix from a throughput-only axis to a
-graded CORRECTNESS axis. Where `spec_matrix_real.py` asks "does n-gram drafting
-make this workload faster", this harness asks "does exploring k sibling chains
-and value-selecting the best one make the model more ACCURATE than a single CoT
-chain" — on the four deterministically-gradable PUBLIC pinned datasets (GSM8K,
-HumanEval, MBPP, JSONSchemaBench). It reuses the #652 prep/lock/gitignore pin
-infrastructure (`Scripts/benchmark`) and the engine bootstrap from `e2e_test`.
+The earlier depth=1 design measured best-of-N + LLM-as-judge rerank, not ToT (a
+cited literature review confirmed it diverges from canonical ToT on all four
+axes). This is the redesign: the search runs HOST-SIDE (tot_search.bfs), the
+engine is a `/v1/chat/completions` DECODE PRIMITIVE, and the shipped wasm
+tree-of-thought inferlet is left untouched — so this measures ToT-the-method on
+the deterministically-gradable PUBLIC pinned datasets (GSM8K, HumanEval, MBPP,
+JSONSchemaBench), reusing the #652 prep/lock/gitignore pin and the `e2e_test`
+boot. grade.py stays the final-accuracy ORACLE; the search never sees the gold.
 
-ISOLATING WIDTH. Both columns go through the SAME `/v1/inferlet`
-tree-of-thought endpoint and the SAME final-answer extraction, so the ONLY thing
-that changes between them is the search width:
+FOUR ARMS per dataset, all graded by grade.py:
+  * B0 greedy   — single greedy CoT chain, temperature 0 (canonical baseline).
+  * B1 single   — one sample at SINGLE_TEMPERATURE.
+  * B2 best-of-k — self-consistency over k whole samples at matched temperature,
+                  selected by a TASK-APPROPRIATE rule that never touches the gold:
+                  math=majority vote, code=execution agreement vs SELF-GENERATED
+                  tests (CodeT-style), json=first schema-valid. The decisive
+                  control: ToT must beat B2 to show STRUCTURE helps beyond samples.
+  * ToT          — harness-side BFS keep-b over PARTIAL states (tot_search):
+                  math = sample step-wise thoughts + value×3 evaluator (Yao §4.1),
+                  code = propose plans → execute-rank leaves (NO LLM judging of
+                  code), json = N/A (constrained-decoding task, not ToT).
 
-  * single  — breadth=1, depth=1, temperature=0 (greedy). One CoT chain, taken
-              as-is. This is the canonical single-chain CoT baseline:
-              deterministic and reproducible.
-  * tot      — breadth=k, depth=1, temperature>0 (sampled). k sibling chains,
-              each value-scored 1–10 by the model, the best selected as the
-              final answer (Yao et al. ToT, restricted to one level).
+PER-TASK design (Yao §3 axes), tunable by env (MATH_DEPTH/CODE_DEPTH/TOT_WIDTH/
+*_TEMPERATURE). Code runs low-T (pass@1 wants the mode; Chen 2021). The matrix
+reports B0/B1/B2/ToT accuracy + ToT−B2 (structure vs samples), ToT−B0, B2−B0.
 
-A width>1 search needs temperature>0 or the k greedy branches would be
-byte-identical and the search would be a no-op (#555/#523 diversity finding);
-the single-chain baseline stays greedy because greedy IS the canonical CoT
-baseline. The temperatures are therefore intentionally different and disclosed
-in the artifact, not hidden. The tot column is consequently STOCHASTIC: its
-accuracy varies run-to-run. The grading is deterministic; the generation is not.
+DISCLOSURE & RESILIENCE. Tokens per arm = Σ tokenizer tokens over EVERY engine
+call the arm made (B2 pays for k samples, ToT for the whole tree), counted for
+GRADED runs only. An ungradable answer or an engine/transport failure is held out
+of the denominator and disclosed (n_ungradable / n_error / first_error), never
+scored wrong or allowed to abort the matrix. #679 NOTE: this path avoids the ToT
+INFERLET, so the #679 daemon trap should not bite; thinking-ON math is still
+heavy and degrades gracefully (errored arms disclosed) rather than crashing.
 
-DEPTH=1 ONLY (the ticket's scope). depth>1 is blocked on #647/#649 — a depth>1
-search returned empty/zero-reasoning final-depth nodes (e2e-tot red), so
-measuring accuracy through it would grade garbage. depth>1 is an explicit
-follow-up once that path is fixed.
-
-PER-CELL METRICS (per dataset × column):
-  * accuracy            = correct / graded   (graded = correct + wrong; an
-                          ungradable run — empty output, no extractable answer —
-                          is held OUT of the denominator, never scored wrong)
-  * n_correct / n_wrong / n_ungradable / n_error (non-200)
-  * output tokens       = Σ tokenizer tokens over every generated node
-                          (content + reasoning) — counted ONLY for graded runs,
-                          the same population as accuracy, so the per-token
-                          efficiency numbers can't be skewed by a column's
-                          ungradable rate; the value-scoring decode is internal
-                          and not counted — both disclosed, not hidden
-  * wall seconds        = end-to-end per prompt (graded runs only, as above)
-  * accuracy_per_ktok   = accuracy ÷ (mean output tokens / 1000): the
-                          accuracy-per-token axis the ticket asks for, numerator
-                          and denominator over the same graded subset
-The row summary reports the ToT−single accuracy DELTA and the token-cost ratio,
-so "did width help, and at what token cost" is answered directly.
-
-NO-CHERRYPICK / COVERAGE. The prompt set is the FULL pinned split (datasets.lock
-content_sha256); a split too large to run end-to-end is bounded ONLY at
-measurement time by `MAX_PROMPTS` over the canonical-ordered prefix, and the
-per-row `coverage` field records `measured / total`. Emission stays full.
-
-CODE EXECUTION WARNING: HumanEval/MBPP grading executes model-generated Python
-in a subprocess (see grade.py). This is why the bench is operator-gated, never
-CI; the CI guard is the engine-free `tot_accuracy_real_test.py`.
-
-Requires: built portable-Metal `Vendor/pie/target/release/pie`, the chat-apc
-wasm + stamp, a real model WITH WEIGHTS, the prep scripts run so
-`Scripts/benchmark/data/<key>.jsonl` exists, and `jsonschema` for the structured
-row. Run via `Scripts/run-tot-accuracy.sh` (self-bootstraps all of these).
+CODE EXECUTION WARNING: code grading + self-test agreement execute model code in
+a subprocess (grade.py). Operator-gated, never CI; the CI guard is the engine-
+free tot_search_test / baselines_test / tot_arms_test / tot_accuracy_real_test.
 
 Usage::
 
-    MODEL=Qwen/Qwen3-8B MAX_TOKENS=512 MAX_PROMPTS=12 TOT_WIDTH=4 \
+    MODEL=Qwen/Qwen3-8B MAX_PROMPTS=12 TOT_WIDTH=4 \
       uv run --project Vendor/pie/client/python --with httpx --with jsonschema \
         --with tokenizers --with huggingface_hub \
         python Inferlets/chat-apc/tot_accuracy_real.py
@@ -75,11 +50,9 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import statistics
 import subprocess
 import sys
 import tempfile
-import time
 from pathlib import Path
 
 import httpx
@@ -90,7 +63,8 @@ if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
 import e2e_test as h  # noqa: E402  boot/teardown + PIE_BIN/WASM_PATH/MANIFEST_PATH
-import grade as g  # noqa: E402  deterministic per-dataset graders
+import tot_arms as ta  # noqa: E402  arm orchestration (B0/B1/B2/ToT)
+import tot_search as ts  # noqa: E402  faithful BFS controller
 
 MODEL = os.environ.get("MODEL", "Qwen/Qwen3-8B")
 MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "512"))
@@ -110,12 +84,55 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 DATA_DIR = _REPO_ROOT / "Scripts" / "benchmark" / "data"
 LOCK_PATH = _REPO_ROOT / "Scripts" / "benchmark" / "datasets.lock"
 
-# The two columns. Both run through tree-of-thought; only `breadth`/`temperature`
-# differ (see module docstring). depth/beam are fixed at the single-level shape.
-COLUMNS = {
-    "single": {"breadth": 1, "temperature": SINGLE_TEMPERATURE},
-    "tot": {"breadth": TOT_WIDTH, "temperature": TOT_TEMPERATURE},
-}
+MATH_DEPTH = int(os.environ.get("MATH_DEPTH", "6"))
+CODE_DEPTH = int(os.environ.get("CODE_DEPTH", "2"))
+CODE_TEMPERATURE = float(os.environ.get("CODE_TEMPERATURE", "0.2"))  # low-T for code pass@1
+
+
+def _task_config(family: str, grader: str) -> ta.DatasetArmsConfig:
+    """Per-task ToT design (Yao §3 axes), built from env knobs. math = sample
+    step-wise + value×3 + BFS keep-b; code = propose plans → execute-rank leaves
+    (NO LLM judging of code) at low temperature; json = no ToT (constrained-
+    decoding task), B0/B1/B2-first-valid only."""
+    if family == "math":
+        spec = ts.TaskSpec(
+            name="math", depth=MATH_DEPTH, breadth=TOT_WIDTH, generator="sample",
+            intermediate_eval="value", eval_samples=3, temperature=TOT_TEMPERATURE,
+            max_tokens=MAX_TOKENS,
+            step_cue="Continue with the SINGLE next reasoning step only (one short "
+                     "step). Do not state the final answer yet.",
+            value_cue="Independently recompute and judge whether the reasoning so "
+                      "far is on track to the correct answer. End with exactly: "
+                      "SCORE: N  (N=1 impossible … 10 sure).",
+            final_cue="Now give the final answer. End with: #### <number>.",
+        )
+        return ta.DatasetArmsConfig("math", grader, TOT_WIDTH, TOT_TEMPERATURE,
+                                    MAX_TOKENS, spec, single_temperature=SINGLE_TEMPERATURE)
+    if family == "code":
+        spec = ts.TaskSpec(
+            name="code", depth=CODE_DEPTH, breadth=TOT_WIDTH, generator="propose",
+            intermediate_eval="none", eval_samples=1, temperature=CODE_TEMPERATURE,
+            max_tokens=MAX_TOKENS,
+            step_cue="Sketch the implementation approach in one line.",
+            propose_cue=f"Propose {TOT_WIDTH} DISTINCT one-line implementation "
+                        f"approaches. Number them 1..{TOT_WIDTH}.",
+            final_cue="Write the complete Python function. Output only the function "
+                      "definition.",
+        )
+        return ta.DatasetArmsConfig(
+            "code", grader, TOT_WIDTH, CODE_TEMPERATURE, MAX_TOKENS, spec,
+            selftest_cue="Write up to 5 `assert` statements any correct "
+                         "implementation must pass. Output only the assert lines.",
+            single_temperature=SINGLE_TEMPERATURE)
+    if family == "json":
+        return ta.DatasetArmsConfig("json", grader, TOT_WIDTH, TOT_TEMPERATURE,
+                                    MAX_TOKENS, spec=None,
+                                    single_temperature=SINGLE_TEMPERATURE)
+    raise SystemExit(f"unknown task family {family!r}")
+
+
+# Dataset → task family (drives decomposition/generator/evaluator/search).
+FAMILY = {"gsm8k": "math", "humaneval": "code", "mbpp": "code", "jsonschema": "json"}
 
 CONFIG_TOML = f"""
 [server]
@@ -210,145 +227,35 @@ def _load_prompts(key: str) -> tuple[list[dict], int]:
     return records, total
 
 
-def _walk(node: dict) -> list:
-    out = [node]
-    for c in node.get("children", []) or []:
-        out.extend(_walk(c))
+def _with_no_think(messages: list[dict]) -> list[dict]:
+    """Append Qwen3's `/no_think` soft switch to the last user message for non-
+    reasoning datasets (so a code/JSON arm doesn't pay for a think block). The
+    math family leaves thinking ON."""
+    if not messages or messages[-1].get("role") != "user":
+        return messages
+    out = [dict(m) for m in messages]
+    out[-1]["content"] = f"{out[-1]['content']}\n/no_think"
     return out
 
 
-def _count_tree_tokens(body: dict, count) -> int:
-    total = 0
-    for n in _walk(body.get("root") or {}):
-        if n.get("id") == "root":
-            continue
-        total += count(n.get("content") or "") + count(n.get("reasoning") or "")
-    return total
-
-
-async def _tot_run(http_c, base, prompt, think, breadth, temperature) -> dict:
-    """One greedy/sampled tree-of-thought search at depth 1; returns the final
-    answer string, the generated-token count, and the wall time. A non-200 (a
-    total branch failure returns 500) — OR a transport-level failure (the wasm
-    daemon trapping/closing the socket mid-search, surfacing as an httpx
-    RemoteProtocolError/ConnectError) — is surfaced as an errored run, not
-    silently scored as a wrong answer and NOT allowed to abort the whole matrix.
-    Recording it as `status=0` keeps the failure fully disclosed (it lands in the
-    cell's n_error and the run-level failures list, forcing a non-zero verdict)
-    while letting the remaining prompts/datasets still produce numbers and
-    pin-pointing exactly where the daemon died."""
-    payload = {
-        "inferlet": "tree-of-thought",
-        "stream": False,
-        "input": {
-            "messages": [{"role": "user", "content": prompt}],
-            "breadth": breadth,
-            "depth": 1,
-            "beam_width": 1,
-            "max_tokens_per_node": MAX_TOKENS,
-            "temperature": temperature,
+def _make_complete(http_c, base: str, think: bool):
+    """A dataset-scoped decode primitive over /v1/chat/completions (engine as a
+    plain token producer; the ToT search is host-side, the shipped inferlet is
+    untouched). Raises on non-200 / transport drop so the arm records it errored
+    (tot_arms._arm catches) rather than scoring a wrong answer or aborting."""
+    async def complete(messages, temperature, max_tokens):
+        msgs = messages if think else _with_no_think(messages)
+        body = {
+            "model": MODEL, "messages": msgs, "temperature": temperature,
+            "max_tokens": max_tokens, "stream": False,
             "top_p": 1.0 if temperature == 0.0 else 0.95,
-            "thinking": bool(think),
-        },
-    }
-    t0 = time.perf_counter()
-    try:
-        r = await http_c.post(f"{base}/v1/inferlet", json=payload)
-    except httpx.HTTPError as e:
-        # Daemon dropped the connection / never replied. Disclosed, not fatal.
-        return {"status": 0, "error_body": f"{type(e).__name__}: {e}",
-                "wall_s": time.perf_counter() - t0}
-    wall_s = time.perf_counter() - t0
-    if r.status_code != 200:
-        return {"status": r.status_code, "error_body": r.text[:400], "wall_s": wall_s}
-    return {"status": 200, "body": r.json(), "wall_s": wall_s}
-
-
-async def _bench_dataset(http_c, base, key, grader, records, total, count, failures) -> dict:
-    print(f"\n[accuracy] dataset={key!r} grader={grader!r} "
-          f"measuring {len(records)}/{total} prompts")
-    cells: dict[str, dict] = {}
-    for col, cfg in COLUMNS.items():
-        graded_pass = 0
-        graded_fail = 0
-        ungradable = 0
-        errored = 0
-        tokens: list[int] = []
-        walls: list[float] = []
-        for idx, rec in enumerate(records):
-            run = await _tot_run(
-                http_c, base, rec["prompt"], bool(rec.get("think")),
-                cfg["breadth"], cfg["temperature"],
-            )
-            if run["status"] != 200:
-                errored += 1
-                failures.append(
-                    f"[{key}[{idx}] {col}] /v1/inferlet -> {run['status']}: "
-                    f"{run.get('error_body','')[:160]}"
-                )
-                continue
-            body = run["body"]
-            answer = (body.get("final_answer") or "").strip()
-            verdict = g.grade(grader, answer, rec["reference"])
-            if verdict.passed is None:
-                # Ungradable (empty/no-extractable answer). Held out of BOTH the
-                # accuracy denominator AND the token/wall samples, so every
-                # per-token metric (mean_output_tokens, accuracy_per_ktok, the
-                # cross-column token_cost_ratio) divides over the SAME graded
-                # population the accuracy is computed on — no hidden mismatch
-                # between a stochastic-tot ungradable rate and greedy single.
-                ungradable += 1
-                continue
-            tokens.append(_count_tree_tokens(body, count))
-            walls.append(run["wall_s"])
-            if verdict.passed is True:
-                graded_pass += 1
-            else:
-                graded_fail += 1
-        graded = graded_pass + graded_fail
-        mean_tok = statistics.mean(tokens) if tokens else None
-        accuracy = (graded_pass / graded) if graded else None
-        cells[col] = {
-            "column": col,
-            "breadth": cfg["breadth"],
-            "temperature": cfg["temperature"],
-            "n_correct": graded_pass,
-            "n_wrong": graded_fail,
-            "n_ungradable": ungradable,
-            "n_error": errored,
-            "n_graded": graded,
-            "accuracy": accuracy,
-            "mean_output_tokens": mean_tok,
-            "total_output_tokens": sum(tokens) if tokens else 0,
-            "mean_wall_s": statistics.mean(walls) if walls else None,
-            "accuracy_per_ktok": (accuracy / (mean_tok / 1000.0))
-            if (accuracy is not None and mean_tok) else None,
         }
-
-    single, tot = cells["single"], cells["tot"]
-    acc_delta = (
-        tot["accuracy"] - single["accuracy"]
-        if (tot["accuracy"] is not None and single["accuracy"] is not None) else None
-    )
-    token_ratio = (
-        tot["mean_output_tokens"] / single["mean_output_tokens"]
-        if (tot["mean_output_tokens"] and single["mean_output_tokens"]) else None
-    )
-    measured = len(records)
-    return {
-        "dataset": key,
-        "grader": grader,
-        "category": records[0].get("category") if records else None,
-        "think": bool(records[0].get("think")) if records else None,
-        "coverage": {
-            "measured": measured, "total": total,
-            "fraction": (measured / total) if total else None,
-            "bounded_by": "MAX_PROMPTS" if (MAX_PROMPTS and measured < total) else "full",
-        },
-        "accuracy_delta_tot_minus_single": acc_delta,
-        "token_cost_ratio_tot_over_single": token_ratio,
-        "cells": cells,
-    }
+        r = await http_c.post(f"{base}/v1/chat/completions", json=body)
+        if r.status_code != 200:
+            raise RuntimeError(f"chat/completions {r.status_code}: {r.text[:160]}")
+        msg = (r.json().get("choices") or [{}])[0].get("message") or {}
+        return (msg.get("content") or "").strip()
+    return complete
 
 
 async def _run(base: str, count) -> tuple[dict, list[str]]:
@@ -357,58 +264,77 @@ async def _run(base: str, count) -> tuple[dict, list[str]]:
     async with httpx.AsyncClient(timeout=600) as http_c:
         for key in _which_datasets():
             grader = _grader_for(key)
+            family = FAMILY.get(key)
+            if family is None:
+                failures.append(f"[{key}] no task family mapping")
+                continue
             records, total = _load_prompts(key)
             if not records:
                 failures.append(f"[{key}] no prompts after cap")
                 continue
-            rows.append(
-                await _bench_dataset(http_c, base, key, grader, records, total, count, failures)
-            )
+            think = bool(records[0].get("think"))
+            cfg = _task_config(family, grader)
+            complete = _make_complete(http_c, base, think)
+            print(f"\n[accuracy] dataset={key!r} family={family} grader={grader!r} "
+                  f"measuring {len(records)}/{total} prompts "
+                  f"(arms: {'B0,B1,B2' if cfg.spec is None else 'B0,B1,B2,ToT'})")
+            row = await ta.run_dataset(records, cfg, complete, count)
+            row.update({
+                "dataset": key,
+                "coverage": {"measured": len(records), "total": total,
+                             "fraction": (len(records) / total) if total else None,
+                             "bounded_by": "MAX_PROMPTS"
+                             if (MAX_PROMPTS and len(records) < total) else "full"},
+            })
+            rows.append(row)
+            for arm, c in row["cells"].items():
+                if c["n_error"] and c.get("first_error") and "N/A" not in c["first_error"]:
+                    failures.append(f"[{key} {arm}] {c['n_error']} errored: {c['first_error'][:160]}")
     artifact = {
         "model": MODEL,
         "driver": "portable/metal",
+        "framing": "Harness-side FAITHFUL Tree-of-Thoughts (Yao 2023 §3, BFS keep-b "
+                   "Alg.1): engine is a /v1/chat/completions decode primitive; the "
+                   "shipped wasm tree-of-thought inferlet is untouched. Measures "
+                   "ToT-the-method.",
         "decode_settings": {
-            "max_tokens_per_node": MAX_TOKENS, "max_prompts": MAX_PROMPTS,
-            "tot_width": TOT_WIDTH, "tot_temperature": TOT_TEMPERATURE,
-            "single_temperature": SINGLE_TEMPERATURE, "depth": 1,
+            "max_tokens": MAX_TOKENS, "max_prompts": MAX_PROMPTS, "breadth_k": TOT_WIDTH,
+            "tot_temperature": TOT_TEMPERATURE, "single_temperature": SINGLE_TEMPERATURE,
+            "code_temperature": CODE_TEMPERATURE, "math_depth": MATH_DEPTH,
+            "code_depth": CODE_DEPTH,
         },
-        "columns": {
-            "single": f"single-chain CoT: breadth=1, depth=1, temperature="
-                      f"{SINGLE_TEMPERATURE}"
-                      + (" (greedy, deterministic baseline)"
-                         if SINGLE_TEMPERATURE == 0.0
-                         else " (best-of-1 SAMPLE — width-isolation arm; STOCHASTIC)"),
-            "tot": f"ToT width={TOT_WIDTH}, depth=1, temperature={TOT_TEMPERATURE} "
-                   "(sampled k siblings, value-selected; STOCHASTIC)",
+        "arms": {
+            "B0_greedy": "greedy CoT, single chain, temperature 0 (canonical baseline)",
+            "B1_single": f"single sample at SINGLE_TEMPERATURE={SINGLE_TEMPERATURE}",
+            "B2_bestofk": f"self-consistency best-of-{TOT_WIDTH} at matched temp; select "
+                          "math=majority-vote, code=execution-agreement (self-gen tests, "
+                          "NOT grading tests), json=first-valid",
+            "ToT": "harness-side BFS keep-b over PARTIAL states; math=sample steps+value×3, "
+                   "code=propose plans→execute-rank leaves (no LLM judging of code), "
+                   "json=N/A (constrained-decoding task)",
         },
-        "out_of_scope": {
-            "depth_gt_1": "blocked on #647/#649 (depth>1 final-depth nodes returned "
-            "empty/zero-reasoning); measuring through it would grade garbage",
-            "soft_metric_datasets": "CNN/DM (ROUGE proxy) + MT-Bench (LLM-judge) break "
-            "the deterministic/PUBLIC/reproducible spirit — separate follow-up",
-        },
-        "token_accounting_caveat": "output tokens/wall are counted for GRADED runs "
-        "only (the same population as accuracy), so accuracy_per_ktok and "
-        "token_cost_ratio share one denominator and a column's ungradable rate "
-        "cannot skew them; output tokens = Σ generated node content+reasoning, and "
-        "the internal value-scoring decode is not counted (short, capped per #649).",
+        "headline": "ToT−B2 isolates SEARCH STRUCTURE from MORE SAMPLES; ToT−B0 vs greedy.",
+        "token_accounting_caveat": "tokens per arm = Σ tokenizer tokens over EVERY engine "
+        "call the arm made (B2 pays for k samples, ToT for the whole tree), counted for "
+        "GRADED runs only (same population as accuracy).",
         "rows": rows,
     }
     return artifact, failures
 
 
 def _print_matrix(artifact: dict, unit: str) -> None:
-    print("\n" + "=" * 104)
-    print(f"ToT accuracy matrix — {artifact['model']} ({artifact['driver']})")
+    print("\n" + "=" * 110)
+    print(f"FAITHFUL ToT accuracy matrix — {artifact['model']} ({artifact['driver']})")
     ds = artifact["decode_settings"]
-    print(f"single=greedy CoT (b1) vs tot=ToT(width={ds['tot_width']}, depth=1, "
-          f"temp={ds['tot_temperature']})  max_tokens/node={ds['max_tokens_per_node']} "
-          f"max_prompts={ds['max_prompts']} (0=full)")
-    print("=" * 104)
+    print(f"k={ds['breadth_k']}  math depth={ds['math_depth']} (think-ON)  code depth="
+          f"{ds['code_depth']} @T={ds['code_temperature']}  tot_T={ds['tot_temperature']}  "
+          f"B1_T={ds['single_temperature']}  max_tokens={ds['max_tokens']}  "
+          f"max_prompts={ds['max_prompts']}")
+    print("=" * 110)
     hdr = (
-        f"{'dataset':<11} {'grader':<18} {'cover':>9} "
-        f"{'acc single':>10} {'acc tot':>8} {'Δacc':>7} "
-        f"{f'{unit}/p single':>15} {f'{unit}/p tot':>13} {'tok×':>6} {'acc/ktok t':>11}"
+        f"{'dataset':<11} {'family':<6} {'cover':>8} "
+        f"{'B0':>6} {'B1':>6} {'B2':>6} {'ToT':>6} "
+        f"{'ToT-B2':>7} {'ToT-B0':>7} {'B2-B0':>7}"
     )
     print(hdr)
     print("-" * len(hdr))
@@ -417,25 +343,22 @@ def _print_matrix(artifact: dict, unit: str) -> None:
         return fmt.format(x) if isinstance(x, (int, float)) else "--"
 
     for r in artifact["rows"]:
-        s, t = r["cells"]["single"], r["cells"]["tot"]
+        c = r["cells"]
         cov = r["coverage"]
         print(
-            f"{r['dataset']:<11} {r['grader']:<18} "
-            f"{cov['measured']}/{cov['total']:<7} "
-            f"{f(s['accuracy']):>10} {f(t['accuracy']):>8} "
-            f"{f(r['accuracy_delta_tot_minus_single'],'{:+.3f}'):>7} "
-            f"{f(s['mean_output_tokens'],'{:.0f}'):>15} "
-            f"{f(t['mean_output_tokens'],'{:.0f}'):>13} "
-            f"{f(r['token_cost_ratio_tot_over_single'],'{:.1f}'):>6} "
-            f"{f(t['accuracy_per_ktok']):>11}"
+            f"{r['dataset']:<11} {r['family']:<6} {cov['measured']}/{cov['total']:<6} "
+            f"{f(c['B0_greedy']['accuracy']):>6} {f(c['B1_single']['accuracy']):>6} "
+            f"{f(c['B2_bestofk']['accuracy']):>6} {f(c['ToT']['accuracy']):>6} "
+            f"{f(r['tot_minus_b2'],'{:+.3f}'):>7} {f(r['tot_minus_b0'],'{:+.3f}'):>7} "
+            f"{f(r['b2_minus_b0'],'{:+.3f}'):>7}"
         )
     print("-" * len(hdr))
-    print("acc = correct/graded (ungradable held out of denominator); Δacc = tot−single; "
-          "tok× = tot tokens ÷ single tokens; acc/ktok = accuracy per 1k output tokens.")
-    print(f"\nToken accounting: {artifact['token_accounting_caveat']}")
-    print("Out of scope:")
-    for k, v in artifact["out_of_scope"].items():
-        print(f"  • {k}: {v}")
+    print("acc = correct/graded (ungradable+errored held out). ToT-B2 = does SEARCH "
+          "STRUCTURE beat more samples; ToT-B0 = vs greedy CoT; B2-B0 = samples vs greedy.")
+    for arm, desc in artifact["arms"].items():
+        print(f"  • {arm}: {desc}")
+    print(f"\nFraming: {artifact['framing']}")
+    print(f"Token accounting: {artifact['token_accounting_caveat']}")
 
 
 async def main() -> int:
@@ -499,13 +422,12 @@ async def main() -> int:
         for fl in failures:
             print(f"  ✗ {fl}")
         return 1
-    helped = [r["dataset"] for r in artifact["rows"]
-              if isinstance(r["accuracy_delta_tot_minus_single"], (int, float))
-              and r["accuracy_delta_tot_minus_single"] > 0]
+    structure_helped = [r["dataset"] for r in artifact["rows"]
+                        if isinstance(r["tot_minus_b2"], (int, float)) and r["tot_minus_b2"] > 0]
     print(
         f"\n[accuracy] PASS (measurement contract): {len(artifact['rows'])} rows. "
-        f"ToT width={TOT_WIDTH} improved accuracy on: {helped or 'none'}. "
-        "Δacc is advisory; the tot column is stochastic (temperature>0)."
+        f"ToT search structure beat best-of-{TOT_WIDTH} (ToT−B2 > 0) on: "
+        f"{structure_helped or 'none'}. Stochastic (temp>0); deltas advisory."
     )
     return 0
 
