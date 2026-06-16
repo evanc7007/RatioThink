@@ -182,9 +182,14 @@ class Aggregation(unittest.TestCase):
             # prompt 'p_err' errors on the single (greedy) column only.
             if prompt == "p_err" and breadth == 1:
                 return {"status": 500, "error_body": "all branches failed", "wall_s": 0.1}
-            # prompt 'p_ung' yields no extractable number on both columns.
+            # prompt 'p_ung' yields no extractable number on both columns. Its
+            # node text is DELIBERATELY huge (100 words/node) so that if an
+            # ungradable run leaked into the token/wall samples, the per-token
+            # metrics below would shift far off the graded-only value.
             if prompt == "p_ung":
-                return {"status": 200, "body": _tree("no number", breadth), "wall_s": 0.1}
+                return {"status": 200,
+                        "body": _tree("no number", breadth, "w " * 100),
+                        "wall_s": 9.9}
             # 'p_hard': single greedy gets it wrong, ToT width selects right.
             if prompt == "p_hard":
                 ans = "42" if breadth > 1 else "41"
@@ -240,6 +245,25 @@ class Aggregation(unittest.TestCase):
         self.assertGreater(row["token_cost_ratio_tot_over_single"], 1.0)
         self.assertEqual(row["cells"]["tot"]["breadth"], a.TOT_WIDTH)
         self.assertEqual(row["cells"]["single"]["breadth"], 1)
+
+    def test_per_token_metrics_use_graded_population_only(self):
+        # MUTATION CHECK (F1): the ungradable p_ung run emits 100-word nodes, far
+        # larger than the graded p_easy/p_hard runs (3-word nodes). If its tokens
+        # leaked into the samples, mean_output_tokens / accuracy_per_ktok would
+        # be skewed; they must reflect the GRADED subset alone.
+        row, _ = self._bench(self.RECORDS)
+        s = row["cells"]["single"]
+        # single graded runs = p_easy + p_hard, each 1 node × 3 words → mean 3.0;
+        # NOT pulled up toward 100 by the ungradable run, and wall mean is 0.1
+        # (the graded runs' wall), NOT 9.9 (the ungradable run's).
+        self.assertEqual(s["mean_output_tokens"], 3.0)
+        self.assertEqual(s["total_output_tokens"], 6)
+        self.assertAlmostEqual(s["mean_wall_s"], 0.1)
+        # accuracy_per_ktok divides the graded accuracy by the graded-only mean.
+        self.assertAlmostEqual(s["accuracy_per_ktok"], s["accuracy"] / (3.0 / 1000.0))
+        # tot column: each graded run forks TOT_WIDTH 3-word nodes → mean 3·k.
+        t = row["cells"]["tot"]
+        self.assertEqual(t["mean_output_tokens"], 3.0 * a.TOT_WIDTH)
 
 
 class ColumnConfig(unittest.TestCase):
