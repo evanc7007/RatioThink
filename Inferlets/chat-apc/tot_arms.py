@@ -20,6 +20,8 @@ so the ToT arm is reported as N/A and only B0/B1/B2(first-valid) are run.
 from __future__ import annotations
 
 import statistics
+import sys
+import time
 from dataclasses import dataclass
 from typing import Awaitable, Callable
 
@@ -170,10 +172,19 @@ async def run_dataset(records: list[dict], cfg: DatasetArmsConfig,
     the headline deltas. Returns the row dict for the matrix."""
     per_arm: dict[str, list[dict]] = {a: [] for a in ARMS}
     references = [r["reference"] for r in records]
-    for rec in records:
+    n = len(records)
+    t0 = time.monotonic()
+    for i, rec in enumerate(records, 1):
+        ps = time.monotonic()
         res = await run_prompt(rec["prompt"], rec["reference"], cfg, complete, count)
         for a in ARMS:
             per_arm[a].append(res[a])
+        dt = time.monotonic() - ps
+        elapsed = time.monotonic() - t0
+        eta = (elapsed / i) * (n - i)
+        print(f"[accuracy]   {cfg.family}/{cfg.grader} prompt {i}/{n} "
+              f"done in {dt:.0f}s (elapsed {elapsed:.0f}s, eta {eta:.0f}s)",
+              file=sys.stderr, flush=True)
     cells = {a: _cell(a, per_arm[a], cfg.grader, references) for a in ARMS}
 
     def _delta(x, y):
