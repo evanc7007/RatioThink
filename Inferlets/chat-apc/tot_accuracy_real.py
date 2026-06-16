@@ -89,7 +89,7 @@ DATA_DIR = _REPO_ROOT / "Scripts" / "benchmark" / "data"
 LOCK_PATH = _REPO_ROOT / "Scripts" / "benchmark" / "datasets.lock"
 
 MATH_DEPTH = int(os.environ.get("MATH_DEPTH", "6"))
-CODE_DEPTH = int(os.environ.get("CODE_DEPTH", "2"))
+CODE_DEPTH = int(os.environ.get("CODE_DEPTH", "3"))
 CODE_TEMPERATURE = float(os.environ.get("CODE_TEMPERATURE", "0.2"))  # low-T for code pass@1
 
 
@@ -244,10 +244,18 @@ def _with_no_think(messages: list[dict]) -> list[dict]:
     return out
 
 
+# Bounded retry for a transient `forward_pass_starved` 500 (the engine
+# momentarily produced no tokens under GPU/memory pressure) or a transient
+# transport blip. Backoff is short and CAPPED: if the engine is persistently
+# memory-walled, the arm errors after RETRY_BACKOFFS rather than retrying for
+# hours (operator's stop condition). A 400 (bad request) is NOT retried.
+RETRY_BACKOFFS = (1.0, 3.0, 6.0, 10.0)
+
+
 def _make_complete(http_c, base: str, think: bool):
     """A dataset-scoped decode primitive over /v1/chat/completions (engine as a
     plain token producer; the ToT search is host-side, the shipped inferlet is
-    untouched). Raises on non-200 / transport drop so the arm records it errored
+    untouched). Raises after bounded retries so the arm records it errored
     (tot_arms._arm catches) rather than scoring a wrong answer or aborting."""
     async def complete(messages, temperature, max_tokens):
         msgs = messages if think else _with_no_think(messages)
@@ -256,16 +264,28 @@ def _make_complete(http_c, base: str, think: bool):
             "max_tokens": max_tokens, "stream": False,
             "top_p": 1.0 if temperature == 0.0 else 0.95,
         }
-        r = await http_c.post(f"{base}/v1/chat/completions", json=body)
-        if r.status_code != 200:
-            raise RuntimeError(f"chat/completions {r.status_code}: {r.text[:160]}")
-        msg = (r.json().get("choices") or [{}])[0].get("message") or {}
-        # Thinking-ON answers can spend the whole budget in the <think> block and
-        # return empty `content` (#600/#434 truncation) — fall back to
-        # reasoning_content so the thought is non-empty (a bare empty assistant
-        # turn also 400s the next request). No-op for /no_think rows.
-        text = (msg.get("content") or "").strip() or (msg.get("reasoning_content") or "").strip()
-        return text
+        last = "unknown"
+        for attempt in range(len(RETRY_BACKOFFS) + 1):
+            try:
+                r = await http_c.post(f"{base}/v1/chat/completions", json=body)
+            except httpx.HTTPError as e:
+                last = f"transport {type(e).__name__}: {e}"
+            else:
+                if r.status_code == 200:
+                    msg = (r.json().get("choices") or [{}])[0].get("message") or {}
+                    # Thinking-ON answers can spend the whole budget in the
+                    # <think> block and return empty content (#600/#434) — fall
+                    # back to reasoning_content (a bare empty assistant turn also
+                    # 400s the next request). No-op for /no_think rows.
+                    return ((msg.get("content") or "").strip()
+                            or (msg.get("reasoning_content") or "").strip())
+                last = f"chat/completions {r.status_code}: {r.text[:160]}"
+                # Only retry transient engine starvation; a 4xx is the caller's bug.
+                if r.status_code < 500 and "forward_pass_starved" not in r.text:
+                    raise RuntimeError(last)
+            if attempt < len(RETRY_BACKOFFS):
+                await asyncio.sleep(RETRY_BACKOFFS[attempt])
+        raise RuntimeError(f"{last} (after {len(RETRY_BACKOFFS)} retries)")
     return complete
 
 

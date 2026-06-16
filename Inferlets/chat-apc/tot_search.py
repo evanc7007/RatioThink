@@ -17,6 +17,7 @@ inferlet is untouched — this measures ToT-the-method, not that inferlet.
 """
 from __future__ import annotations
 
+import asyncio
 import re
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable
@@ -124,24 +125,22 @@ async def generate(state: State, spec: TaskSpec, complete: Complete) -> list[Sta
     # At the terminal level solicit the FINAL answer (final_cue); intermediate
     # levels solicit the next partial thought. propose stays for intermediate
     # constrained expansion; the terminal level always samples a full answer.
-    children: list[State] = []
-    if terminal and spec.final_cue:
-        for _ in range(spec.breadth):
-            msgs = state.messages + [{"role": "user", "content": spec.final_cue}]
-            thought = await complete(msgs, spec.temperature, spec.max_tokens)
-            children.append(_child(state, thought, next_depth, terminal))
-    elif spec.generator == "propose" and spec.propose_cue:
-        msgs = state.messages + [{"role": "user", "content": spec.propose_cue}]
-        text = await complete(msgs, spec.temperature, spec.max_tokens)
-        for thought in parse_proposals(text, spec.breadth):
-            children.append(_child(state, thought, next_depth, terminal))
-    else:  # sample
+    # The `breadth` siblings are issued CONCURRENTLY (asyncio.gather) so the
+    # engine co-batches them — sequential per-node calls make a thinking-ON deep
+    # tree intractable (~15s/call × thousands). gather preserves result order.
+    if (terminal and spec.final_cue) or spec.generator != "propose" or not spec.propose_cue:
         cue = spec.final_cue if (terminal and spec.final_cue) else spec.step_cue
-        for _ in range(spec.breadth):
-            msgs = state.messages + [{"role": "user", "content": cue}]
-            thought = await complete(msgs, spec.temperature, spec.max_tokens)
-            children.append(_child(state, thought, next_depth, terminal))
-    return children
+        thoughts = await asyncio.gather(*[
+            complete(state.messages + [{"role": "user", "content": cue}],
+                     spec.temperature, spec.max_tokens)
+            for _ in range(spec.breadth)
+        ])
+        return [_child(state, t, next_depth, terminal) for t in thoughts]
+    # propose: ONE constrained call yields `breadth` distinct next thoughts.
+    text = await complete(state.messages + [{"role": "user", "content": spec.propose_cue}],
+                          spec.temperature, spec.max_tokens)
+    return [_child(state, t, next_depth, terminal)
+            for t in parse_proposals(text, spec.breadth)]
 
 
 def _child(parent: State, thought: str, depth: int, terminal: bool) -> State:
@@ -162,20 +161,17 @@ async def evaluate(states: list[State], spec: TaskSpec, complete: Complete) -> N
     not by an LLM judge). Mutates states in place."""
     if spec.intermediate_eval == "none" or not spec.value_cue:
         return
-    for s in states:
-        if spec.intermediate_eval == "value":
-            samples: list[float] = []
-            for _ in range(max(1, spec.eval_samples)):
-                msgs = s.messages + [{"role": "user", "content": spec.value_cue}]
-                v = parse_value(await complete(msgs, spec.temperature, spec.max_tokens))
-                if v is not None:
-                    samples.append(v)
-            s.score = _median(samples) if samples else None
-        elif spec.intermediate_eval == "vote":
-            s.score = parse_value(
-                await complete(s.messages + [{"role": "user", "content": spec.value_cue}],
-                               spec.temperature, spec.max_tokens)
-            )
+    n = max(1, spec.eval_samples) if spec.intermediate_eval == "value" else 1
+    # Flat-gather every (state × sample) value call so the engine co-batches the
+    # whole level's scoring (×3 per child × frontier) instead of serializing it.
+    texts = await asyncio.gather(*[
+        complete(s.messages + [{"role": "user", "content": spec.value_cue}],
+                 spec.temperature, spec.max_tokens)
+        for s in states for _ in range(n)
+    ])
+    for i, s in enumerate(states):
+        vals = [v for v in (parse_value(t) for t in texts[i * n:(i + 1) * n]) if v is not None]
+        s.score = _median(vals) if vals else None
 
 
 async def bfs(root: State, spec: TaskSpec, complete: Complete) -> list[State]:
@@ -186,9 +182,11 @@ async def bfs(root: State, spec: TaskSpec, complete: Complete) -> list[State]:
     against grade.py, NOT here (the search never sees the gold answer)."""
     frontier = [root]
     for level in range(spec.depth):
-        children: list[State] = []
-        for s in frontier:
-            children.extend(await generate(s, spec, complete))
+        # Expand every frontier state CONCURRENTLY so the whole level's
+        # generations co-batch on the engine (one batched wave per level rather
+        # than frontier×breadth serial 15s calls).
+        expansions = await asyncio.gather(*[generate(s, spec, complete) for s in frontier])
+        children: list[State] = [c for kids in expansions for c in kids]
         if not children:
             break
         last_level = level == spec.depth - 1
