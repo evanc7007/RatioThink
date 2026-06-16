@@ -223,8 +223,14 @@ def _count_tree_tokens(body: dict, count) -> int:
 async def _tot_run(http_c, base, prompt, think, breadth, temperature) -> dict:
     """One greedy/sampled tree-of-thought search at depth 1; returns the final
     answer string, the generated-token count, and the wall time. A non-200 (a
-    total branch failure returns 500) is surfaced as an error, not silently
-    scored as a wrong answer."""
+    total branch failure returns 500) — OR a transport-level failure (the wasm
+    daemon trapping/closing the socket mid-search, surfacing as an httpx
+    RemoteProtocolError/ConnectError) — is surfaced as an errored run, not
+    silently scored as a wrong answer and NOT allowed to abort the whole matrix.
+    Recording it as `status=0` keeps the failure fully disclosed (it lands in the
+    cell's n_error and the run-level failures list, forcing a non-zero verdict)
+    while letting the remaining prompts/datasets still produce numbers and
+    pin-pointing exactly where the daemon died."""
     payload = {
         "inferlet": "tree-of-thought",
         "stream": False,
@@ -240,7 +246,12 @@ async def _tot_run(http_c, base, prompt, think, breadth, temperature) -> dict:
         },
     }
     t0 = time.perf_counter()
-    r = await http_c.post(f"{base}/v1/inferlet", json=payload)
+    try:
+        r = await http_c.post(f"{base}/v1/inferlet", json=payload)
+    except httpx.HTTPError as e:
+        # Daemon dropped the connection / never replied. Disclosed, not fatal.
+        return {"status": 0, "error_body": f"{type(e).__name__}: {e}",
+                "wall_s": time.perf_counter() - t0}
     wall_s = time.perf_counter() - t0
     if r.status_code != 200:
         return {"status": r.status_code, "error_body": r.text[:400], "wall_s": wall_s}
@@ -426,7 +437,12 @@ async def main() -> int:
 
     count, unit = _load_tokenizer()
 
-    with tempfile.TemporaryDirectory(prefix="tot-accuracy-") as tmp:
+    # PIE_HOME under a SHORT /tmp dir, not the per-user $TMPDIR
+    # (/var/folders/…, ~50 chars): the portable driver opens an aux_server unix
+    # socket at $PIE_HOME/standalone/<pid>/g0/aux.sock, and the macOS sun_path
+    # limit is 104 bytes — a $TMPDIR-nested home overflows it before the engine
+    # can serve a single request.
+    with tempfile.TemporaryDirectory(prefix="ta-", dir="/tmp") as tmp:
         tmp = Path(tmp)
         cfg = tmp / "config.toml"
         cfg.write_text(CONFIG_TOML)
