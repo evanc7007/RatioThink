@@ -37,11 +37,15 @@ PER-CELL METRICS (per dataset × column):
                           is held OUT of the denominator, never scored wrong)
   * n_correct / n_wrong / n_ungradable / n_error (non-200)
   * output tokens       = Σ tokenizer tokens over every generated node
-                          (content + reasoning); the value-scoring decode is
-                          internal and not counted — disclosed, not hidden
-  * wall seconds        = end-to-end per prompt
+                          (content + reasoning) — counted ONLY for graded runs,
+                          the same population as accuracy, so the per-token
+                          efficiency numbers can't be skewed by a column's
+                          ungradable rate; the value-scoring decode is internal
+                          and not counted — both disclosed, not hidden
+  * wall seconds        = end-to-end per prompt (graded runs only, as above)
   * accuracy_per_ktok   = accuracy ÷ (mean output tokens / 1000): the
-                          accuracy-per-token axis the ticket asks for
+                          accuracy-per-token axis the ticket asks for, numerator
+                          and denominator over the same graded subset
 The row summary reports the ToT−single accuracy DELTA and the token-cost ratio,
 so "did width help, and at what token cost" is answered directly.
 
@@ -268,15 +272,22 @@ async def _bench_dataset(http_c, base, key, grader, records, total, count, failu
                 continue
             body = run["body"]
             answer = (body.get("final_answer") or "").strip()
+            verdict = g.grade(grader, answer, rec["reference"])
+            if verdict.passed is None:
+                # Ungradable (empty/no-extractable answer). Held out of BOTH the
+                # accuracy denominator AND the token/wall samples, so every
+                # per-token metric (mean_output_tokens, accuracy_per_ktok, the
+                # cross-column token_cost_ratio) divides over the SAME graded
+                # population the accuracy is computed on — no hidden mismatch
+                # between a stochastic-tot ungradable rate and greedy single.
+                ungradable += 1
+                continue
             tokens.append(_count_tree_tokens(body, count))
             walls.append(run["wall_s"])
-            verdict = g.grade(grader, answer, rec["reference"])
             if verdict.passed is True:
                 graded_pass += 1
-            elif verdict.passed is False:
-                graded_fail += 1
             else:
-                ungradable += 1
+                graded_fail += 1
         graded = graded_pass + graded_fail
         mean_tok = statistics.mean(tokens) if tokens else None
         accuracy = (graded_pass / graded) if graded else None
@@ -355,7 +366,10 @@ async def _run(base: str, count) -> tuple[dict, list[str]]:
             "soft_metric_datasets": "CNN/DM (ROUGE proxy) + MT-Bench (LLM-judge) break "
             "the deterministic/PUBLIC/reproducible spirit — separate follow-up",
         },
-        "token_accounting_caveat": "output tokens = Σ generated node content+reasoning; "
+        "token_accounting_caveat": "output tokens/wall are counted for GRADED runs "
+        "only (the same population as accuracy), so accuracy_per_ktok and "
+        "token_cost_ratio share one denominator and a column's ungradable rate "
+        "cannot skew them; output tokens = Σ generated node content+reasoning, and "
         "the internal value-scoring decode is not counted (short, capped per #649).",
         "rows": rows,
     }
