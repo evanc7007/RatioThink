@@ -14,9 +14,53 @@ Run::
 """
 from __future__ import annotations
 
+import os
 import unittest
 
 import grade as g
+
+_HAS_SANDBOX = os.path.exists(g._SANDBOX_EXEC)
+
+
+@unittest.skipUnless(_HAS_SANDBOX, "macOS sandbox-exec required")
+class SandboxIsolation(unittest.TestCase):
+    """The code graders execute MODEL-GENERATED code; prove the Seatbelt sandbox
+    blocks DESTRUCTIVE behaviour (file writes/deletes outside the work dir,
+    network) while ordinary compute still runs and a runaway is killed."""
+
+    def test_ordinary_compute_passes(self):
+        passed, _ = g.run_program("assert 6 * 7 == 42\n")
+        self.assertIs(passed, True)
+
+    def test_home_write_is_blocked(self):
+        target = os.path.expanduser("~/.sbtest_home_write_probe")
+        try:
+            g.run_program(f"open({target!r}, 'w').write('pwned')\n")
+            self.assertFalse(os.path.exists(target), "candidate wrote to HOME — sandbox leak!")
+        finally:
+            if os.path.exists(target):
+                os.remove(target)
+
+    def test_rm_of_existing_file_is_blocked(self):
+        decoy = os.path.expanduser("~/.sbtest_decoy_keepme")
+        with open(decoy, "w") as f:
+            f.write("keep")
+        try:
+            g.run_program(f"import os; os.system('rm -f {decoy}')\n")
+            self.assertTrue(os.path.exists(decoy), "candidate deleted a HOME file — sandbox leak!")
+        finally:
+            if os.path.exists(decoy):
+                os.remove(decoy)
+
+    def test_workdir_write_is_allowed(self):
+        # writing a RELATIVE file (into the throwaway cwd) must succeed.
+        passed, _ = g.run_program("open('scratch.txt','w').write('ok'); assert True\n")
+        self.assertIs(passed, True)
+
+    def test_infinite_loop_times_out_fast(self):
+        passed, detail = g.run_program("while True: pass\n", timeout=2)
+        self.assertIs(passed, False)
+        self.assertIn("timeout", detail)
 
 
 # --- extraction helpers ----------------------------------------------------

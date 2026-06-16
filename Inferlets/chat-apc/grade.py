@@ -27,7 +27,10 @@ separate from a genuine wrong answer so accuracy isn't silently deflated.
 from __future__ import annotations
 
 import json
+import os
 import re
+import resource
+import signal
 import subprocess
 import sys
 import tempfile
@@ -38,7 +41,15 @@ from typing import Callable
 # Per-task wall-clock cap for executed candidate code (s). Generous enough for
 # the trivial HumanEval/MBPP solutions, short enough that a hung/inf-loop
 # candidate is graded as a fail rather than wedging the run.
-EXEC_TIMEOUT_S = 10
+EXEC_TIMEOUT_S = float(os.environ.get("EXEC_TIMEOUT_S", "6"))
+# Hard caps for a single candidate process (defence in depth — these graders
+# execute MODEL-GENERATED code). CPU seconds bound a busy loop even if wall-clock
+# timing is contended; RLIMIT_AS caps address space (a runaway allocation);
+# RLIMIT_NPROC caps processes per uid (a fork bomb). All best-effort: a platform
+# that rejects a limit (macOS sometimes ENOSYS on RLIMIT_AS) skips it.
+EXEC_CPU_SECONDS = int(os.environ.get("EXEC_CPU_SECONDS", "10"))
+EXEC_ADDRSPACE_BYTES = int(os.environ.get("EXEC_ADDRSPACE_BYTES", str(2 * 1024**3)))
+EXEC_MAX_PROCS = int(os.environ.get("EXEC_MAX_PROCS", "64"))
 
 
 @dataclass
@@ -125,38 +136,111 @@ def _import_lines(prompt: str) -> str:
 
 
 # --- code execution --------------------------------------------------------
+#
+# These graders execute MODEL-GENERATED code. Isolation is layered:
+#   1. macOS Seatbelt (`sandbox-exec`): deny-by-default, allow file-READS (the
+#      stdlib + interpreter), allow file-WRITES ONLY under the throwaway work
+#      dir, and DENY network. This is what stops a destructive candidate —
+#      `rm -rf ~`, writing system files, network exfil — none of which can touch
+#      anything outside the work dir. Verified: a candidate's `rm`/HOME-write is
+#      EPERM'd while ordinary compute runs.
+#   2. Its own process GROUP (setsid) so a timeout kills the candidate AND any
+#      grandchildren it forked (plain subprocess timeout leaks them).
+#   3. setrlimit CPU / address-space / nproc — a busy loop, runaway allocation,
+#      or fork bomb is bounded even within the wall-clock window.
+#   4. `-I` isolated interpreter + a throwaway cwd.
+# If `sandbox-exec` is unavailable the candidate is NOT run unsandboxed by
+# default — it is reported ungradable (None) — unless EXEC_ALLOW_UNSANDBOXED=1
+# is set for a known-trusted context.
+
+_SANDBOX_EXEC = "/usr/bin/sandbox-exec"
 
 
-def run_program(program: str, timeout: float = EXEC_TIMEOUT_S) -> tuple[bool, str]:
-    """Execute `program` in an isolated subprocess. Returns (passed, detail);
-    passed is True only on a clean exit 0. An assertion failure, exception, or
-    timeout is a graded FAIL (not an error), exactly as the reference code
-    benchmarks score it."""
-    with tempfile.NamedTemporaryFile(
-        "w", suffix=".py", delete=False, encoding="utf-8"
-    ) as f:
-        f.write(program)
-        path = f.name
+def _sandbox_profile(workdir_real: str) -> str:
+    """Seatbelt: deny default; allow reads + interpreter exec; writes ONLY in the
+    work dir; no network. workdir must be the REAL path (/private/tmp/…) — macOS
+    resolves symlinks before matching, so a /tmp subpath would never match."""
+    return (
+        "(version 1)\n"
+        "(deny default)\n"
+        "(allow process-fork)\n"
+        "(allow process-exec*)\n"
+        "(allow signal (target self))\n"
+        "(allow sysctl-read)\n"
+        "(allow mach-lookup)\n"
+        "(allow file-read*)\n"
+        f'(allow file-write* (subpath "{workdir_real}") (literal "/dev/null"))\n'
+        "(deny network*)\n"
+    )
+
+
+def _rlimits():
+    """Child-side hard caps (best-effort; a platform that rejects one skips it),
+    plus its own session/process-group so a timeout reaps the whole subtree."""
+    os.setsid()
+    for res, val in ((resource.RLIMIT_CPU, EXEC_CPU_SECONDS),
+                     (resource.RLIMIT_AS, EXEC_ADDRSPACE_BYTES),
+                     (getattr(resource, "RLIMIT_NPROC", None), EXEC_MAX_PROCS)):
+        if res is None:
+            continue
+        try:
+            resource.setrlimit(res, (val, val))
+        except (ValueError, OSError):
+            pass
+
+
+def run_program(program: str, timeout: float = EXEC_TIMEOUT_S) -> tuple[bool | None, str]:
+    """Execute MODEL-GENERATED `program` under Seatbelt + a process group +
+    rlimits (see module note). Returns (passed, detail): True on clean exit 0; an
+    assertion failure / exception / timeout is a graded FAIL (False, as the
+    reference benchmarks score it); a harness/sandbox problem is None
+    (ungradable — never scored as a wrong answer)."""
+    sandboxed = os.path.exists(_SANDBOX_EXEC)
+    if not sandboxed and os.environ.get("EXEC_ALLOW_UNSANDBOXED") != "1":
+        return None, "sandbox-exec unavailable; refusing to run untrusted code"
+    workdir = Path(tempfile.mkdtemp(prefix="codeexec-")).resolve()
+    path = workdir / "candidate.py"
+    path.write_text(program, encoding="utf-8")
+    if sandboxed:
+        cmd = [_SANDBOX_EXEC, "-p", _sandbox_profile(str(workdir)),
+               sys.executable, "-I", str(path)]
+    else:
+        cmd = [sys.executable, "-I", str(path)]
+    proc = None
     try:
-        # -I: isolated mode (ignore env/site/user) so the candidate can't reach
-        # the harness's installed packages or PYTHON* env. -S as well is too
-        # aggressive (blocks `json`-via-site on some builds), so -I only.
-        proc = subprocess.run(
-            [sys.executable, "-I", path],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            cwd=str(workdir), preexec_fn=_rlimits,
         )
+        try:
+            out, err = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _kill_group(proc)
+            return False, f"timeout >{timeout}s"
         if proc.returncode == 0:
             return True, "exit 0"
-        tail = (proc.stderr or proc.stdout or "").strip().splitlines()
+        tail = (err or out or "").strip().splitlines()
         return False, (tail[-1] if tail else f"exit {proc.returncode}")
-    except subprocess.TimeoutExpired:
-        return False, f"timeout >{timeout}s"
     except Exception as e:  # noqa: BLE001
+        if proc is not None:
+            _kill_group(proc)
         return None, f"exec error: {e}"
     finally:
-        Path(path).unlink(missing_ok=True)
+        import shutil
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def _kill_group(proc) -> None:
+    """SIGKILL the candidate's whole process group (it called setsid), reaping
+    any grandchildren it forked, then reap the zombie."""
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    try:
+        proc.wait(timeout=5)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 # --- graders ---------------------------------------------------------------
