@@ -27,6 +27,7 @@ engine-free self-test pins them; the async samplers take the injected
 """
 from __future__ import annotations
 
+import asyncio
 from collections import Counter
 from typing import Awaitable, Callable
 
@@ -116,5 +117,7 @@ async def single_sample(complete: Complete, messages: list[dict],
 
 async def sample_k(complete: Complete, messages: list[dict], k: int,
                   temperature: float, max_tokens: int) -> list[str]:
-    """Draw k i.i.d. samples at the matched temperature (the B2 candidate pool)."""
-    return [await complete(messages, temperature, max_tokens) for _ in range(k)]
+    """Draw k i.i.d. samples at the matched temperature (the B2 candidate pool),
+    CONCURRENTLY so the engine co-batches them (gather preserves order)."""
+    return list(await asyncio.gather(
+        *[complete(messages, temperature, max_tokens) for _ in range(k)]))
