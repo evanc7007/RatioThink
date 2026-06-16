@@ -97,6 +97,12 @@ MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "512"))
 MAX_PROMPTS = int(os.environ.get("MAX_PROMPTS", "12"))  # 0 → whole split
 TOT_WIDTH = int(os.environ.get("TOT_WIDTH", "4"))  # k for the ToT column
 TOT_TEMPERATURE = float(os.environ.get("TOT_TEMPERATURE", "0.7"))
+# Single-chain decode temperature. Default 0.0 = greedy CoT (the canonical
+# baseline; keeps the module docstring's "single is deterministic" framing).
+# Set it equal to TOT_TEMPERATURE to ISOLATE search width as the only variable
+# (single = best-of-1 sample, tot = best-of-k samples, identical temperature) —
+# separating "did width help" from "did sampling vs greedy move the number".
+SINGLE_TEMPERATURE = float(os.environ.get("SINGLE_TEMPERATURE", "0.0"))
 ACCURACY_OUT = os.environ.get(
     "ACCURACY_OUT", f"tot_accuracy_{MODEL.replace('/', '__')}.json"
 )
@@ -107,7 +113,7 @@ LOCK_PATH = _REPO_ROOT / "Scripts" / "benchmark" / "datasets.lock"
 # The two columns. Both run through tree-of-thought; only `breadth`/`temperature`
 # differ (see module docstring). depth/beam are fixed at the single-level shape.
 COLUMNS = {
-    "single": {"breadth": 1, "temperature": 0.0},
+    "single": {"breadth": 1, "temperature": SINGLE_TEMPERATURE},
     "tot": {"breadth": TOT_WIDTH, "temperature": TOT_TEMPERATURE},
 }
 
@@ -363,11 +369,15 @@ async def _run(base: str, count) -> tuple[dict, list[str]]:
         "driver": "portable/metal",
         "decode_settings": {
             "max_tokens_per_node": MAX_TOKENS, "max_prompts": MAX_PROMPTS,
-            "tot_width": TOT_WIDTH, "tot_temperature": TOT_TEMPERATURE, "depth": 1,
+            "tot_width": TOT_WIDTH, "tot_temperature": TOT_TEMPERATURE,
+            "single_temperature": SINGLE_TEMPERATURE, "depth": 1,
         },
         "columns": {
-            "single": "single-chain CoT: breadth=1, depth=1, temperature=0 (greedy, "
-                      "deterministic baseline)",
+            "single": f"single-chain CoT: breadth=1, depth=1, temperature="
+                      f"{SINGLE_TEMPERATURE}"
+                      + (" (greedy, deterministic baseline)"
+                         if SINGLE_TEMPERATURE == 0.0
+                         else " (best-of-1 SAMPLE — width-isolation arm; STOCHASTIC)"),
             "tot": f"ToT width={TOT_WIDTH}, depth=1, temperature={TOT_TEMPERATURE} "
                    "(sampled k siblings, value-selected; STOCHASTIC)",
         },
