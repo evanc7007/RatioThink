@@ -76,7 +76,11 @@ TOT_TEMPERATURE = float(os.environ.get("TOT_TEMPERATURE", "0.7"))
 # Set it equal to TOT_TEMPERATURE to ISOLATE search width as the only variable
 # (single = best-of-1 sample, tot = best-of-k samples, identical temperature) —
 # separating "did width help" from "did sampling vs greedy move the number".
-SINGLE_TEMPERATURE = float(os.environ.get("SINGLE_TEMPERATURE", "0.0"))
+# B1's temperature. Unset → MATCH the dataset's family temperature (so B1/B2/ToT
+# decode at the same temp and only the search/sampling structure differs; B0
+# greedy stays the canonical temp-0 baseline). Set it to pin B1 explicitly.
+_SINGLE_T_ENV = os.environ.get("SINGLE_TEMPERATURE")
+SINGLE_TEMPERATURE = float(_SINGLE_T_ENV) if _SINGLE_T_ENV is not None else None
 ACCURACY_OUT = os.environ.get(
     "ACCURACY_OUT", f"tot_accuracy_{MODEL.replace('/', '__')}.json"
 )
@@ -106,8 +110,9 @@ def _task_config(family: str, grader: str) -> ta.DatasetArmsConfig:
                       "SCORE: N  (N=1 impossible … 10 sure).",
             final_cue="Now give the final answer. End with: #### <number>.",
         )
+        b1_t = SINGLE_TEMPERATURE if SINGLE_TEMPERATURE is not None else TOT_TEMPERATURE
         return ta.DatasetArmsConfig("math", grader, TOT_WIDTH, TOT_TEMPERATURE,
-                                    MAX_TOKENS, spec, single_temperature=SINGLE_TEMPERATURE)
+                                    MAX_TOKENS, spec, single_temperature=b1_t)
     if family == "code":
         spec = ts.TaskSpec(
             name="code", depth=CODE_DEPTH, breadth=TOT_WIDTH, generator="propose",
@@ -119,15 +124,16 @@ def _task_config(family: str, grader: str) -> ta.DatasetArmsConfig:
             final_cue="Write the complete Python function. Output only the function "
                       "definition.",
         )
+        b1_t = SINGLE_TEMPERATURE if SINGLE_TEMPERATURE is not None else CODE_TEMPERATURE
         return ta.DatasetArmsConfig(
             "code", grader, TOT_WIDTH, CODE_TEMPERATURE, MAX_TOKENS, spec,
             selftest_cue="Write up to 5 `assert` statements any correct "
                          "implementation must pass. Output only the assert lines.",
-            single_temperature=SINGLE_TEMPERATURE)
+            single_temperature=b1_t)
     if family == "json":
+        b1_t = SINGLE_TEMPERATURE if SINGLE_TEMPERATURE is not None else TOT_TEMPERATURE
         return ta.DatasetArmsConfig("json", grader, TOT_WIDTH, TOT_TEMPERATURE,
-                                    MAX_TOKENS, spec=None,
-                                    single_temperature=SINGLE_TEMPERATURE)
+                                    MAX_TOKENS, spec=None, single_temperature=b1_t)
     raise SystemExit(f"unknown task family {family!r}")
 
 
@@ -254,7 +260,12 @@ def _make_complete(http_c, base: str, think: bool):
         if r.status_code != 200:
             raise RuntimeError(f"chat/completions {r.status_code}: {r.text[:160]}")
         msg = (r.json().get("choices") or [{}])[0].get("message") or {}
-        return (msg.get("content") or "").strip()
+        # Thinking-ON answers can spend the whole budget in the <think> block and
+        # return empty `content` (#600/#434 truncation) — fall back to
+        # reasoning_content so the thought is non-empty (a bare empty assistant
+        # turn also 400s the next request). No-op for /no_think rows.
+        text = (msg.get("content") or "").strip() or (msg.get("reasoning_content") or "").strip()
+        return text
     return complete
 
 
@@ -299,7 +310,8 @@ async def _run(base: str, count) -> tuple[dict, list[str]]:
                    "ToT-the-method.",
         "decode_settings": {
             "max_tokens": MAX_TOKENS, "max_prompts": MAX_PROMPTS, "breadth_k": TOT_WIDTH,
-            "tot_temperature": TOT_TEMPERATURE, "single_temperature": SINGLE_TEMPERATURE,
+            "tot_temperature": TOT_TEMPERATURE,
+            "single_temperature": SINGLE_TEMPERATURE if SINGLE_TEMPERATURE is not None else "match-family",
             "code_temperature": CODE_TEMPERATURE, "math_depth": MATH_DEPTH,
             "code_depth": CODE_DEPTH,
         },
