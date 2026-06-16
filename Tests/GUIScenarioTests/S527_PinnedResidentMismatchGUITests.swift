@@ -76,12 +76,15 @@ final class S527_PinnedResidentMismatchGUITests: XCTestCase {
   private func waitForToolbarModelValue(_ expected: String,
                                         in app: XCUIApplication,
                                         timeout: TimeInterval) -> Bool {
-    let modelMenu = app.menuButtons["toolbar.model"]
+    // The redesigned `toolbar.model` is a Button (custom popover), not a native
+    // Menu; read it as a button and check label as well as value/title.
+    let modelMenu = app.buttons["toolbar.model"]
     let deadline = Date().addingTimeInterval(timeout)
     let leaf = expected.split(separator: "/").last.map(String.init) ?? expected
     while Date() < deadline {
       let value = (modelMenu.value as? String) ?? ""
-      if value.contains(expected) || modelMenu.title.contains(leaf) {
+      if value.contains(expected) || modelMenu.title.contains(leaf)
+        || modelMenu.label.contains(leaf) || modelMenu.label.contains(expected) {
         return true
       }
       RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.25))

@@ -48,7 +48,13 @@ struct TranscriptView: View {
       : ChatRetryPlan.validRetryPointIDs(
           sortedRoles: snapshot.items.map { ($0.id, $0.role.rawValue) })
 
-    return ScrollViewReader { proxy in
+    return GeometryReader { geo in
+      // Cap each bubble at ~72% of the row's content width (the pane minus the
+      // LazyVStack's 16pt horizontal padding on each side) so bubbles hug their
+      // own content instead of stretching the pane; floored, with a small floor
+      // for very narrow panes.
+      let maxBubble = max(120, floor((geo.size.width - 32) * 0.72))
+      ScrollViewReader { proxy in
       ScrollView(.vertical) {
         LazyVStack(alignment: .leading, spacing: 12) {
           if snapshot.items.isEmpty {
@@ -57,7 +63,8 @@ struct TranscriptView: View {
           ForEach(snapshot.items) { item in
             MessageBubble(message: item,
                           onRetry: retryAction(for: item, retryableIDs: retryableIDs),
-                          onEdit: editAction(for: item))
+                          onEdit: editAction(for: item),
+                          maxBubbleWidth: maxBubble)
               .id(item.id)
           }
           // Sentinel row so `scrollTo(.bottomSentinel)` lands at the
@@ -86,6 +93,7 @@ struct TranscriptView: View {
       // to the bottom. Animating here replayed a scroll up from y=0 on
       // every switch — the reported redundant-scroll effect (GH #163).
       .onAppear { scrollToBottom(proxy, animated: false) }
+      }
     }
   }
 

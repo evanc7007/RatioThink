@@ -151,17 +151,18 @@ final class MissingModelRecoveryTests: XCTestCase {
     XCTAssertFalse(MissingModelRecovery.promptAction(profileDefaultModel: nil, isInstalled: false).isDownload)   // .unavailable
   }
 
-  /// F1 edge: a present-but-INVALID staged model (a dir/symlink at the staged
-  /// path → `isModelInstalled` bare `fileExists` is true → action `.load`)
-  /// fails the engine with `.modelMissing`, but the sheet shows Open Settings,
-  /// NOT a download. The banner is the only one-click download there, so it
-  /// must NOT be suppressed even with the sheet open. Mirrors the call site's
-  /// `showNoModelPrompt && noModelAction.isDownload` gate.
+  /// F1 edge: a slug the gate reports installed (`isInstalled == true` → action
+  /// `.load`) can still fail the engine with `.modelMissing` — e.g. a TOCTOU
+  /// removal between the gate's existence check and the launch, or an artifact
+  /// the launcher's deeper validation rejects. The sheet then shows Open
+  /// Settings, NOT a download, so the banner is the only one-click download
+  /// there and must NOT be suppressed even with the sheet open. Mirrors the
+  /// call site's `showNoModelPrompt && noModelAction.isDownload` gate.
   func test_bannerTarget_not_suppressed_when_sheet_shows_settings_not_download() {
-    let status = EngineStatus.failed(code: .modelMissing, message: "staged path is a directory")
+    let status = EngineStatus.failed(code: .modelMissing, message: "model file vanished after the gate check")
     let slug = ProfileStore.defaultChatModelID
     let action = MissingModelRecovery.promptAction(profileDefaultModel: slug, isInstalled: true)
-    XCTAssertEqual(action, .load(slug), "invalid-staged edge: bare fileExists true → .load")
+    XCTAssertEqual(action, .load(slug), "installed-but-modelMissing edge: isInstalled true → .load")
     let sheetGate = true && action.isDownload   // the call site's expression
     XCTAssertNotNil(MissingModelRecovery.bannerTarget(
       engineStatus: status, profileDefaultModel: slug, sendGatePresented: sheetGate),

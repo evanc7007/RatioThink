@@ -247,73 +247,62 @@ public struct LaunchSpecResolver {
                                profile: Profile,
                                modelsRoot: URL,
                                fileManager: FileManager = .default) -> Result<String, EngineError> {
+    // Shared two-stage resolution; this method adds ONLY the memory guardrail
+    // and the `modelMissing` diagnostic on top. `localPath` / `hfIdentity` /
+    // `hfCacheRoot` are recomputed here purely to carry into the error builder
+    // (the resolution itself lives in `resolveModelArtifact`).
     let localPath = Self.joinModelPath(modelsRoot: modelsRoot, slug: model)
-    switch Self.validateAppStagedModel(at: localPath, fileManager: fileManager) {
-    case .success(true):
-      switch ModelMemoryGuardrail.validate(
-        resolvedModelURL: URL(fileURLWithPath: localPath, isDirectory: false),
+    let hfIdentity = Self.hfIdentity(forModelSlug: model)
+    let hfCacheRoot = hfHome()
+    switch Self.resolveModelArtifact(slug: model, modelsRoot: modelsRoot,
+                                     hfHome: hfCacheRoot, fileManager: fileManager) {
+    case .appStaged(let path):
+      if case .failure(let err) = ModelMemoryGuardrail.validate(
+        resolvedModelURL: URL(fileURLWithPath: path, isDirectory: false),
         modelID: model,
         policy: memoryPolicy(),
         fileManager: fileManager
       ) {
-      case .success:
-        break
-      case .failure(let err):
         return .failure(err)
       }
-      return .success(localPath)
-    case .success(false):
-      break
-    case .failure(let problem):
+      return .success(path)
+    case .hfCache(let cached):
+      if case .failure(let err) = ModelMemoryGuardrail.validate(
+        resolvedModelURL: cached,
+        modelID: model,
+        policy: memoryPolicy(),
+        fileManager: fileManager
+      ) {
+        return .failure(err)
+      }
+      return .success(cached.path)
+    case .notResolvable(.appStagedInvalid(let reason)):
       return .failure(Self.modelMissingError(
         profile: profile,
         model: model,
         appPath: localPath,
-        appPathProblem: problem.reason,
-        hfIdentity: Self.hfIdentity(forModelSlug: model),
-        hfHome: hfHome()
+        appPathProblem: reason,
+        hfIdentity: hfIdentity,
+        hfHome: hfCacheRoot
+      ))
+    case .notResolvable(.hfInvalid(let problem)):
+      return .failure(Self.modelMissingError(
+        profile: profile,
+        model: model,
+        appPath: localPath,
+        hfIdentity: hfIdentity,
+        hfHome: hfCacheRoot,
+        hfProblem: problem
+      ))
+    case .notResolvable(.absent):
+      return .failure(Self.modelMissingError(
+        profile: profile,
+        model: model,
+        appPath: localPath,
+        hfIdentity: hfIdentity,
+        hfHome: hfCacheRoot
       ))
     }
-
-    let hfIdentity = Self.hfIdentity(forModelSlug: model)
-    let hfCacheRoot = hfHome()
-    if let hfIdentity {
-      switch HFCacheResolver(hfHome: hfCacheRoot, fileManager: fileManager)
-        .resolve(repo: hfIdentity.repo, file: hfIdentity.file) {
-      case .hit(let cached):
-        switch ModelMemoryGuardrail.validate(
-          resolvedModelURL: cached,
-          modelID: model,
-          policy: memoryPolicy(),
-          fileManager: fileManager
-        ) {
-        case .success:
-          break
-        case .failure(let err):
-          return .failure(err)
-        }
-        return .success(cached.path)
-      case .miss:
-        break
-      case .invalid(let problem):
-        return .failure(Self.modelMissingError(
-          profile: profile,
-          model: model,
-          appPath: localPath,
-          hfIdentity: hfIdentity,
-          hfHome: hfCacheRoot,
-          hfProblem: problem
-        ))
-      }
-    }
-
-    return .failure(Self.modelMissingError(
-      profile: profile,
-      model: model,
-      appPath: localPath,
-      hfIdentity: hfIdentity,
-      hfHome: hfCacheRoot
-    ))
   }
 
   private struct AppStagedModelProblem: Error {
@@ -371,6 +360,93 @@ public struct LaunchSpecResolver {
       log.notice("load: app-staged model is UNVERIFIED (sha256 not checked, .unverified sidecar present) — \(path, privacy: .public)")
     }
     return .success(true)
+  }
+
+  /// The outcome of locating a model slug's on-disk artifact, WITHOUT the
+  /// memory-guardrail check — the single source of truth for the launcher's
+  /// two-stage resolution. `resolveModelRef` layers the guardrail + `ModelRef`
+  /// on top of it; `isModelResolvable` reduces it to a Bool. Sharing this
+  /// result is what stops the launcher and the send-gate from drifting apart.
+  private enum ModelArtifactResolution {
+    /// Found in Rational's app-staged models dir at `path` (a regular file or
+    /// a symlink to one).
+    case appStaged(path: String)
+    /// Found in the HuggingFace cache at `url` (a file or a snapshot dir).
+    case hfCache(url: URL)
+    /// Not loadable from either source; carries why so the launcher can build
+    /// the matching `modelMissing` diagnostic.
+    case notResolvable(NotResolvable)
+
+    enum NotResolvable {
+      /// An artifact EXISTS at the expected app-staged path but is invalid
+      /// (a directory, a broken/wrong-type file). The launch stops here and
+      /// does NOT fall through to the HF cache.
+      case appStagedInvalid(reason: String)
+      /// The HF cache holds the repo but the snapshot is incomplete/corrupt.
+      case hfInvalid(HFCacheResolver.CacheProblem)
+      /// Present in neither source — an app-staged miss plus an HF miss (or no
+      /// HF identity could be derived from the slug).
+      case absent
+    }
+  }
+
+  /// The launcher's two-stage existence resolution, shared verbatim by
+  /// `resolveModelRef` and `isModelResolvable`. App-staged path first; a
+  /// present-but-INVALID staged artifact stops here with no HF fallthrough
+  /// (exactly as a real launch fails), while an app-staged MISS falls through
+  /// to the HF cache. Existence only — no `ModelMemoryGuardrail`, no directory
+  /// creation, no xattr writes — so it is safe on the SwiftUI render path.
+  /// `hfHome == nil` skips the HF stage.
+  private static func resolveModelArtifact(slug: String,
+                                           modelsRoot: URL,
+                                           hfHome: URL?,
+                                           fileManager: FileManager) -> ModelArtifactResolution {
+    let localPath = joinModelPath(modelsRoot: modelsRoot, slug: slug)
+    switch validateAppStagedModel(at: localPath, fileManager: fileManager) {
+    case .success(true):
+      return .appStaged(path: localPath)
+    case .failure(let problem):
+      return .notResolvable(.appStagedInvalid(reason: problem.reason))
+    case .success(false):
+      break  // not app-staged → try the HF cache
+    }
+    guard let hfHome, let identity = hfIdentity(forModelSlug: slug) else {
+      return .notResolvable(.absent)
+    }
+    switch HFCacheResolver(hfHome: hfHome, fileManager: fileManager)
+      .resolve(repo: identity.repo, file: identity.file) {
+    case .hit(let cached):
+      return .hfCache(url: cached)
+    case .miss:
+      return .notResolvable(.absent)
+    case .invalid(let problem):
+      return .notResolvable(.hfInvalid(problem))
+    }
+  }
+
+  /// Read-only check of whether `slug` resolves to an on-disk model artifact
+  /// through the launcher's own two-stage resolution (`resolveModelArtifact`):
+  /// the app-staged models dir, else the HuggingFace cache. Consumes the SAME
+  /// resolution core as `resolveModelRef`, MINUS the `ModelMemoryGuardrail`
+  /// step — a present-but-too-large model is a load-time `.memoryRisk`, not a
+  /// missing one, so existence is the right question for an availability gate.
+  /// Performs no directory creation and no xattr writes, so it is safe to call
+  /// on the SwiftUI render path.
+  ///
+  /// The send-gate (`ChatScaffoldView.isModelInstalled`) consults this so a
+  /// genuinely-loadable HF-cached model (e.g. a safetensors snapshot) is
+  /// offered Load instead of being misreported "isn't available".
+  public static func isModelResolvable(slug: String,
+                                       modelsRoot: URL,
+                                       hfHome: URL?,
+                                       fileManager: FileManager = .default) -> Bool {
+    switch resolveModelArtifact(slug: slug, modelsRoot: modelsRoot,
+                                hfHome: hfHome, fileManager: fileManager) {
+    case .appStaged, .hfCache:
+      return true
+    case .notResolvable:
+      return false
+    }
   }
 
   /// Effective boot model: the user's explicit per-start selection when

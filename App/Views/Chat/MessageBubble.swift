@@ -36,6 +36,12 @@ struct MessageBubble: View {
   /// streaming), which is what gates the Edit affordance. The closure
   /// receives the new text and forks the conversation from here.
   var onEdit: ((String) -> Void)? = nil
+  /// Upper bound on a bubble's laid-out width so it hugs its own content
+  /// instead of stretching to the pane. The transcript passes ~72% of the
+  /// row's content width; the default keeps direct previews/tests sized
+  /// sensibly. The text surface gets this minus the bubble's horizontal
+  /// padding.
+  var maxBubbleWidth: CGFloat = 480
 
   @State private var isEditing = false
   @State private var editText = ""
@@ -43,26 +49,33 @@ struct MessageBubble: View {
   var body: some View {
     switch message.role {
     case .user:
-      HStack {
-        Spacer(minLength: 60)
-        if isEditing {
-          editor
-        } else {
-          bubble(background: Color.accentColor,
-                 foreground: .white,
-                 alignment: .trailing)
-        }
-      }
-      .contextMenu {
-        copyMenuItems
-        // #624: edit-and-fork from this user turn. Hidden while editing or
-        // when the scaffold withholds the hook (a stream is in flight).
-        if !isEditing, onEdit != nil {
-          Divider()
-          Button(action: beginEditing) {
-            Label("Edit", systemImage: "pencil")
+      VStack(alignment: .trailing, spacing: 4) {
+        HStack {
+          Spacer(minLength: 60)
+          if isEditing {
+            editor
+          } else {
+            bubble(background: Color.accentColor, foreground: .white)
           }
-          .accessibilityIdentifier("message.user.edit")
+        }
+        // #624: a VISIBLE Edit/Copy row under the user bubble, mirroring the
+        // assistant turn's Copy/Retry chrome. Replaces the right-click
+        // `.contextMenu` Edit, which the selectable-text NSTextView shadowed
+        // (its native menu won on right-click). Shown only when not editing
+        // and not streaming (`onEdit != nil`), right-aligned under the bubble.
+        if !isEditing, onEdit != nil {
+          HStack(spacing: 12) {
+            Spacer(minLength: 60)
+            CopyAnswerButton(text: message.content)
+            Button(action: beginEditing) {
+              Label("Edit", systemImage: "pencil")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+            .help("Edit this message — forks the conversation and re-runs it from here")
+            .accessibilityIdentifier("message.user.edit")
+          }
         }
       }
     case .assistant:
@@ -87,8 +100,7 @@ struct MessageBubble: View {
           if !message.content.isEmpty
             || (message.reasoning.isEmpty && message.tot == nil && message.finishReason == nil) {
             bubble(background: Color.secondary.opacity(0.15),
-                   foreground: .primary,
-                   alignment: .leading)
+                   foreground: .primary)
           }
           // Honest end-state: explain a missing/truncated answer rather
           // than rendering nothing. (#434)
@@ -100,15 +112,13 @@ struct MessageBubble: View {
               .reportMessageBubbleFrame(.generationPerformance(message.id))
           }
           // One quiet chrome row under the turn: the canonical-source copy
-          // path (#515 — a drag selection now spans the whole bubble (#636)
-          // and copies the RENDERED text; this button copies the verbatim
-          // Markdown SOURCE, and right-click on the selectable text surfaces
-          // AppKit's own menu rather than our `.contextMenu`, so the button
-          // stays the guaranteed source-copy affordance; see `MessageCopyPlan`)
-          // and the #513 retry control. Retry reads as turn chrome, not a
-          // primary action — the destructive part is guarded by the
-          // scaffold's confirmation when retry would erase anything beyond
-          // this stale assistant.
+          // path (#515 — a drag selection spans the whole bubble (#636) and
+          // copies the RENDERED text; this button copies the verbatim Markdown
+          // SOURCE, the guaranteed copy affordance now that message rows carry
+          // no custom right-click menu) and the #513 retry control. Retry reads
+          // as turn chrome, not a primary action — the destructive part is
+          // guarded by the scaffold's confirmation when retry would erase
+          // anything beyond this stale assistant.
           if !message.content.isEmpty || onRetry != nil {
             HStack(spacing: 12) {
               if !message.content.isEmpty {
@@ -131,7 +141,6 @@ struct MessageBubble: View {
       }
       .accessibilityElement(children: .contain)
       .accessibilityIdentifier("message.assistant")
-      .contextMenu { copyMenuItems }
     case .system:
       HStack {
         Spacer()
@@ -139,23 +148,6 @@ struct MessageBubble: View {
           .font(.caption)
           .foregroundStyle(.secondary)
         Spacer()
-      }
-      .contextMenu { copyMenuItems }
-    }
-  }
-
-  /// Canonical-source copy path (#515). A drag selection now spans the whole
-  /// rendered bubble (#636) and yields the displayed text; this menu copies the
-  /// verbatim Markdown SOURCE from `ChatMessageItem` instead — see
-  /// `MessageCopyPlan` for the answer/thinking boundary policy. (Right-click
-  /// over the selectable text surfaces AppKit's own text menu, so these items
-  /// appear on the surrounding bubble chrome.)
-  @ViewBuilder
-  private var copyMenuItems: some View {
-    ForEach(MessageCopyPlan.plan(for: message).items, id: \.label) { item in
-      Button(item.label) {
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(item.text, forType: .string)
       }
     }
   }
@@ -200,17 +192,23 @@ struct MessageBubble: View {
     .frame(maxWidth: .infinity, alignment: .trailing)
   }
 
-  private func bubble(background: Color, foreground: Color, alignment: HorizontalAlignment) -> some View {
+  /// One message bubble that hugs its own content up to `maxBubbleWidth`, then
+  /// wraps. No greedy `maxWidth: .infinity` frame — the enclosing row's
+  /// `HStack` + `Spacer` does the left/right alignment, so a short bubble stays
+  /// snug against its edge with no long empty margin beside it.
+  private func bubble(background: Color, foreground: Color) -> some View {
     // #158/#636: a single selectable `NSTextView` surface (one text storage)
     // replaces MarkdownUI's per-block `Text` rendering so a drag selection
     // spans every paragraph. Link/image security and the rendered look move
-    // into `SelectableMarkdownText` / `MarkdownAttributedString`.
-    SelectableMarkdownText(markdown: message.content, foreground: Self.nsColor(for: foreground))
+    // into `SelectableMarkdownText` / `MarkdownAttributedString`. The text
+    // surface is capped at the bubble width minus its horizontal padding (24).
+    SelectableMarkdownText(markdown: message.content,
+                           foreground: Self.nsColor(for: foreground),
+                           maxWidth: max(1, maxBubbleWidth - 24))
       .reportMessageBubbleFrame(.content(message.id))
       .padding(.horizontal, 12)
       .padding(.vertical, 8)
       .background(background, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-      .frame(maxWidth: .infinity, alignment: alignment == .trailing ? .trailing : .leading)
   }
 
   /// Maps the bubble's SwiftUI foreground to the AppKit color the attributed

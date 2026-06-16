@@ -25,6 +25,10 @@ public enum ToolbarModelOptions {
     /// Structured identity parsed from `slug` (#580): the menu groups rows by
     /// `parts.groupKey` (base) and shows `parts.quant` as the row tag.
     public let parts: ModelNameParts
+    /// Weight precision for a directory-loaded (safetensors/.bin) model — the
+    /// variant label when there is no GGUF quant, so the row reads `bf16`
+    /// instead of repeating the base name. `nil` for GGUF rows + undetermined.
+    public let precision: String?
 
     public var id: String { slug }
     public var isSelectable: Bool { unavailableReason == nil }
@@ -43,7 +47,8 @@ public enum ToolbarModelOptions {
                 isCurrent: Bool,
                 isProfileDefault: Bool,
                 unavailableReason: String? = nil,
-                isUnverified: Bool = false) {
+                isUnverified: Bool = false,
+                precision: String? = nil) {
       self.slug = slug
       self.displayName = displayName
       self.source = source
@@ -52,6 +57,7 @@ public enum ToolbarModelOptions {
       self.unavailableReason = unavailableReason
       self.isUnverified = isUnverified
       self.parts = ModelNameParts.parse(slug)
+      self.precision = precision
     }
   }
 
@@ -150,7 +156,8 @@ public enum ToolbarModelOptions {
                     isCurrent: slug == currentSlug,
                     isProfileDefault: slug == profileDefault,
                     unavailableReason: unavailableReason(for: model),
-                    isUnverified: model?.isUnverified ?? false)
+                    isUnverified: model?.isUnverified ?? false,
+                    precision: model?.precision)
     }
   }
 

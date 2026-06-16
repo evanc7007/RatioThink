@@ -63,7 +63,8 @@ final class S572_JSONThinkProfileGUITests: XCTestCase {
     // the model menu — eliminating that menu's not-key focus race entirely
     // (#545). The same-model JSON Think swap is silent because the resident
     // model is unchanged.
-    let modelMenu = app.menuButtons["toolbar.model"]
+    // The redesigned `toolbar.model` is a Button (custom popover), not a Menu.
+    let modelMenu = app.buttons["toolbar.model"]
     XCTAssertTrue(modelMenu.waitForExistence(timeout: 10),
                   "model menu missing after creating chat; app tree: \(app.debugDescription)")
     XCTAssertTrue(waitForResidentModelValue(modelMenu, servedModelID, timeout: 20),
@@ -137,9 +138,12 @@ final class S572_JSONThinkProfileGUITests: XCTestCase {
     let deadline = Date().addingTimeInterval(timeout)
     while Date() < deadline {
       let value = element.value as? String ?? ""
+      let label = element.label
       let title = element.title
-      if value == expectedModelID,
+      // The Button surfaces the reconciled served slug in its value or label.
+      if (value == expectedModelID || label == expectedModelID),
          !value.localizedCaseInsensitiveContains("profile default"),
+         !label.localizedCaseInsensitiveContains("profile default"),
          !title.localizedCaseInsensitiveContains("(Default)") {
         return true
       }

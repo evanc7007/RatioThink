@@ -34,6 +34,10 @@ struct ChatScaffoldView: View {
   @EnvironmentObject private var profileStore: ProfileStore
   @EnvironmentObject private var appPreferences: AppPreferences
   @EnvironmentObject private var downloadController: ModelDownloadController
+  /// The one live source of truth for locally installed/cached models, shared
+  /// with the Models settings table. Drives the toolbar dropdown so a delete
+  /// reflects immediately (no private rescan that a delete never invalidates).
+  @EnvironmentObject private var library: ModelLibraryStore
   /// The reconciled engine-lifecycle fold, forwarded to the toolbar pip +
   /// popover so they derive the resident/offline distinction from the single
   /// published `indicator`.
@@ -65,12 +69,13 @@ struct ChatScaffoldView: View {
   // #616: the engine's served-model list (`engineModels`) is folded by the
   // `/v1/models` reconcile and now lives on `engineCoordinator` — an engine
   // fact shared app-wide, not per-chat-view state.
-  // #580 #5: the unverified shield in the chat menu flows through
-  // `toolbarDiscoveredModels` → `ToolbarModelOptions.build` (which carries
-  // each model's `isUnverified`), so no separate unverified-slug plumbing is
-  // needed here.
-  @State private var toolbarDiscoveredModels: [InstalledModel] = []
-  @State private var didScanToolbarModels = false
+  // The toolbar model menu reads its installed/cached files from the shared
+  // `ModelLibraryStore` (the ONE source of truth the Models settings table and
+  // duplicate guard also use), NOT a private rescan. A delete in Settings
+  // republishes `library.installed`, so the dropdown drops the removed model
+  // live — fixing the stale-after-delete bug a download-completion-only rescan
+  // caused. #580 #5's unverified shield rides each `InstalledModel.isUnverified`
+  // through `ToolbarModelOptions.build`, so no separate plumbing is needed.
   /// PR#15 F2/F3: a thrown engine start/stop error (transport failure, a
   /// stop that left the engine running) that the status poll won't
   /// reflect. Surfaced via the in-chat engine-failure banner — NOT the
@@ -236,27 +241,30 @@ struct ChatScaffoldView: View {
     }
   }
 
-  /// True when the slug's app-staged model file exists — the engine's
-  /// primary model source. A miss means the prompt offers Download
-  /// instead of Load.
+  /// True when `slug` resolves to a loadable model — the engine's primary
+  /// app-staged models dir OR, failing that, the HuggingFace cache. A miss
+  /// means the prompt offers Download instead of Load.
   ///
-  /// Intentionally checks ONLY the app-staged path, not the HF cache
-  /// (the resolver's secondary fallback). A model present only in
-  /// `~/.cache/huggingface` is offered a Download here, which simply
-  /// stages a second copy into the app models dir before it resolves —
-  /// benign redundancy, not a wrong result. Mirroring the resolver's
-  /// two-stage check would couple this UI gate to resolver internals.
+  /// Delegates to `LaunchSpecResolver.isModelResolvable`, which mirrors the
+  /// launcher's own two-stage resolution. Checking ONLY the app-staged path
+  /// (the prior behavior) misreported a genuinely-loadable HF-cached model —
+  /// e.g. a safetensors snapshot the dropdown lists as selectable — as
+  /// "isn't available", because the launcher resolves it from the cache but
+  /// this gate could not see it. Sharing one predicate keeps the gate and the
+  /// launcher from disagreeing about what is loadable.
   static func isModelInstalled(_ slug: String) -> Bool {
-    // Read-only existence check that runs on the render path (the live
-    // `noModelAction` / the download CTA): resolve the models dir path
-    // WITHOUT creating it or touching xattrs. The mutating `PieDirs
-    // .models()` does `createDirectory` + `setResourceValues
-    // (isExcludedFromBackup)` on every call, so calling it here would emit
-    // main-thread filesystem WRITES on every render while the no-model
-    // sheet is open. `modelsURL()` is pure path composition; the
-    // download/staging writers still call the mutating `models()`.
-    let path = LaunchSpecResolver.joinModelPath(modelsRoot: PieDirs.modelsURL(), slug: slug)
-    return FileManager.default.fileExists(atPath: path)
+    // Read-only check that runs on the render path (the live `noModelAction` /
+    // the download CTA): resolve the models dir path WITHOUT creating it or
+    // touching xattrs. The mutating `PieDirs.models()` does `createDirectory` +
+    // `setResourceValues(isExcludedFromBackup)` on every call, so calling it
+    // here would emit main-thread filesystem WRITES on every render while the
+    // no-model sheet is open. `modelsURL()` is pure path composition, and
+    // `isModelResolvable` performs existence reads only; the download/staging
+    // writers still call the mutating `models()`.
+    LaunchSpecResolver.isModelResolvable(
+      slug: slug,
+      modelsRoot: PieDirs.modelsURL(),
+      hfHome: LaunchSpecResolver.defaultHFHome())
   }
 
   /// Kick the helper to (re)start the engine on this chat's profile —
@@ -333,7 +341,7 @@ struct ChatScaffoldView: View {
     case .unknown:
       // First paint/previews keep the injected list only until either the
       // engine reconcile or the filesystem scan has supplied real choices.
-      return didScanToolbarModels ? [] : availableModels
+      return library.freshness == .scanned ? [] : availableModels
     case .known(let ids):
       return ids
     }
@@ -354,7 +362,7 @@ struct ChatScaffoldView: View {
 
   private var toolbarModelOptions: [ToolbarModelOptions.Option] {
     ToolbarModelOptions.build(
-      discoveredModels: toolbarDiscoveredModels,
+      discoveredModels: library.installed,
       servedModelIDs: toolbarServedModelIDs,
       profileDefaultModelID: selectedProfileDefault,
       modelOverride: chats.first?.modelID,
@@ -718,8 +726,13 @@ struct ChatScaffoldView: View {
       pendingSend.disarm()
       cancelDeferredEngineSync()
     }
-    .task(id: downloadController.completionTick) {
-      await refreshToolbarModelOptions()
+    // Ensure the shared library has scanned at least once for the chat scene
+    // (the Models settings tab is the only OTHER scan trigger, and the user may
+    // never open it). After the first scan the store self-refreshes on download
+    // completion (its `$active` sink) and on a Settings delete, and republishes
+    // `library.installed` — so the dropdown stays live without a private rescan.
+    .task {
+      if library.freshness == .notScanned { await library.refresh() }
     }
     // Reflect a model the engine already has resident (e.g. after the launch
     // prompt/user-confirm path, explicit Restart, Local API start,
@@ -731,15 +744,6 @@ struct ChatScaffoldView: View {
     }
   }
 
-  @MainActor
-  private func refreshToolbarModelOptions() async {
-    let scan = await CachedModelScan.run()
-    toolbarDiscoveredModels = scan.appManaged + scan.huggingFaceCache
-    didScanToolbarModels = true
-    if let appError = scan.appError {
-      NSLog("ChatScaffold: model picker scan warning: \(appError)")
-    }
-  }
 
   /// Drive the engine-residency reconcile through the coordinator (which does
   /// the bounded `/v1/models` fetch, folds the served list into
