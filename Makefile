@@ -512,9 +512,12 @@ bench-spec-matrix: $(LOGDIR) ## Spec-decode benefit MATRIX: method × workload o
 	  echo "log: $$LOG"; \
 	  exit $$status
 
-test-tot-accuracy-selftest: ## Engine-free unit guard for the ToT accuracy harness + graders (#657): GSM8K/HumanEval/MBPP/JSONSchema graders, ungradable-held-out denominator, width token-cost. Deterministic, CI-safe.
-	uv run --project Vendor/pie/client/python --with httpx --with jsonschema \
-	  python Inferlets/chat-apc/tot_accuracy_real_test.py
+test-tot-accuracy-selftest: ## Engine-free unit guards for the faithful ToT harness (#657): graders, BFS controller (tot_search), baselines (B0/B1/B2), arm orchestration (B0/B1/B2/ToT + ToT-minus-B2). Deterministic, CI-safe.
+	@set -e; for t in tot_search_test baselines_test tot_arms_test tot_accuracy_real_test; do \
+	  echo "== $$t =="; \
+	  uv run --project Vendor/pie/client/python --with httpx --with jsonschema \
+	    python Inferlets/chat-apc/$$t.py; \
+	done
 
 bench-tot-accuracy: $(LOGDIR) ## ToT task-ACCURACY matrix: single-chain CoT vs ToT(width=k, depth=1) on PUBLIC graded datasets (#657, extends #652). Opt-in, portable Metal, needs uv + real 7-14B weights. Knobs: MODEL, MAX_TOKENS, MAX_PROMPTS, TOT_WIDTH, DATASETS, ACCURACY_OUT.
 	@set +e +o pipefail; \
