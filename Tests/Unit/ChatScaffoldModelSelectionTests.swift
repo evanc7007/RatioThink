@@ -296,6 +296,128 @@ final class ChatScaffoldModelSelectionTests: XCTestCase {
     )
   }
 
+  // MARK: - #673 chat-toolbar profile swap auto-reloads on a model change
+
+  /// Engine running on a DIFFERENT served model than the newly selected
+  /// profile would boot → the swap must relaunch the engine onto the new
+  /// model (no send required), and arm the in-flight guard.
+  func test_swap_to_different_served_model_while_running_restarts_engine() {
+    var inFlight = false
+    let outcome = ChatScaffoldView.profileSwapEngineOutcome(
+      newProfileID: "creative",
+      chatModelID: nil,
+      newProfileDefaultModel: "model-B",
+      status: .running(EngineSessionSnapshot(port: 8123,
+                                             profileID: "chat",
+                                             servedModelID: "model-A")),
+      restartInFlight: &inFlight)
+
+    XCTAssertEqual(outcome, .restart)
+    XCTAssertTrue(inFlight, "a model-changing swap must arm the restart-in-flight guard")
+  }
+
+  /// Engine running, the newly selected profile serves the SAME model → no
+  /// relaunch (mirrors #654 `selectOnly`; pie binds only the model at boot).
+  func test_swap_to_same_served_model_while_running_does_not_restart() {
+    var inFlight = false
+    let outcome = ChatScaffoldView.profileSwapEngineOutcome(
+      newProfileID: "creative",
+      chatModelID: nil,
+      newProfileDefaultModel: "model-A",
+      status: .running(EngineSessionSnapshot(port: 8123,
+                                             profileID: "chat",
+                                             servedModelID: "model-A")),
+      restartInFlight: &inFlight)
+
+    XCTAssertEqual(outcome, .selectOnly)
+    XCTAssertFalse(inFlight, "a same-model swap must not arm a restart")
+  }
+
+  /// A per-chat pinned model beats the new profile's default when deciding the
+  /// boot model — the same pin-over-default resolution the start path uses. A
+  /// pin equal to the resident model → no relaunch even if the profile default
+  /// differs.
+  func test_swap_uses_chat_pin_over_profile_default_for_model_comparison() {
+    var inFlight = false
+    let outcome = ChatScaffoldView.profileSwapEngineOutcome(
+      newProfileID: "creative",
+      chatModelID: "model-A",
+      newProfileDefaultModel: "model-B",
+      status: .running(EngineSessionSnapshot(port: 8123,
+                                             profileID: "chat",
+                                             servedModelID: "model-A")),
+      restartInFlight: &inFlight)
+
+    XCTAssertEqual(outcome, .selectOnly,
+                   "the chat's pin (model-A) matches the resident model, so the profile's model-B default must not trigger a relaunch")
+    XCTAssertFalse(inFlight)
+  }
+
+  /// #3: a swap while the engine is STOPPED must not boot the engine — the
+  /// marker-only path stays (`selectOnly`, no restart).
+  func test_swap_while_stopped_is_marker_only_no_engine_start() {
+    var inFlight = false
+    let outcome = ChatScaffoldView.profileSwapEngineOutcome(
+      newProfileID: "creative",
+      chatModelID: nil,
+      newProfileDefaultModel: "model-B",
+      status: .stopped,
+      restartInFlight: &inFlight)
+
+    XCTAssertEqual(outcome, .selectOnly)
+    XCTAssertFalse(inFlight, "a stopped-engine swap must not arm a restart")
+  }
+
+  /// A swap mid-transition (engine `.starting`) is rejected so an in-flight
+  /// launch is not torn down by a second relaunch.
+  func test_swap_while_starting_is_rejected() {
+    var inFlight = false
+    let outcome = ChatScaffoldView.profileSwapEngineOutcome(
+      newProfileID: "creative",
+      chatModelID: nil,
+      newProfileDefaultModel: "model-B",
+      status: .starting,
+      restartInFlight: &inFlight)
+
+    XCTAssertEqual(outcome, .reject)
+    XCTAssertFalse(inFlight)
+  }
+
+  /// F2: a swap to a profile with NO resolvable model (nil pin + nil default)
+  /// is not a model change — it must never tear down a running engine. The
+  /// gate short-circuits to `.selectOnly` before delegating, so the previously
+  /// working engine is left serving its current model.
+  func test_swap_to_profile_with_no_resolvable_model_does_not_restart() {
+    var inFlight = false
+    let outcome = ChatScaffoldView.profileSwapEngineOutcome(
+      newProfileID: "creative",
+      chatModelID: nil,
+      newProfileDefaultModel: nil,
+      status: .running(EngineSessionSnapshot(port: 8123,
+                                             profileID: "chat",
+                                             servedModelID: "model-A")),
+      restartInFlight: &inFlight)
+
+    XCTAssertEqual(outcome, .selectOnly,
+                   "a nil-model swap is not a model change; a running engine must not be torn down")
+    XCTAssertFalse(inFlight)
+  }
+
+  /// F1: a model-changing swap relaunches the single, app-scoped engine, so it
+  /// must honor the same stream-defer invariant as the pinned-mismatch
+  /// relaunch and the explicit Load button — defer while another chat streams,
+  /// run immediately once the app-wide stream set is idle.
+  func test_swap_relaunch_uses_stream_guard_before_restart() {
+    let chatB = UUID()
+    XCTAssertEqual(
+      ChatScaffoldView.profileSwapRelaunchDecision(inFlightChatIDs: [chatB]),
+      .deferUntilIdle,
+      "a model-changing profile swap must not restart the single engine while another chat streams")
+    XCTAssertEqual(
+      ChatScaffoldView.profileSwapRelaunchDecision(inFlightChatIDs: []),
+      .runNow)
+  }
+
   // MARK: - AC4: model label is stable / derives from the selection authority
 
   func test_label_shows_pinned_model_leaf() {
