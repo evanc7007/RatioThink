@@ -11,11 +11,6 @@ import XCTest
 /// no-op and the label mis-read while the sidebar is shown.
 @MainActor
 final class WindowStateSidebarToggleTests: XCTestCase {
-  /// Every visibility the native control or the app can leave on the binding.
-  /// `NavigationSplitViewVisibility` is not `CaseIterable`, so enumerate it.
-  private static let allVisibilities: [NavigationSplitViewVisibility] =
-    [.all, .doubleColumn, .automatic, .detailOnly]
-
   func test_toggleSidebar_from_any_visible_state_hides() {
     for visible in [NavigationSplitViewVisibility.all, .doubleColumn, .automatic] {
       let state = WindowState()
@@ -45,23 +40,30 @@ final class WindowStateSidebarToggleTests: XCTestCase {
                    "Hide after a native-control show must actually hide, not no-op")
   }
 
-  /// Mirror of the menu-label expression at `RatioThinkApp.swift:674`. Kept in
-  /// lockstep with production: the command labels the sidebar action by the same
-  /// single-hidden-state predicate the toggle uses.
-  private func sidebarMenuLabel(for visibility: NavigationSplitViewVisibility) -> String {
-    visibility == .detailOnly ? "Show Sidebar" : "Hide Sidebar"
-  }
-
-  /// The menu label must read "Show Sidebar" exactly when the sidebar is hidden
-  /// and "Hide Sidebar" for every visible state — `.all`, `.doubleColumn`, and
+  /// The menu command at `RatioThinkApp.swift` renders `WindowState`'s own
+  /// `sidebarToggleTitle`, so assert on that production property directly. The
+  /// expected labels are a hardcoded (visibility, label) table written out
+  /// independently — NOT recomputed from the production `== .detailOnly`
+  /// predicate — so a future predicate inversion or literal typo must be
+  /// reflected deliberately in this table rather than auto-satisfied by shared
+  /// logic. The label reads "Show Sidebar" only when hidden (`.detailOnly`) and
+  /// "Hide Sidebar" for every visible state — `.all`, `.doubleColumn`,
   /// `.automatic` alike — so it never mis-reads after the native control leaves
-  /// the binding at `.doubleColumn`.
-  func test_menu_label_matches_actual_visibility() {
-    for visibility in Self.allVisibilities {
-      let sidebarHidden = (visibility == .detailOnly)
-      let expected = sidebarHidden ? "Show Sidebar" : "Hide Sidebar"
-      XCTAssertEqual(sidebarMenuLabel(for: visibility), expected,
-                     "menu label must match actual visibility for \(visibility)")
+  /// the binding at `.doubleColumn`. Reverting the production predicate to
+  /// `== .all` flips the label for `.all` and `.detailOnly`, failing this
+  /// test (#685).
+  func test_sidebarToggleTitle_matches_actual_visibility() {
+    let expectations: [(NavigationSplitViewVisibility, String)] = [
+      (.detailOnly, "Show Sidebar"),
+      (.all, "Hide Sidebar"),
+      (.doubleColumn, "Hide Sidebar"),
+      (.automatic, "Hide Sidebar"),
+    ]
+    let state = WindowState()
+    for (visibility, expectedLabel) in expectations {
+      state.columnVisibility = visibility
+      XCTAssertEqual(state.sidebarToggleTitle, expectedLabel,
+                     "sidebarToggleTitle must match actual visibility for \(visibility)")
     }
   }
 }
