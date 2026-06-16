@@ -65,7 +65,14 @@ final class WindowState: ObservableObject {
   }
 
   func toggleSidebar() {
-    columnVisibility = (columnVisibility == .all) ? .doubleColumn : .all
+    // Two-column split view: the sidebar is hidden by collapsing to the detail
+    // column only (`.detailOnly`). Every other visibility — `.all`,
+    // `.doubleColumn`, `.automatic` — shows the sidebar, so key the predicate on
+    // the single hidden state. The system-injected sidebar-toggle control writes
+    // `.doubleColumn` (not `.all`) back through this binding when it shows the
+    // sidebar in a 2-column view; keying on `== .all` would miss that and make
+    // the next Hide a no-op (#677).
+    columnVisibility = (columnVisibility == .detailOnly) ? .all : .detailOnly
   }
 
   func toggleItemList() {
