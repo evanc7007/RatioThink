@@ -19,6 +19,7 @@ so the ToT arm is reported as N/A and only B0/B1/B2(first-valid) are run.
 """
 from __future__ import annotations
 
+import os
 import statistics
 import sys
 import time
@@ -30,6 +31,15 @@ import grade as g
 import tot_search as ts
 
 Complete = Callable[[list[dict], float, int], Awaitable[str]]
+
+# Optional arm filter (#657 parity runs): ARMS_ONLY="B0_greedy,ToT" runs just
+# those arms and marks the rest skipped, so a ToT-vs-ToT parity sweep doesn't
+# pay for B1/B2. Empty (default) runs all four.
+_ARMS_ONLY = {a for a in os.environ.get("ARMS_ONLY", "").split(",") if a}
+
+
+def _arm_enabled(arm: str) -> bool:
+    return not _ARMS_ONLY or arm in _ARMS_ONLY
 ARMS = ("B0_greedy", "B1_single", "B2_bestofk", "ToT")
 
 
@@ -83,6 +93,8 @@ async def run_prompt(prompt: str, reference: dict, cfg: DatasetArmsConfig,
     msgs = [{"role": "user", "content": prompt}]
     out: dict[str, dict] = {}
 
+    skipped = {"answer": None, "tokens": 0, "error": "skipped (ARMS_ONLY)"}
+
     async def _arm(fn):
         tally = _Tally(complete, count)
         try:
@@ -92,15 +104,19 @@ async def run_prompt(prompt: str, reference: dict, cfg: DatasetArmsConfig,
         return {"answer": answer, "tokens": tally.tokens, "error": None}
 
     # B0 greedy
-    out["B0_greedy"] = await _arm(lambda c: bl.greedy(c, msgs, cfg.max_tokens))
+    out["B0_greedy"] = (
+        await _arm(lambda c: bl.greedy(c, msgs, cfg.max_tokens))
+        if _arm_enabled("B0_greedy") else dict(skipped))
     # B1 single sample @ the SINGLE_TEMPERATURE arm temperature
-    out["B1_single"] = await _arm(
-        lambda c: bl.single_sample(c, msgs, cfg.single_temperature, cfg.max_tokens))
+    out["B1_single"] = (
+        await _arm(lambda c: bl.single_sample(c, msgs, cfg.single_temperature, cfg.max_tokens))
+        if _arm_enabled("B1_single") else dict(skipped))
 
     # self-generated tests for code selection (shared by B2 + ToT; NOT the
     # grading tests, so the oracle never leaks into selection).
     self_tests: list[str] = []
-    if cfg.family == "code" and cfg.selftest_cue:
+    if (_arm_enabled("B2_bestofk") or _arm_enabled("ToT")) \
+            and cfg.family == "code" and cfg.selftest_cue:
         try:
             raw = await complete(msgs + [{"role": "user", "content": cfg.selftest_cue}],
                                  cfg.temperature, cfg.max_tokens)
@@ -112,10 +128,12 @@ async def run_prompt(prompt: str, reference: dict, cfg: DatasetArmsConfig,
         pool = await bl.sample_k(c, msgs, cfg.breadth, cfg.temperature, cfg.max_tokens)
         return await _select(cfg.family, pool, reference, self_tests)
 
-    out["B2_bestofk"] = await _arm(_b2)
+    out["B2_bestofk"] = await _arm(_b2) if _arm_enabled("B2_bestofk") else dict(skipped)
 
     # ToT arm (None for json)
-    if cfg.spec is None:
+    if not _arm_enabled("ToT"):
+        out["ToT"] = dict(skipped)
+    elif cfg.spec is None:
         out["ToT"] = {"answer": None, "tokens": 0, "error": "N/A (constrained-decoding task)"}
     else:
         async def _tot(c):
@@ -182,7 +200,17 @@ async def run_dataset(records: list[dict], cfg: DatasetArmsConfig,
         dt = time.monotonic() - ps
         elapsed = time.monotonic() - t0
         eta = (elapsed / i) * (n - i)
-        print(f"[accuracy]   {cfg.family}/{cfg.grader} prompt {i}/{n} "
+        # Per-prompt ToT verdict (#657 parity): emit PASS/fail so the python ToT
+        # column can be compared PAIRED against the wasm path on identical
+        # prompts, not just as two aggregate proportions.
+        tot = res.get("ToT", {})
+        if tot.get("error"):
+            verdict = "ToT:ERR"
+        else:
+            r = g.grade(cfg.grader, tot.get("answer") or "", rec["reference"])
+            verdict = "ToT:" + ("PASS" if r.passed else "fail" if r.passed is False
+                                else "ungradable")
+        print(f"[accuracy]   {cfg.family}/{cfg.grader} prompt {i}/{n} {verdict} "
               f"done in {dt:.0f}s (elapsed {elapsed:.0f}s, eta {eta:.0f}s)",
               file=sys.stderr, flush=True)
     cells = {a: _cell(a, per_arm[a], cfg.grader, references) for a in ARMS}
