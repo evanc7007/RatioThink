@@ -388,6 +388,9 @@ async fn run_round(
                     ROOT_ID,
                     params.level,
                     *idx,
+                    // Best-of-N has no cross-sibling token penalty; its only
+                    // divergence lever is the per-candidate directive pair.
+                    &[],
                     first_directive,
                     retry_directive,
                 )

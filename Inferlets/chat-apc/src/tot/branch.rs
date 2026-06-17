@@ -58,5 +58,8 @@ pub(crate) fn round_params(
         top_p,
         thinking,
         exec: ExecStrategy::default(),
+        // Best-of-N's divergence is the per-candidate directive pair; it does
+        // not use the ToT cross-sibling token penalty (#693c).
+        sibling_penalty: 0.0,
     }
 }
