@@ -50,6 +50,10 @@ MAX_TOKENS_PER_NODE = int(os.environ.get("MAX_TOKENS", "512"))
 # gsm8k = the decisive math row; one code row (humaneval, matching the matrix's
 # strongest faithful ToT lift) makes the LLM-judge-vs-execute gap concrete.
 DATASETS = os.environ.get("DATASETS", "gsm8k,humaneval").split(",")
+# Task mode sent to the shipped inferlet. "chat" (default) = the honest BEFORE
+# (whole-answer + single greedy judge); "reasoning" = the #657 math arm
+# (value×N-median + partial-step decomposition) — the AFTER re-measure.
+TASK = os.environ.get("TASK", "chat")
 OUT = os.environ.get("WASM_BEFORE_OUT", "tot_wasm_before.json")
 _FAITHFUL = {"gsm8k": 0.750, "humaneval": 1.000, "mbpp": 0.800}  # ToT col, credible matrix
 
@@ -72,6 +76,7 @@ async def _tot_once(http_c: httpx.AsyncClient, base_url: str, prompt: str,
                 "messages": [{"role": "user", "content": prompt}],
                 "breadth": WIDTH, "depth": depth, "beam_width": WIDTH,
                 "max_tokens_per_node": MAX_TOKENS_PER_NODE,
+                "task": TASK,
             },
         },
     )
@@ -139,12 +144,14 @@ async def _run(base_url: str) -> dict:
         for key in DATASETS:
             grader = lock["datasets"][key]["grader"]
             rows.append(await _run_dataset(http_c, base_url, key, grader))
-    return {"model": base.MODEL, "width": WIDTH, "rows": rows}
+    return {"model": base.MODEL, "width": WIDTH, "task": TASK, "rows": rows}
 
 
 def _print(artifact: dict) -> None:
     print("\n" + "=" * 78)
-    print(f"SHIPPED wasm ToT — honest BEFORE — {artifact['model']} (breadth={WIDTH})")
+    label = "AFTER (math arm)" if TASK == "reasoning" else "honest BEFORE"
+    print(f"SHIPPED wasm ToT — {label} — task={TASK!r} — "
+          f"{artifact['model']} (breadth={WIDTH})")
     print("=" * 78)
     print(f"{'dataset':11} {'cover':>8} {'wasm-ToT':>9} {'faithful':>9} {'gap':>7}")
     print("-" * 78)
