@@ -226,6 +226,92 @@ final class BestOfNTests: XCTestCase {
       ["a0", "a1", "b0", "b1"])
   }
 
+  // MARK: Release-ack observability (#703 F4)
+
+  /// A release that freed every requested snapshot is silent — no short-release
+  /// line.
+  func test_shortReleaseLog_nil_when_every_snapshot_freed() {
+    XCTAssertNil(
+      ChatSendController.shortReleaseLog(
+        BestOfNReleaseAck(requested: 3, released: 3, absent: 0)))
+  }
+
+  /// A partial release (some names already evicted) surfaces the accounting so
+  /// it is not a silent success.
+  func test_shortReleaseLog_reports_partial_release() {
+    XCTAssertEqual(
+      ChatSendController.shortReleaseLog(BestOfNReleaseAck(requested: 3, released: 2, absent: 1)),
+      "best-of-n release freed 2/3 snapshots (1 already absent)")
+  }
+
+  /// A FULL miss (`released == 0`) — the symptom the ticket calls out, a
+  /// release that "freed nothing reports success" — is now logged.
+  func test_shortReleaseLog_reports_full_miss() {
+    XCTAssertEqual(
+      ChatSendController.shortReleaseLog(BestOfNReleaseAck(requested: 2, released: 0, absent: 2)),
+      "best-of-n release freed 0/2 snapshots (2 already absent)")
+  }
+
+  /// The unary control ack decodes from the single frame the release transport
+  /// yields (the wire shape `bestofn::release` emits).
+  func test_releaseAck_decodes_from_unary_frame() throws {
+    let body = Data(
+      #"{"object":"best_of_n.release","requested":3,"released":1,"absent":2}"#.utf8)
+    let ack = try JSONDecoder().decode(BestOfNReleaseAck.self, from: body)
+    XCTAssertEqual(ack, BestOfNReleaseAck(requested: 3, released: 1, absent: 2))
+  }
+
+  /// #703 F1: a 2xx frame whose body is NOT a decodable ReleaseReport (proxy
+  /// mangling, a 200-wrapped error envelope, truncation, schema drift) must
+  /// THROW, not read as a silent clean release. `decodeReleaseAck` is the seam
+  /// `releaseBestOfNSnapshots` routes through; a throw there reaches the
+  /// logging `catch` instead of exiting clean with no ack.
+  func test_decodeReleaseAck_throws_on_undecodable_2xx_frame() {
+    let garbage = Data(#"{"unexpected":"shape"}"#.utf8)
+    XCTAssertThrowsError(try ChatSendController.decodeReleaseAck(frames: [garbage]))
+  }
+
+  /// No frame arrived (e.g. an empty drain) is the ONLY nil case — distinct
+  /// from an undecodable body, so the absence of an ack is not conflated with a
+  /// decode failure.
+  func test_decodeReleaseAck_nil_when_no_frame_arrived() throws {
+    XCTAssertNil(try ChatSendController.decodeReleaseAck(frames: []))
+  }
+
+  /// A well-formed frame decodes through the same seam.
+  func test_decodeReleaseAck_decodes_well_formed_frame() throws {
+    let frame = Data(
+      #"{"object":"best_of_n.release","requested":2,"released":2,"absent":0}"#.utf8)
+    XCTAssertEqual(
+      try ChatSendController.decodeReleaseAck(frames: [frame]),
+      BestOfNReleaseAck(requested: 2, released: 2, absent: 0))
+  }
+
+  // MARK: Think-more chain frees each prior round exactly once
+
+  /// A think-more hop frees its prior round COMPLETELY and EXACTLY once: the
+  /// resume payload's picked snapshot plus the unpicked siblings together cover
+  /// every candidate of the round, with no name repeated and the picked name
+  /// not also in the unpicked drop set. The engine resume path deletes
+  /// `unpicked + picked`, so a chained multi-hop session releases one round's
+  /// snapshots per hop, never twice and never leaving one behind.
+  func test_thinkMore_resume_frees_each_prior_round_exactly_once() throws {
+    let candidates = [
+      ToTSelectionCandidate(id: "n0", branchIndex: 0, snapshotName: "s0"),
+      ToTSelectionCandidate(id: "n1", branchIndex: 1, snapshotName: "s1"),
+      ToTSelectionCandidate(id: "n2", branchIndex: 2, snapshotName: "s2"),
+    ]
+    let round = BestOfNRound(level: 1, candidates: candidates, chosenID: "n1")
+    let picked = try XCTUnwrap(round.chosen?.snapshotName)
+    let unpicked = round.unpickedSnapshotNames(excluding: "n1")
+
+    let freed = [picked] + unpicked
+    XCTAssertEqual(
+      Set(freed), Set(candidates.map(\.snapshotName)), "every candidate of the round is freed")
+    XCTAssertEqual(freed.count, candidates.count, "no snapshot is freed twice")
+    XCTAssertFalse(unpicked.contains(picked), "the picked snapshot is not also in the drop set")
+  }
+
   private struct ReleaseWire: Decodable {
     let model: String
     let release: [String]
