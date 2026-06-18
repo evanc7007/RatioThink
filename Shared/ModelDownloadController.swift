@@ -42,12 +42,7 @@ public final class ModelDownloadController: ObservableObject {
     /// Set on `.failed`, surfaced as the row's caption.
     public var errorMessage: String?
 
-    public var isTerminal: Bool {
-      switch progress.phase {
-      case .completed, .cancelled, .failed: return true
-      case .starting, .downloading, .verifying: return false
-      }
-    }
+    public var isTerminal: Bool { progress.phase.isTerminal }
 
     fileprivate var shouldAutoEvict: Bool {
       switch progress.phase {
@@ -94,8 +89,10 @@ public final class ModelDownloadController: ObservableObject {
     let result = downloader.start(repo: repo, file: file)
     switch result {
     case .failure(let err):
+      // #720: surface clean, user-facing copy in the action-error slot;
+      // the raw structured error stays in the logs / diagnostics only.
       let msg = String(describing: err)
-      lastError = "start(repo: \(repo), file: \(file)) failed: \(msg)"
+      lastError = err.userFacingMessage
       Self.log.error("ModelDownloadController enqueue failed: \(msg, privacy: .public)")
       Diag.app.event("download.fail", [("phase", "start"), ("file", file),
                                        ("reason", DiagnosticLog.redactHome(msg))])
@@ -207,14 +204,11 @@ public final class ModelDownloadController: ObservableObject {
     // mid-flight after a real cancel failure (review v5 F37).
     // Reusing `apply()` keeps the phase / errorMessage / eviction
     // wiring in one place — the producer-side reason path.
-    let synthetic = DownloadProgress(
+    let synthetic = Self.makeSyntheticFailure(
       handleID: id,
-      phase: .failed,
       bytesReceived: entry.progress.bytesReceived,
       bytesExpected: entry.progress.bytesExpected,
-      etaSeconds: nil,
-      verification: .notApplicable,
-      failureReason: msg)
+      reason: msg)
     apply(synthetic, handle: handle)
     lastError = msg
   }
@@ -242,6 +236,26 @@ public final class ModelDownloadController: ObservableObject {
 
   // MARK: - private
 
+  /// Build a terminal `.failed` `DownloadProgress` for the synthesis paths
+  /// (real cancel failure / stream-closed-without-terminal). Centralizes the
+  /// fixed shape — `.failed` phase, `.notApplicable` verification, no ETA — so
+  /// the two producers only supply the byte counters and the reason.
+  private static func makeSyntheticFailure(
+    handleID: UUID,
+    bytesReceived: Int64,
+    bytesExpected: Int64?,
+    reason: String
+  ) -> DownloadProgress {
+    DownloadProgress(
+      handleID: handleID,
+      phase: .failed,
+      bytesReceived: bytesReceived,
+      bytesExpected: bytesExpected,
+      etaSeconds: nil,
+      verification: .notApplicable,
+      failureReason: reason)
+  }
+
   private func consume(stream: AsyncStream<DownloadProgress>,
                        handle: DownloadHandle) async {
     var lastSeenPhase: DownloadProgress.Phase = .starting
@@ -256,14 +270,11 @@ public final class ModelDownloadController: ObservableObject {
     // so the UI shows the row reached an end-state and
     // `scheduleEviction` actually evicts it on the linger timer.
     if !lastSeenPhase.isTerminal {
-      let synthetic = DownloadProgress(
+      let synthetic = Self.makeSyntheticFailure(
         handleID: handle.id,
-        phase: .failed,
         bytesReceived: active[handle.id]?.progress.bytesReceived ?? 0,
         bytesExpected: active[handle.id]?.progress.bytesExpected,
-        etaSeconds: nil,
-        verification: .notApplicable,
-        failureReason: "stream closed before producer emitted a terminal phase")
+        reason: "stream closed before producer emitted a terminal phase")
       apply(synthetic, handle: handle)
     }
     scheduleEviction(of: handle.id)

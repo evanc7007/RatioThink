@@ -31,7 +31,7 @@ final class S218_CancelAffordancesGUITests: XCTestCase {
     app.launch()
     defer { app.terminate() }
     XCTAssert(app.wait(for: .runningForeground, timeout: 10),
-              "RatioThink.app did not reach runningForeground")
+              "Rational.app did not reach runningForeground")
     app.activate()
 
     // Settings → Models → Add Model… → a curated Add enqueues a download.
@@ -83,7 +83,6 @@ final class S218_CancelAffordancesGUITests: XCTestCase {
                   "download did not reach Cancelled after Discard; window: \(settings.debugDescription)")
   }
 
-
   @MainActor
   func test_failed_download_row_offers_retry_and_dismiss() throws {
     let pieHome = "/tmp/pie-s722-" + UUID().uuidString
@@ -99,7 +98,7 @@ final class S218_CancelAffordancesGUITests: XCTestCase {
     app.launch()
     defer { app.terminate() }
     XCTAssert(app.wait(for: .runningForeground, timeout: 10),
-              "RatioThink.app did not reach runningForeground")
+              "Rational.app did not reach runningForeground")
     app.activate()
 
     openModelsAddSheet(app)
@@ -131,8 +130,49 @@ final class S218_CancelAffordancesGUITests: XCTestCase {
                    "Dismiss should clear the failed row without reopening the Add Model sheet")
   }
 
-  // MARK: - helpers (narrow queries only)
+  @MainActor
+  func test_failed_download_retry_restarts_same_target() throws {
+    let pieHome = "/tmp/pie-s722-retry-" + UUID().uuidString
+    let app = XCUIApplication(bundleIdentifier: "com.ratiothink.app")
+    app.launchArguments.append(contentsOf: [
+      "-NSQuitAlwaysKeepsWindows", "NO",
+      "-ApplePersistenceIgnoreState", "YES",
+    ])
+    app.launchEnvironment["PIE_HOME"] = pieHome
+    app.launchEnvironment["PIE_TEST_FAKE_DOWNLOADS"] = "1"
+    app.launchEnvironment["PIE_TEST_FAKE_DOWNLOAD_FAILURE"] = "Download timed out — check your connection and try again."
+    app.launchEnvironment["PIE_TEST_FAKE_DOWNLOAD_FAILURE_ATTEMPTS"] = "1"
+    configureCompletedFirstLaunch(app, suiteName: stablePreferenceSuiteName(pieHome))
+    app.launch()
+    defer { app.terminate() }
+    XCTAssert(app.wait(for: .runningForeground, timeout: 10),
+              "Rational.app did not reach runningForeground")
+    app.activate()
 
+    openModelsAddSheet(app)
+
+    let curated = app.buttons
+      .matching(NSPredicate(format: "identifier BEGINSWITH %@", "CuratedAdd-")).firstMatch
+    XCTAssertTrue(curated.waitForExistence(timeout: 10),
+                  "no curated Add button; app: \(app.debugDescription)")
+    curated.click()
+
+    let settings = app.windows
+      .matching(identifier: "com_apple_SwiftUI_Settings_window").firstMatch
+    let retry = settings.buttons["DownloadRow-Retry"].firstMatch
+    XCTAssertTrue(retry.waitForExistence(timeout: 10),
+                  "first fake attempt did not reach failed row; window: \(settings.debugDescription)")
+
+    retry.click()
+
+    let cancel = settings.buttons["DownloadRow-Cancel"].firstMatch
+    XCTAssertTrue(cancel.waitForExistence(timeout: 10),
+                  "Retry did not restart the target into an in-flight row; window: \(settings.debugDescription)")
+    XCTAssertFalse(settings.buttons["DownloadRow-Retry"].exists,
+                   "Retry should leave the failed terminal row once the target restarts")
+  }
+
+  // MARK: - helpers (narrow queries only)
 
   private func openModelsAddSheet(_ app: XCUIApplication) {
     app.typeKey(",", modifierFlags: .command)
