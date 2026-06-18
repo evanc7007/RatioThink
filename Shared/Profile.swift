@@ -110,7 +110,15 @@ public struct Profile {
     let inferlet = try requireString("inferlet")
 
     let icon = table["icon"]?.string
-    let description = table["description"]?.string
+    let description: String?
+    if let rawDescription = table["description"] {
+      guard let stringDescription = rawDescription.string else {
+        throw ProfileError.invalidValue(field: "description", reason: "expected string")
+      }
+      description = stringDescription
+    } else {
+      description = nil
+    }
     let systemPrompt = table["system_prompt"]?.string
 
     var sampling = Sampling()

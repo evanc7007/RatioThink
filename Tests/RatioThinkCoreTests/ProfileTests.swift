@@ -48,6 +48,22 @@ final class ProfileTests: XCTestCase {
                    "description is user-facing prose and must not replace the engine system prompt")
   }
 
+  func test_rejects_non_string_description_before_dump_can_amputate_it() {
+    XCTAssertThrowsError(try Profile.parse(toml: """
+    id = "chat"
+    name = "Chat"
+    description = 42
+    model = "m"
+    inferlet = "chat-apc"
+    """)) { err in
+      guard case ProfileError.invalidValue(let field, let reason) = err else {
+        return XCTFail("expected .invalidValue for non-string description, got \(err)")
+      }
+      XCTAssertEqual(field, "description")
+      XCTAssertEqual(reason, "expected string")
+    }
+  }
+
   func test_applies_sampling_defaults_when_section_omitted() throws {
     let toml = """
     id = "x"
