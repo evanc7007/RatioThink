@@ -214,13 +214,32 @@ struct MissingModelDownloadCTA: View {
     downloads: ModelDownloadController
   ) -> DownloadActionResult {
     guard let id = downloads.retry(id: entryID) else {
-      // Preserve the failed row when retry cannot start, but surface the
-      // same enqueue-time error copy as the initial Download path.
+      // `retry(id:)` deliberately preserves the failed row when the new
+      // start returns nil. Keep tracking that retained row so the CTA stays
+      // on the failed-row Retry surface instead of falling back to the
+      // initial Download path, which would use enqueueOrAdopt and orphan the
+      // persisted failure.
+      let retainedFailedID: UUID? = {
+        guard downloads.active[entryID]?.progress.phase == .failed else { return nil }
+        return entryID
+      }()
       return DownloadActionResult(
-        handleID: nil,
+        handleID: retainedFailedID,
         enqueueError: downloads.lastError ?? "Could not start download")
     }
     return DownloadActionResult(handleID: id, enqueueError: nil)
+  }
+
+
+  @MainActor
+  static func retryAffordanceIsRenderable(
+    handleID: UUID?,
+    downloads: ModelDownloadController
+  ) -> Bool {
+    guard let handleID,
+      let entry = downloads.active[handleID]
+    else { return false }
+    return entry.progress.phase == .failed
   }
 
   /// Whether this target's file is already staged on disk. The download

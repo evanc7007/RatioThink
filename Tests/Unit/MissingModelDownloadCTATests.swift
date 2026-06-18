@@ -55,12 +55,19 @@ final class MissingModelDownloadCTATests: XCTestCase {
       entryID: failed.id,
       downloads: controller)
 
-    XCTAssertNil(result.handleID)
+    XCTAssertEqual(
+      result.handleID, failed.id,
+      "CTA Retry must keep tracking the retained failed row when retry start fails")
     XCTAssertEqual(result.enqueueError, controller.lastError ?? "Could not start download")
     XCTAssertNotNil(result.enqueueError)
     XCTAssertEqual(
       controller.active[failed.id]?.progress.phase, .failed,
       "retry(id:) should preserve the stale failed row when the new start returns nil")
+    XCTAssertTrue(
+      MissingModelDownloadCTA.retryAffordanceIsRenderable(
+        handleID: result.handleID,
+        downloads: controller),
+      "missingModel.retry must remain renderable alongside the enqueue error")
   }
 }
 
