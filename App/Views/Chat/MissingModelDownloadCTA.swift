@@ -165,26 +165,62 @@ struct MissingModelDownloadCTA: View {
       Text(entry.errorMessage ?? "Download failed")
         .font(.caption).foregroundStyle(.secondary)
         .lineLimit(2).truncationMode(.tail)
-      Button("Retry", action: startDownload)
+      Button("Retry") { retryDownload(entry) }
         .buttonStyle(.bordered)
         .accessibilityIdentifier("missingModel.retry")
     }
   }
 
   private func startDownload() {
-    enqueueError = nil
+    applyDownloadAction(Self.startDownload(downloads: downloads, target: target))
+  }
+
+  private func retryDownload(_ entry: ModelDownloadController.ActiveDownload) {
+    applyDownloadAction(Self.retryFailedDownload(entryID: entry.id, downloads: downloads))
+  }
+
+  private func applyDownloadAction(_ result: DownloadActionResult) {
+    enqueueError = result.enqueueError
     didComplete = false
+    handleID = result.handleID
+  }
+
+  struct DownloadActionResult: Equatable {
+    let handleID: UUID?
+    let enqueueError: String?
+  }
+
+  @MainActor
+  static func startDownload(
+    downloads: ModelDownloadController,
+    target: ModelDownloadTarget
+  ) -> DownloadActionResult {
     // Adopt an in-flight download for the same target rather than
     // tripping the downloader's dedupe (which would return nil + a
     // confusing "already downloading" error).
-    if let id = downloads.enqueueOrAdopt(repo: target.repo, file: target.file) {
-      handleID = id
-    } else {
+    guard let id = downloads.enqueueOrAdopt(repo: target.repo, file: target.file) else {
       // `enqueue` returned nil — surface the controller's reason instead
       // of looking like the button did nothing.
-      handleID = nil
-      enqueueError = downloads.lastError ?? "Could not start download"
+      return DownloadActionResult(
+        handleID: nil,
+        enqueueError: downloads.lastError ?? "Could not start download")
     }
+    return DownloadActionResult(handleID: id, enqueueError: nil)
+  }
+
+  @MainActor
+  static func retryFailedDownload(
+    entryID: UUID,
+    downloads: ModelDownloadController
+  ) -> DownloadActionResult {
+    guard let id = downloads.retry(id: entryID) else {
+      // Preserve the failed row when retry cannot start, but surface the
+      // same enqueue-time error copy as the initial Download path.
+      return DownloadActionResult(
+        handleID: nil,
+        enqueueError: downloads.lastError ?? "Could not start download")
+    }
+    return DownloadActionResult(handleID: id, enqueueError: nil)
   }
 
   /// Whether this target's file is already staged on disk. The download
