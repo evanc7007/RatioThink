@@ -2578,6 +2578,260 @@ final class ProfileStoreTests: XCTestCase {
     }
   }
 
+  // MARK: - strict built-in policy: hide retired built-ins (#718)
+
+  /// The headline #718 acceptance, end-to-end: a CUSTOMIZED built-in that a
+  /// newer version RETIRED (its file carries a `builtin-origin` marker whose
+  /// origin is no longer shipped) must vanish from the picker and be preserved
+  /// as `.bak` — while a genuine USER-AUTHORED profile (no marker, non-base
+  /// id) stays visible. Mutation-proof: drop the `mergeEffective` hide and the
+  /// retired built-in re-appears; drop the migration and the file is not
+  /// backed up.
+  func test_strict_policy_hides_retired_builtin_keeps_user_authored() throws {
+    try withTempProfilesDir { dir in
+      // A built-in retired in a newer version: marker names a dead origin, and
+      // the user had customized it (pinned a model).
+      let retired = """
+      \(ProfileStore.builtinOriginKey) = "retired-thinker"
+      id = "retired-thinker"
+      name = "My Retired Thinker"
+      model = "Org/Repo/pinned.gguf"
+      inferlet = "chat-apc"
+      """
+      let retiredURL = dir.appendingPathComponent("retired-thinker.toml")
+      try retired.write(to: retiredURL, atomically: true, encoding: .utf8)
+
+      // A genuine user-authored profile: no marker, non-base id.
+      let mine = """
+      id = "my-own-thing"
+      name = "My Own Thing"
+      model = "Org/Repo/mine.gguf"
+      inferlet = "chat-apc"
+      """
+      try mine.write(to: dir.appendingPathComponent("my-own-thing.toml"),
+                     atomically: true, encoding: .utf8)
+
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+
+      let fm = FileManager.default
+      // Retired built-in: absent from the effective set, file moved aside.
+      XCTAssertNil(store.entries.first { $0.profile?.id == "retired-thinker" },
+                   "a customized RETIRED built-in must not appear in the picker")
+      XCTAssertFalse(fm.fileExists(atPath: retiredURL.path),
+                     "the retired built-in file must be moved aside")
+      XCTAssertTrue(fm.fileExists(atPath: retiredURL.path + ".bak"),
+                    "the retired built-in must be preserved as .bak, not destroyed")
+      // User-authored profile: untouched and still shown.
+      let mineEntry = try XCTUnwrap(
+        store.entries.first { $0.profile?.id == "my-own-thing" },
+        "a user-authored profile (no marker) must stay visible")
+      XCTAssertEqual(mineEntry.profile?.name, "My Own Thing")
+      // Base built-ins intact.
+      XCTAssertNotNil(store.entries.first { $0.profile?.id == "chat" }?.profile,
+                      "the strict policy must not touch base built-ins")
+    }
+  }
+
+  /// The required marked-vs-unmarked distinction, exercised on the pure
+  /// `mergeEffective` discriminator (no disk): a non-winning user entry whose
+  /// `builtin-origin` is no longer shipped is HIDDEN; an unmarked user entry
+  /// with the same non-base id is APPENDED. Mutation-proof: without the
+  /// `builtinOrigin`/`shippedBuiltinIDs` guard both would surface identically.
+  func test_mergeEffective_hides_marked_retired_keeps_unmarked_user() throws {
+    let dir = URL(fileURLWithPath: "/tmp/profiles")
+    let base = ProfileStore.baseEntries(directory: dir)
+
+    func entry(_ filename: String, _ toml: String) throws -> ProfileLoadResult {
+      ProfileLoadResult(url: dir.appendingPathComponent(filename),
+                        profile: try Profile.parse(toml: toml), error: nil, warnings: [])
+    }
+    // Same non-base id "ghost" — the ONLY difference is the marker.
+    let marked = try entry("ghost.toml", """
+      \(ProfileStore.builtinOriginKey) = "ghost"
+      id = "ghost"
+      name = "Marked Ghost"
+      inferlet = "chat-apc"
+      """)
+    let unmarked = try entry("keeper.toml", """
+      id = "keeper"
+      name = "User Keeper"
+      inferlet = "chat-apc"
+      """)
+
+    let merged = ProfileStore.mergeEffective(base: base, user: [marked, unmarked])
+    let ids = Set(merged.compactMap { $0.profile?.id })
+    XCTAssertFalse(ids.contains("ghost"),
+                   "a marked retired built-in (origin not shipped) must be hidden")
+    XCTAssertTrue(ids.contains("keeper"),
+                  "an unmarked user-authored profile must be kept (#709/#706 invariant)")
+  }
+
+  /// A marker whose origin IS still shipped is NOT a retirement — the file
+  /// stays visible. Guards against the hide firing on a live built-in id.
+  func test_mergeEffective_keeps_marked_file_when_origin_still_shipped() throws {
+    let dir = URL(fileURLWithPath: "/tmp/profiles")
+    let base = ProfileStore.baseEntries(directory: dir)
+    // A marked file whose origin is the live `chat` id but a divergent own id
+    // (a hand-edited copy). origin shipped -> must survive as a user entry.
+    let marked = ProfileLoadResult(
+      url: dir.appendingPathComponent("copy-of-chat.toml"),
+      profile: try Profile.parse(toml: """
+      \(ProfileStore.builtinOriginKey) = "chat"
+      id = "copy-of-chat"
+      name = "Copy of Chat"
+      inferlet = "chat-apc"
+      """), error: nil, warnings: [])
+
+    let merged = ProfileStore.mergeEffective(base: base, user: [marked])
+    XCTAssertTrue(merged.contains { $0.profile?.id == "copy-of-chat" },
+                  "a marker pointing at a still-shipped built-in is not a retirement")
+  }
+
+  /// Back-compat recognizer: every CURRENT built-in filename must be in the
+  /// historical map (mapped to its own id) so that when one is later RETIRED
+  /// from `baseBuiltins`, an already-installed (pre-marker) copy is still
+  /// recognized by filename and hidden. Guards against a future built-in being
+  /// added to `baseBuiltins` but forgotten in `historicalBuiltinFilenames`.
+  func test_historical_filenames_cover_every_shipped_builtin() {
+    for builtin in ProfileStore.baseBuiltins {
+      XCTAssertEqual(ProfileStore.historicalBuiltinFilenames[builtin.filename], builtin.id,
+                     "historicalBuiltinFilenames must map \(builtin.filename) -> \(builtin.id)")
+    }
+  }
+
+  /// Every base constant must carry a `builtin-origin` marker equal to its id,
+  /// so an override written from it lands the provenance on disk. Drift guard:
+  /// a new built-in added without the marker would be invisible to the strict
+  /// policy until retired — fail here instead.
+  func test_every_base_builtin_constant_is_marked_with_its_origin() throws {
+    for builtin in ProfileStore.baseBuiltins {
+      let parsed = try Profile.parse(toml: builtin.toml)
+      XCTAssertEqual(parsed.builtinOrigin, builtin.id,
+                     "base constant \(builtin.id) must stamp builtin-origin = \(builtin.id)")
+    }
+  }
+
+  /// Customizing a base built-in (`setModel`) must persist the
+  /// `builtin-origin` marker to disk — the source of the provenance that lets
+  /// a LATER version recognize this file as a retired built-in even after the
+  /// user renamed nothing but the model. Without the marker in the base
+  /// constants this override would be indistinguishable from a user file.
+  func test_setModel_on_base_builtin_persists_builtin_origin_marker() throws {
+    try withTempProfilesDir { dir in
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+
+      try store.setModel("Org/Repo/pinned.gguf", forProfileID: "json-think")
+
+      let onDisk = try Profile.parse(toml: String(
+        contentsOf: dir.appendingPathComponent("json-think.toml"), encoding: .utf8))
+      XCTAssertEqual(onDisk.builtinOrigin, "json-think",
+                     "an override written from a base built-in must carry its builtin-origin")
+      XCTAssertEqual(onDisk.model, "Org/Repo/pinned.gguf", "the customization must persist too")
+    }
+  }
+
+  /// #718 F2: a pre-existing `<name>.toml.bak` (a backup the system wrote on a
+  /// prior run) must NOT be destroyed when another retired built-in is moved
+  /// aside — the new backup takes a non-colliding `.bak-2` name. "Preserved,
+  /// not destroyed" applies to earlier backups too.
+  func test_retired_builtin_backup_does_not_clobber_existing_bak() throws {
+    try withTempProfilesDir { dir in
+      let toml = """
+      builtin-origin = "retired-x"
+      id = "retired-x"
+      name = "Retired X"
+      inferlet = "chat-apc"
+      """
+      try toml.write(to: dir.appendingPathComponent("retired-x.toml"),
+                     atomically: true, encoding: .utf8)
+      // A backup the system wrote on a previous run.
+      let priorBak = dir.appendingPathComponent("retired-x.toml.bak")
+      try "PRIOR BACKUP — must survive".write(to: priorBak, atomically: true, encoding: .utf8)
+
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+
+      let fm = FileManager.default
+      XCTAssertEqual(try String(contentsOf: priorBak, encoding: .utf8),
+                     "PRIOR BACKUP — must survive",
+                     "an existing .bak must not be overwritten by a later retired-built-in move")
+      XCTAssertTrue(fm.fileExists(atPath: dir.appendingPathComponent("retired-x.toml.bak-2").path),
+                    "the new backup must take a non-colliding .bak-2 name")
+      XCTAssertFalse(fm.fileExists(atPath: dir.appendingPathComponent("retired-x.toml").path),
+                     "the retired built-in must be moved aside")
+    }
+  }
+
+  /// #718 F3: when an earlier migration ALSO fails, a retired-built-in move
+  /// failure must still reach `_builtinSeedError` (priority surface), not be
+  /// swallowed by the old `??` chain. Read-only dir fails both an unparseable
+  /// current built-in's backup AND the retired built-in's move; the snapshot
+  /// must point at the retired file, proving provenance is not swallowed.
+  func test_provenance_move_failure_surfaces_even_when_earlier_migration_failed() throws {
+    try withTempProfilesDir { dir in
+      // Earlier domain: an unparseable current built-in → migrateSeededBuiltins
+      // backup fails under read-only.
+      try "id = \"repeat-boost\"\n".write(
+        to: dir.appendingPathComponent(ProfileStore.defaultRepeatBoostFilename),
+        atomically: true, encoding: .utf8)
+      // Provenance domain: a marked retired built-in → its move fails too.
+      try """
+      builtin-origin = "retired-x"
+      id = "retired-x"
+      name = "Retired X"
+      inferlet = "chat-apc"
+      """.write(to: dir.appendingPathComponent("retired-x.toml"),
+                atomically: true, encoding: .utf8)
+      try setPermissions(dir, mode: 0o500)
+      defer { try? setPermissions(dir, mode: 0o755) }
+
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+
+      guard case .seedFailed(let path, _)? = store.snapshot.directoryError else {
+        return XCTFail("a provenance move failure must surface on directoryError; got \(String(describing: store.snapshot.directoryError))")
+      }
+      XCTAssertTrue(path.hasSuffix("retired-x.toml"),
+                    "provenance error must win the channel even when an earlier migration also failed; got \(path)")
+    }
+  }
+
+  /// #718 F4: an UNREADABLE file is not silently skipped — provenance falls
+  /// through to the filename recognizer. A shipped built-in at a known
+  /// filename (here `chat.toml`, unreadable) is recognized as shipped and left
+  /// in place (NOT moved aside). Proves the read-failure path reaches
+  /// recognition instead of `continue`-ing past it. (The retired-move-aside on
+  /// read failure shares the move block exercised by F2/F3; a non-shipped
+  /// historical filename cannot exist until a built-in is actually retired.)
+  func test_unreadable_shipped_builtin_is_recognized_and_left_in_place() throws {
+    try withTempProfilesDir { dir in
+      let chat = dir.appendingPathComponent("chat.toml")
+      try "id = \"chat\"\nname = \"Chat\"\ninferlet = \"chat-apc\"\n".write(
+        to: chat, atomically: true, encoding: .utf8)
+      try setPermissions(chat, mode: 0o000)
+      defer { try? setPermissions(chat, mode: 0o644) }
+
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+
+      let fm = FileManager.default
+      XCTAssertTrue(fm.fileExists(atPath: chat.path),
+                    "an unreadable SHIPPED built-in must be left in place, not moved aside")
+      XCTAssertFalse(fm.fileExists(atPath: dir.appendingPathComponent("chat.toml.bak").path),
+                     "a shipped built-in must not be backed up by the retirement migration")
+      // The base chat is always present regardless of the unreadable file.
+      XCTAssertNotNil(store.entries.first { $0.profile?.id == "chat" }?.profile,
+                      "the base chat built-in remains available")
+    }
+  }
+
   /// #706 F3: `BaseBuiltin.name` is hand-carried alongside the TOML so the
   /// revert notice can label a built-in without re-parsing. Guard the desync:
   /// a future TOML `name` edit that forgets the struct must fail here.

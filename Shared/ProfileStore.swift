@@ -293,6 +293,7 @@ public final class ProfileStore: ObservableObject {
   public static let defaultChatHFRepoID = "Qwen/Qwen3-0.6B-GGUF"
 
   public static let defaultChatTOML: String = """
+  builtin-origin = "chat"
   id = "chat"
   name = "Chat"
   icon = "bubble.left.and.bubble.right"
@@ -322,6 +323,7 @@ public final class ProfileStore: ObservableObject {
   /// a ToT profile without hand-editing TOML.
   public static let treeOfThoughtFilename = "tree-of-thought.toml"
   public static let treeOfThoughtTOML: String = """
+  builtin-origin = "tree-of-thought"
   id = "tree-of-thought"
   name = "Tree of Thought"
   icon = "point.3.connected.trianglepath.dotted"
@@ -355,6 +357,7 @@ public final class ProfileStore: ObservableObject {
   /// like tree-of-thought, never auto-selected. `thinking` is omitted (the
   /// server defaults it off, #679).
   public static let bestOfNTOML: String = """
+  builtin-origin = "best-of-n"
   id = "best-of-n"
   name = "Best of N"
   icon = "square.grid.2x2"
@@ -402,6 +405,7 @@ public final class ProfileStore: ObservableObject {
   /// enabled. `leader_len`/`draft_len` are omitted so the inferlet applies
   /// its #418 defaults (1 / 3).
   public static let defaultRepeatBoostTOML: String = """
+  builtin-origin = "repeat-boost"
   id = "repeat-boost"
   name = "Repeat Boost"
   icon = "bolt"
@@ -434,6 +438,7 @@ public final class ProfileStore: ObservableObject {
   /// guarantee is the `[constraint]` grammar, not the prompt. Sampling is
   /// left at the chat default (JSON mode does not require greedy decode).
   public static let defaultJSONThinkTOML: String = """
+  builtin-origin = "json-think"
   id = "json-think"
   name = "JSON Think"
   icon = "curlybraces"
@@ -488,6 +493,41 @@ public final class ProfileStore: ObservableObject {
   /// Ids of the EXAMPLE built-ins — excluded from the base set when
   /// `seedsExampleProfiles` is false (hermetic scan/lifecycle tests).
   public static let exampleBuiltinIDs: Set<String> = [treeOfThoughtProfileID, bestOfNProfileID]
+
+  /// Every built-in id the CURRENT version ships, regardless of the
+  /// `seedsExampleProfiles` flag (examples included). This is the "shipped
+  /// base set" of the strict built-in policy (#718): a file carrying a
+  /// `builtin-origin` marker whose origin is absent here is a built-in that a
+  /// newer version RETIRED, and is hidden. Distinct from `mergeEffective`'s
+  /// per-merge `basePresentIDs` (which drops examples when excluded, #709):
+  /// example exclusion is a test-only base trim, NOT a retirement, so it must
+  /// not trigger the hide.
+  public static let shippedBuiltinIDs: Set<String> = Set(baseBuiltins.map { $0.id })
+
+  /// Top-level TOML key recording a built-in's provenance
+  /// (`Profile.builtinOrigin`). Stamped into every base constant above, so an
+  /// override WRITTEN from a base built-in (`setModel` / editor -> `dump`)
+  /// carries it automatically — the marker is then an id-independent lineage
+  /// signal on disk. A user-authored profile created from scratch has no such
+  /// key. See #718.
+  public static let builtinOriginKey = "builtin-origin"
+
+  /// Every built-in FILENAME ever shipped, mapped to its provenance id. A
+  /// superset of the current `baseBuiltins` filenames: when a built-in is
+  /// RETIRED from `baseBuiltins`, leave its filename here so an
+  /// already-installed (pre-marker) copy is still recognized as a dead
+  /// built-in — `migrateBuiltinProvenance` recognizes it by filename, stamps
+  /// the marker, and moves it aside (#718). `fast-think.toml` is included for
+  /// the rare case the #628 rename migration could not move it; its origin is
+  /// the live `repeat-boost` id so it is treated as a current built-in.
+  public static let historicalBuiltinFilenames: [String: String] = [
+    defaultChatFilename:        defaultProfileID,
+    defaultRepeatBoostFilename: defaultRepeatBoostProfileID,
+    treeOfThoughtFilename:      treeOfThoughtProfileID,
+    defaultJSONThinkFilename:   defaultJSONThinkProfileID,
+    bestOfNFilename:            bestOfNProfileID,
+    legacyFastThinkFilename:    defaultRepeatBoostProfileID,
+  ]
 
   /// Non-fatal notice (#702): a user's customization of a built-in failed to
   /// parse, so the migration moved the broken file aside (`bakFilename`) and
@@ -597,7 +637,20 @@ public final class ProfileStore: ObservableObject {
     // Append every user entry that did not win an override: non-base valid
     // ids, parse-failed entries (no id), AND losing duplicate-base-id files
     // (#706 F2 — a duplicated built-in stays visible, never silently dropped).
-    for (i, u) in user.enumerated() where !winning.contains(i) { merged.append(u) }
+    //
+    // EXCEPT a stale RETIRED built-in (#718): a file carrying a
+    // `builtin-origin` marker whose origin is no longer in the shipped set is
+    // a built-in a newer version dropped. Hide it — do NOT surface it as a
+    // user profile (its on-disk copy is moved aside by
+    // `migrateBuiltinProvenance`). An UNMARKED file (no `builtin-origin`) is
+    // user-authored and always appended, preserving the #709/#706 invariant
+    // that genuine user profiles with non-base ids are never dropped.
+    for (i, u) in user.enumerated() where !winning.contains(i) {
+      if let origin = u.profile?.builtinOrigin, !shippedBuiltinIDs.contains(origin) {
+        continue
+      }
+      merged.append(u)
+    }
 
     return merged.sorted { $0.url.lastPathComponent < $1.url.lastPathComponent }
   }
@@ -868,7 +921,30 @@ public final class ProfileStore: ObservableObject {
       //     file stops shadowing the base. A move failure rides the shared
       //     `_builtinSeedError` channel.
       let (builtinBackupError, revertNotices) = self.migrateSeededBuiltins()
-      let builtinSeedError = migrationError ?? builtinBackupError
+      //  3. Strict built-in policy (#718): recognize a built-in a newer
+      //     version RETIRED (by its `builtin-origin` marker or historical
+      //     filename) and move it aside so a customized dead built-in stops
+      //     appearing in the picker. It does NOT write the marker — that is
+      //     seeded via the base TOML constants and rides the override dump.
+      //     Runs after the dedup pass so `migrateSeededBuiltins` has already
+      //     cleared byte-equal current stock copies first.
+      let provenanceError = self.migrateBuiltinProvenance()
+      // #718 F3a: three independent migration error domains share one
+      // `_builtinSeedError` slot. The old priority `??` reported
+      // `provenanceError` ONLY when both earlier migrations succeeded, so a
+      // retired-built-in move failure could be swallowed behind an unrelated
+      // earlier error. Log every failure independently (none silent), and
+      // surface `provenanceError` FIRST so a strict-policy move failure always
+      // reaches the snapshot's `directoryError`.
+      let migrationFailures: [(String, ProfileStoreError)] =
+        [("fast-think rename", migrationError),
+         ("seeded-builtin dedup", builtinBackupError),
+         ("retired-builtin provenance", provenanceError)]
+        .compactMap { name, err in err.map { (name, $0) } }
+      if migrationFailures.count > 1 {
+        Log.store.error("start: \(migrationFailures.count) profile migrations failed (\(migrationFailures.map(\.0).joined(separator: ", "), privacy: .public)); surfacing provenance-first")
+      }
+      let builtinSeedError = provenanceError ?? builtinBackupError ?? migrationError
       // Seed the active-profile marker -> chat on a FRESH install (no user
       // `*.toml` files yet) so the first menu-bar Resume resolves into a real
       // start. Gated on emptiness so a populated install with no marker keeps
@@ -1705,6 +1781,94 @@ public final class ProfileStore: ObservableObject {
       }
     }
     return (firstError, reverts)
+  }
+
+  /// Strict built-in policy reconciliation (#718). Runs at `start()` AFTER
+  /// `migrateSeededBuiltins` (which has already deleted byte-equal stock
+  /// copies of the CURRENT built-ins, so only real overrides and unrecognized
+  /// files remain). For every on-disk `*.toml`, resolve its built-in
+  /// provenance and hide it if the built-in it descends from is RETIRED:
+  ///
+  ///   · Provenance = the `builtin-origin` marker if present, else — for a
+  ///     file at a historical built-in FILENAME — the mapped origin id IFF
+  ///     the file's own id matches that built-in (a genuine pre-marker
+  ///     override, not a #706 filename squatter) or it cannot be parsed OR
+  ///     READ (a broken/unreadable built-in at a known filename, #718 F4). A
+  ///     file with NEITHER a marker nor a recognized built-in filename is
+  ///     USER-AUTHORED and left untouched — the #709/#706 invariant that
+  ///     genuine user profiles are never removed.
+  ///   · provenance id no longer in the SHIPPED set -> a built-in a newer
+  ///     version RETIRED: MOVE to a non-colliding `<name>.toml.bak` so it
+  ///     stops being scanned (and `mergeEffective` hides any marked copy that
+  ///     slips through). Preserved, not destroyed (#718 acceptance) — an
+  ///     existing backup the system wrote is NEVER overwritten (#718 F2).
+  ///
+  /// The historical filename map is what catches an ALREADY-INSTALLED stale
+  /// built-in (no version ships the marker yet); the marker is the
+  /// id-independent discriminator going forward. Idempotent: a shipped or
+  /// user-authored file is left in place. Returns the first move failure
+  /// (rides the shared `_builtinSeedError` channel; the caller surfaces it
+  /// with priority, #718 F3); a failure on one file never blocks the rest. A
+  /// move FAILURE leaves the file on disk where `mergeEffective` still hides
+  /// the marked copy — intentional: the built-in is correctly gone from the
+  /// picker AND the failure is loud via `directoryError`, not silent.
+  private func migrateBuiltinProvenance() -> ProfileStoreError? {
+    let fm = FileManager.default
+    let urls = ((try? fm.contentsOfDirectory(
+      at: directory, includingPropertiesForKeys: nil,
+      options: [.skipsHiddenFiles])) ?? []).filter(Self.isProfileTOML)
+    var firstError: ProfileStoreError?
+    for url in urls {
+      let filename = url.lastPathComponent
+      // #718 F4: an unreadable file is NOT silently skipped — log it (mirroring
+      // migrateSeededBuiltins) and fall through with profile==nil so the
+      // filename recognizer can still move aside a retired built-in sitting at
+      // a known filename (the broken-built-in case the design handles).
+      let body = try? String(contentsOf: url, encoding: .utf8)
+      if body == nil {
+        Log.store.error("migrateBuiltinProvenance: read \(filename, privacy: .public) failed; falling back to filename recognition")
+      }
+      let profile = body.flatMap { try? Profile.parse(toml: $0) }
+
+      let origin: String?
+      if let marker = profile?.builtinOrigin {
+        origin = marker
+      } else if let filenameOrigin = Self.historicalBuiltinFilenames[filename],
+                profile == nil || profile?.id == filenameOrigin {
+        origin = filenameOrigin
+      } else {
+        origin = nil
+      }
+      guard let origin, !Self.shippedBuiltinIDs.contains(origin) else { continue }
+
+      // #718 F2: move to a non-colliding `.bak`; never destroy a prior backup.
+      let bak = nonCollidingBackupURL(for: url)
+      do {
+        try fm.moveItem(at: url, to: bak)
+        Log.store.info("migrateBuiltinProvenance: retired built-in \(filename, privacy: .public) (origin \(origin, privacy: .public) no longer shipped) moved to \(bak.lastPathComponent, privacy: .public)")
+      } catch {
+        let underlying = String(describing: error)
+        Log.store.error("migrateBuiltinProvenance: back up retired \(filename, privacy: .public) failed: \(underlying, privacy: .public)")
+        if firstError == nil { firstError = .seedFailed(path: url.path, underlying: underlying) }
+      }
+    }
+    return firstError
+  }
+
+  /// A `<name>.toml.bak` URL that does NOT overwrite an existing backup the
+  /// system already wrote (#718 F2): `chat.toml.bak`, then `chat.toml.bak-2`,
+  /// `chat.toml.bak-3`, … Mirrors `freeBaseFilename`'s numeric-suffix scheme so
+  /// a prior retired-built-in backup is preserved, never destroyed.
+  private func nonCollidingBackupURL(for url: URL) -> URL {
+    let dir = url.deletingLastPathComponent()
+    let base = url.lastPathComponent + ".bak"
+    var candidate = dir.appendingPathComponent(base, isDirectory: false)
+    var n = 2
+    while FileManager.default.fileExists(atPath: candidate.path) {
+      candidate = dir.appendingPathComponent("\(base)-\(n)", isDirectory: false)
+      n += 1
+    }
+    return candidate
   }
 
   /// True when the writable profiles directory holds no `*.toml` files — a
