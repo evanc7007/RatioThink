@@ -54,4 +54,26 @@ final class ChatScaffoldModelSelectionTests: XCTestCase {
       "Qwen/Qwen3-0.6B"
     )
   }
+
+  func test_default_load_click_starts_engine_even_while_status_is_starting_placeholder() {
+    XCTAssertEqual(
+      ChatScaffoldView.defaultLoadAction(for: .starting),
+      .startEngine,
+      "the no-model sheet's explicit Load click must kick the engine even if the status poll is still on the initial .starting placeholder; otherwise the first click is swallowed until a later .stopped poll"
+    )
+  }
+
+  func test_default_load_action_preserves_existing_status_mapping() {
+    XCTAssertEqual(ChatScaffoldView.defaultLoadAction(for: .running(port: 1234, profileID: "chat")), .loadDirect)
+    XCTAssertEqual(ChatScaffoldView.defaultLoadAction(for: .stopped), .startEngine)
+    XCTAssertEqual(
+      ChatScaffoldView.defaultLoadAction(for: .failed(code: .engineGone, message: "gone")),
+      .startEngine
+    )
+    XCTAssertEqual(
+      ChatScaffoldView.defaultLoadAction(for: .failed(code: .memoryRisk, message: "too large")),
+      .none
+    )
+    XCTAssertEqual(ChatScaffoldView.defaultLoadAction(for: .stopping), .none)
+  }
 }

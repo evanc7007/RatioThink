@@ -536,6 +536,30 @@ struct ChatScaffoldView: View {
       isInstalled: slug.map(isModelInstalled) ?? false)
   }
 
+  enum DefaultLoadAction: Equatable {
+    case loadDirect
+    case startEngine
+    case none
+  }
+
+  /// Decide what an explicit click on the no-model sheet's Load button should
+  /// do for the current engine status. `.starting` is treated as a start kick:
+  /// the status store's initial value is also `.starting`, so a click that
+  /// races the first real `.stopped` poll must not be swallowed. The helper
+  /// start path is idempotent for a genuine in-flight start.
+  static func defaultLoadAction(for status: EngineStatus) -> DefaultLoadAction {
+    switch status {
+    case .running:
+      return .loadDirect
+    case .stopped, .starting:
+      return .startEngine
+    case let .failed(code, _):
+      return code.invitesResumeRetry ? .startEngine : .none
+    case .stopping:
+      return .none
+    }
+  }
+
   /// "Load default" action. Honors the no-eager-load invariant — only
   /// runs because the user tapped Load. #397: ensures the engine is
   /// running FIRST (the App's only engine-start path), since a load
@@ -543,23 +567,17 @@ struct ChatScaffoldView: View {
   /// `engineNotReady`. The sheet stays open and reflects busy→ready, then
   /// auto-dismisses via `dismissPromptIfResolved`.
   private func loadDefaultModel(_ model: String) {
-    switch engineStatusStore.status {
-    case .running:
+    switch Self.defaultLoadAction(for: engineStatusStore.status) {
+    case .loadDirect:
       // Engine up — load the model directly (`/v1/models/load`).
       swapCoordinator.loadDirect(modelID: model)
-    case .stopped:
+    case .startEngine:
       // Bring the engine up bound to this chat's profile; v1 pie loads
       // the profile's model at boot, and `reconcileEngineResidentModel`
       // picks it up once `.running`.
       startEngineForSelectedProfile()
-    case let .failed(code, _):
-      // #397 F3: only re-start for a retryable failure. memoryRisk /
-      // killRejected re-fire a guaranteed-to-fail or refused start, so
-      // do NOT — the prompt shows those as terminal (Open Settings /
-      // reason), never an active Load/Retry that loops.
-      if code.invitesResumeRetry { startEngineForSelectedProfile() }
-    case .starting, .stopping:
-      break  // already in flight — the busy state already reflects this
+    case .none:
+      break
     }
   }
 
