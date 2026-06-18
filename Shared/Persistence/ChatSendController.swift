@@ -826,6 +826,18 @@ public final class ChatSendController: ObservableObject {
       var reachedTerminal = false
       let encoder = JSONEncoder()
       var lastLiveEncode = Date.distantPast
+
+      // #708 selection-flash fix (root cause): flag the turn as Best-of-N from
+      // the FIRST frame — an empty pick set, no choice — so `MessageBubble`
+      // renders it in the option presentation throughout generation. Without
+      // this, candidates stream into `tot` while `bestOfN` is nil, so
+      // `MessageBubble` takes the tree-of-thought branch and each `kept`
+      // candidate draws a GREEN beam checkmark, which flips to a hollow option
+      // glyph the instant `awaiting_selection` sets `bestOfN` (the
+      // green-checkmark-then-unselected flash). The `awaiting_selection` handler
+      // below swaps in the real pick set; until then the candidates show neutral,
+      // not-yet-pickable option glyphs with no chosen/kept indicator.
+      assistant.bestOfN = try? encoder.encode(BestOfNRound(level: 0, candidates: [], chosenID: nil))
       do {
         for try await event in toTEventStream(from: engine.dispatchInferlet(request)) {
           guard self.generation == myGeneration, !Task.isCancelled else { return }
@@ -898,6 +910,7 @@ public final class ChatSendController: ObservableObject {
       messages: transcriptTurns(chat: chat, options: options),
       n: config.n,
       maxTokensPerCandidate: config.maxTokensPerCandidate,
+      thinking: config.thinking,
       temperature: options.sampling.temperature,
       topP: options.sampling.topP,
       resumeFrom: resume?.pickedName,
@@ -1154,6 +1167,7 @@ private struct BestOfNRequestInput: Encodable {
   let messages: [ChatMessage]
   let n: Int
   let maxTokensPerCandidate: Int
+  let thinking: Bool
   let temperature: Double
   let topP: Double
   let resumeFrom: String?
@@ -1162,7 +1176,7 @@ private struct BestOfNRequestInput: Encodable {
   let level: Int?
 
   private enum CodingKeys: String, CodingKey {
-    case model, messages, n, temperature, level, unpicked
+    case model, messages, n, temperature, level, unpicked, thinking
     case maxTokensPerCandidate = "max_tokens_per_candidate"
     case topP = "top_p"
     case resumeFrom = "resume_from"

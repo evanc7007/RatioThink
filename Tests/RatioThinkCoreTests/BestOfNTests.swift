@@ -1,4 +1,5 @@
 import XCTest
+import SwiftData
 
 @testable import RatioThinkCore
 
@@ -72,11 +73,14 @@ final class BestOfNTests: XCTestCase {
     mode = "best-of-n"
     n = 4
     max_tokens_per_candidate = 320
+    thinking = false
     """
     let profile = try Profile.parse(toml: toml)
     let config = try XCTUnwrap(profile.bestOfN)
     XCTAssertEqual(config.n, 4)
     XCTAssertEqual(config.maxTokensPerCandidate, 320)
+    // An explicit `thinking = false` is honored over the ON default (#708).
+    XCTAssertFalse(config.thinking)
     // Sampling is sourced from the profile (drives candidate-generation temp).
     XCTAssertEqual(profile.bestOfNRequestSampling.temperature, 0.7)
   }
@@ -104,8 +108,9 @@ final class BestOfNTests: XCTestCase {
     mode = "best-of-n"
     """
     let config = try XCTUnwrap(Profile.parse(toml: toml).bestOfN)
-    XCTAssertEqual(config.n, 5)
+    XCTAssertEqual(config.n, 3)  // #708: default N is 3
     XCTAssertEqual(config.maxTokensPerCandidate, 256)
+    XCTAssertTrue(config.thinking)  // #708: thinking defaults ON
   }
 
   // MARK: BestOfNRound metadata
@@ -128,6 +133,15 @@ final class BestOfNTests: XCTestCase {
     XCTAssertEqual(decoded.chosen?.snapshotName, "s1")
     // Unpicked = the other two snapshots, dropped next round.
     XCTAssertEqual(decoded.unpickedSnapshotNames(excluding: "n1"), ["s0", "s2"])
+
+    // #708 click-to-reselect: re-picking is just overwriting `chosenID` with a
+    // different candidate id (`handleBestOfN(.pick)` is idempotent on re-tap).
+    // All snapshots stay alive, so the new choice resolves cleanly and the
+    // unpicked set tracks the new pick.
+    round.chosenID = "n2"
+    XCTAssertTrue(round.hasChoice)
+    XCTAssertEqual(round.chosen?.snapshotName, "s2")
+    XCTAssertEqual(round.unpickedSnapshotNames(excluding: "n2"), ["s0", "s1"])
   }
 
   // MARK: Lifecycle release request wire (stop/commit + abandon trigger)
@@ -316,6 +330,209 @@ final class BestOfNTests: XCTestCase {
     let model: String
     let release: [String]
   }
+
+  // MARK: liveness rule (#708) — only the trailing, uncommitted round is live
+
+  private func bonRoundData(_ snaps: [String], chosen: String? = nil) -> Data {
+    let cands = snaps.enumerated().map {
+      ToTSelectionCandidate(id: "n\($0.offset)", branchIndex: $0.offset, snapshotName: $0.element)
+    }
+    return try! JSONEncoder().encode(BestOfNRound(level: 1, candidates: cands, chosenID: chosen))
+  }
+
+  /// The trailing, content-empty Best-of-N round is the one live row.
+  func test_liveRoundID_is_the_trailing_uncommitted_round() {
+    let base = Date(timeIntervalSince1970: 1_700_000_000)
+    let user = Message(role: "user", content: "q", ts: base)
+    let round = Message(role: "assistant", content: "", ts: base.addingTimeInterval(1),
+                        bestOfN: bonRoundData(["s0", "s1"]))
+    XCTAssertEqual(BestOfNRound.liveRoundID(in: [user, round]), round.id)
+  }
+
+  /// A committed round (think-more / use-this set `content`) is NOT live — it
+  /// locks into read-only history even while it is still the trailing turn.
+  func test_liveRoundID_nil_when_round_committed() {
+    let base = Date(timeIntervalSince1970: 1_700_000_000)
+    let round = Message(role: "assistant", content: "the kept reply", ts: base,
+                        bestOfN: bonRoundData(["s0"], chosen: "n0"))
+    XCTAssertNil(BestOfNRound.liveRoundID(in: [round]))
+  }
+
+  /// The pick-then-abandon hole: an empty round the user moved past with a NEW
+  /// turn is no longer trailing, so it must NOT stay falsely live (the bug the
+  /// old "last content-empty round" rule had).
+  func test_liveRoundID_nil_for_picked_then_abandoned_round() {
+    let base = Date(timeIntervalSince1970: 1_700_000_000)
+    let round = Message(role: "assistant", content: "", ts: base.addingTimeInterval(1),
+                        bestOfN: bonRoundData(["s0"], chosen: "n0"))
+    let newTurn = Message(role: "user", content: "another question",
+                          ts: base.addingTimeInterval(2))
+    XCTAssertNil(BestOfNRound.liveRoundID(in: [round, newTurn]))
+  }
+
+  /// Think-more commits the prior round (content set) and appends a new empty
+  /// trailing round → liveness moves to the new round, never the committed one.
+  func test_liveRoundID_moves_to_the_new_round_after_think_more() {
+    let base = Date(timeIntervalSince1970: 1_700_000_000)
+    let committed = Message(role: "assistant", content: "round 1 pick",
+                            ts: base.addingTimeInterval(1), bestOfN: bonRoundData(["a0"], chosen: "n0"))
+    let next = Message(role: "assistant", content: "", ts: base.addingTimeInterval(2),
+                       bestOfN: bonRoundData(["b0", "b1"]))
+    XCTAssertEqual(BestOfNRound.liveRoundID(in: [committed, next]), next.id)
+  }
+
+  /// No Best-of-N round at all → no live row.
+  func test_liveRoundID_nil_without_any_bestOfN_round() {
+    XCTAssertNil(BestOfNRound.liveRoundID(in: [Message(role: "assistant", content: "plain")]))
+  }
+
+  // MARK: selection-flash regression (#708) — option presentation from frame 1
+
+  /// The selection-flash bug: a Best-of-N turn streams its candidates into
+  /// `assistant.tot` but only set `assistant.bestOfN` at `awaiting_selection`,
+  /// AFTER generation. While `bestOfN` was nil the round rendered through the
+  /// tree-of-thought branch, where a `kept` beam node draws a GREEN checkmark —
+  /// which flipped to a hollow Best-of-N option glyph the instant
+  /// `awaiting_selection` set `bestOfN` (the green-then-unselected flash).
+  ///
+  /// Root-cause guard: the turn must carry `bestOfN` (option presentation) from
+  /// the FIRST frame, with no chosen candidate, all the way through the
+  /// `node_complete` / `level_pruned` window (where the ToT branch would have
+  /// drawn the green `kept` checkmarks) — never only at `awaiting_selection`.
+  /// Static snapshot tests render the final state only and missed this; this
+  /// drives the streaming transition.
+  @MainActor
+  func test_round_renders_as_bestOfN_throughout_generation_never_kept_beam() async throws {
+    let container = try RatioThinkModelContainer.makeInMemory()
+    let context = ModelContext(container)
+    let chat = Chat()
+    context.insert(chat)
+    chat.messages.append(Message(role: "user", content: "hi", ts: Date(timeIntervalSinceReferenceDate: 1)))
+    try context.save()
+
+    let engine = ManualInferletEngine()
+    let controller = ChatSendController()
+    controller.sendBestOfN(
+      chat: chat,
+      context: context,
+      engine: engine,
+      config: BestOfNProfileConfig(n: 3),
+      persistenceStatus: PersistenceStatus(),
+      options: ChatSendRequestOptions(modelID: "m"))
+
+    func assistant() -> Message? { chat.messages.first { $0.role == "assistant" } }
+    func round() -> BestOfNRound? {
+      assistant()?.bestOfN.flatMap { try? JSONDecoder().decode(BestOfNRound.self, from: $0) }
+    }
+    func nodeCount() -> Int {
+      (assistant()?.tot.flatMap { try? JSONDecoder().decode(ToTTree.self, from: $0) })?.nodes.count ?? 0
+    }
+
+    // The assistant turn is created at round start.
+    try await waitUntil("assistant turn inserted") { assistant() != nil }
+
+    // INVARIANT 1 — before any candidate streams, the turn is ALREADY a
+    // Best-of-N round (option presentation), with no choice. Pre-fix this is
+    // nil, so MessageBubble would take the ToT (green-beam) branch.
+    let early = try XCTUnwrap(round(), "turn must carry bestOfN from round start, not only at awaiting_selection")
+    XCTAssertTrue(early.candidates.isEmpty, "no pickable candidates before awaiting_selection")
+    XCTAssertNil(early.chosenID, "nothing chosen before the user picks")
+
+    // Stream the candidates and the `level_pruned` that marks them `kept` — the
+    // exact window the ToT branch would render as green checkmarks.
+    engine.emit(#"{"event":"tree_start","id":"bon","model":"m","breadth":3,"depth":1,"beam_width":3}"#)
+    engine.emit(#"{"event":"node_complete","node":{"id":"n0","parent_id":"root","depth":1,"branch_index":0,"content":"A","status":"ok"}}"#)
+    engine.emit(#"{"event":"node_complete","node":{"id":"n1","parent_id":"root","depth":1,"branch_index":1,"content":"B","status":"ok"}}"#)
+    engine.emit(#"{"event":"level_pruned","level":1,"kept":["n0","n1"]}"#)
+    try await waitUntil("candidates streamed") { nodeCount() >= 2 }
+
+    // INVARIANT 2 — mid-generation (post `level_pruned`, pre `awaiting_selection`)
+    // the turn is STILL Best-of-N with no chosen candidate. The view therefore
+    // shows neutral option glyphs — never a green kept/chosen indicator.
+    let mid = try XCTUnwrap(round(), "turn must stay in Best-of-N mode during generation")
+    XCTAssertNil(mid.chosenID, "no candidate may be chosen before the user picks")
+
+    // Finalize → candidates become pickable.
+    engine.emit(#"{"event":"awaiting_selection","level":1,"candidates":[{"id":"n0","branch_index":0,"snapshot_name":"s0"},{"id":"n1","branch_index":1,"snapshot_name":"s1"}]}"#)
+    engine.finish()
+    try await waitUntil("round resolved") { !controller.isInFlight }
+
+    let final = try XCTUnwrap(round())
+    XCTAssertEqual(final.candidates.map(\.id), ["n0", "n1"], "awaiting_selection populates the pick set")
+    XCTAssertNil(final.chosenID, "still no choice until the user picks")
+  }
+
+  /// #708 F1 regression: a Best-of-N turn that FAILS before `awaiting_selection`
+  /// (stream ends with no terminal) must surface its ⚠️ error text — not be
+  /// swallowed. The committed answer / error now renders as the plain content
+  /// bubble (no bestOfN suppression), so the ⚠️ surfaces from `message.content`.
+  @MainActor
+  func test_failed_round_surfaces_error() async throws {
+    let container = try RatioThinkModelContainer.makeInMemory()
+    let context = ModelContext(container)
+    let chat = Chat()
+    context.insert(chat)
+    chat.messages.append(Message(role: "user", content: "hi", ts: Date(timeIntervalSinceReferenceDate: 1)))
+    try context.save()
+
+    let engine = ManualInferletEngine()
+    let controller = ChatSendController()
+    controller.sendBestOfN(
+      chat: chat,
+      context: context,
+      engine: engine,
+      config: BestOfNProfileConfig(n: 3),
+      persistenceStatus: PersistenceStatus(),
+      options: ChatSendRequestOptions(modelID: "m"))
+
+    func assistant() -> Message? { chat.messages.first { $0.role == "assistant" } }
+    try await waitUntil("assistant turn inserted") { assistant() != nil }
+
+    // Stream a couple candidates, then END the stream with NO awaiting_selection
+    // → the no_terminal failure branch.
+    engine.emit(#"{"event":"tree_start","id":"bon","model":"m","breadth":3,"depth":1,"beam_width":3}"#)
+    engine.emit(#"{"event":"node_complete","node":{"id":"n0","parent_id":"root","depth":1,"branch_index":0,"content":"A","status":"ok"}}"#)
+    engine.finish()
+    try await waitUntil("round failed") { !controller.isInFlight }
+
+    let a = try XCTUnwrap(assistant())
+    XCTAssertTrue(a.content.hasPrefix("⚠️"),
+                  "a failed Best-of-N round must surface its ⚠️ error text as content; content=\(a.content)")
+  }
+
+  /// Polls `condition` on the main actor until true or the timeout elapses.
+  @MainActor
+  private func waitUntil(
+    _ description: String, timeout: TimeInterval = 3,
+    _ condition: () -> Bool
+  ) async throws {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+      if condition() { return }
+      try await Task.sleep(nanoseconds: 5_000_000)
+    }
+    XCTFail("timed out waiting for: \(description)")
+  }
+}
+
+/// `EngineClient` whose Best-of-N dispatch stream is driven frame-by-frame from
+/// the test, so a test can inspect controller/message state at any point of the
+/// generation → `awaiting_selection` transition (#708 flash regression).
+private final class ManualInferletEngine: EngineClient, @unchecked Sendable {
+  private var continuation: AsyncThrowingStream<Data, Error>.Continuation?
+
+  func health() async throws -> EngineHealth { EngineHealth(status: .ok) }
+  func models() async throws -> [ModelInfo] { [] }
+  func chatCompletion(_ req: ChatRequest) -> AsyncThrowingStream<ChatEvent, Error> {
+    AsyncThrowingStream { $0.finish() }
+  }
+  func dispatchInferlet(_ req: InferletRequest) -> AsyncThrowingStream<Data, Error> {
+    AsyncThrowingStream { self.continuation = $0 }
+  }
+
+  /// Yield one raw JSON event frame (the wire shape `toTEventStream` parses).
+  func emit(_ json: String) { continuation?.yield(Data(json.utf8)) }
+  func finish() { continuation?.finish() }
 }
 
 /// Minimal `EngineClient` that records the last dispatched `InferletRequest` so

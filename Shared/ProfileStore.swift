@@ -354,8 +354,10 @@ public final class ProfileStore: ObservableObject {
 
   /// Example Best-of-N interactive profile (#690): generates N candidates the
   /// user picks among (think-more vs stop). Non-default — an example built-in
-  /// like tree-of-thought, never auto-selected. `thinking` is omitted (the
-  /// server defaults it off, #679).
+  /// like tree-of-thought, never auto-selected. `thinking = true` (#708): each
+  /// candidate emits a tagged `<think>` block the demux routes to the reasoning
+  /// channel so the row shows a real folded "Thinking" disclosure and a clean
+  /// answer (the thinking-ON #679 crash is guarded in the pinned engine).
   public static let bestOfNTOML: String = """
   builtin-origin = "best-of-n"
   id = "best-of-n"
@@ -372,8 +374,9 @@ public final class ProfileStore: ObservableObject {
 
   [inferlet_args]
   mode = "best-of-n"
-  n = 5
+  n = 3
   max_tokens_per_candidate = 256
+  thinking = true
 
   """
 
