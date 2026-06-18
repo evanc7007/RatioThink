@@ -375,7 +375,7 @@ public final class ChatSendController: ObservableObject {
     context: ModelContext,
     persistenceStatus: PersistenceStatus
   ) {
-    if assistant.content.isEmpty {
+    if assistant.content.isEmpty && assistant.reasoning.isEmpty {
       assistant.chat?.messages.removeAll { $0.id == assistant.id }
       context.delete(assistant)
     } else {
