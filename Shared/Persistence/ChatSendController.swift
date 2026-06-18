@@ -231,6 +231,12 @@ public final class ChatSendController: ObservableObject {
     generation &+= 1
     task?.cancel()
     task = nil
+    // `MessageStreamWriter.cancel()` intentionally drops unflushed buffers.
+    // For a user-visible cancel decision, first land any delta already
+    // delivered to this writer so `recordCancelledAssistant` distinguishes
+    // a truly blank preallocated row from a partial assistant turn that was
+    // cancelled before the timer's first flush boundary.
+    activeWriter?.flush()
     activeWriter?.cancel()
     if let assistant = activeAssistant,
        let context = activeContext,
