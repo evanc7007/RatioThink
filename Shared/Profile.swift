@@ -50,6 +50,7 @@ public struct Profile {
   public var id: String
   public var name: String
   public var icon: String?
+  public var description: String?
   public var model: String
   public var inferlet: String
   public var systemPrompt: String?
@@ -66,6 +67,7 @@ public struct Profile {
     id: String,
     name: String,
     icon: String? = nil,
+    description: String? = nil,
     model: String,
     inferlet: String,
     systemPrompt: String? = nil,
@@ -77,6 +79,7 @@ public struct Profile {
     self.id = id
     self.name = name
     self.icon = icon
+    self.description = description
     self.model = model
     self.inferlet = inferlet
     self.systemPrompt = systemPrompt
@@ -107,6 +110,7 @@ public struct Profile {
     let inferlet = try requireString("inferlet")
 
     let icon = table["icon"]?.string
+    let description = table["description"]?.string
     let systemPrompt = table["system_prompt"]?.string
 
     var sampling = Sampling()
@@ -134,6 +138,7 @@ public struct Profile {
 
     return Profile(
       id: id, name: name, icon: icon,
+      description: description,
       model: model, inferlet: inferlet,
       systemPrompt: systemPrompt,
       sampling: sampling,
@@ -175,7 +180,7 @@ public struct Profile {
     }
     // Drop stale typed sections the caller may have cleared on
     // `self` since parse — without this, a profile loaded with
-    // `icon = "X"` (or `system_prompt = "..."` / `inferlet_args.foo
+    // `icon = "X"` (or `description = "..."` / `system_prompt = "..."` / `inferlet_args.foo
     // = 1`) and then mutated to `.icon = nil` (etc.) would still
     // dump with the original value because the clone preserved the
     // key. `table[key] = nil` is a no-op in TOMLKit (the subscript
@@ -184,6 +189,7 @@ public struct Profile {
     // keys only when the Swift side still has a value (review v3
     // F4 — prior code only purged inferlet_args).
     table.remove(at: "icon")
+    table.remove(at: "description")
     table.remove(at: "system_prompt")
     table.remove(at: "inferlet_args")
     table.remove(at: "speculation")
@@ -192,6 +198,7 @@ public struct Profile {
     table["model"]    = TOMLValue(stringLiteral: model)
     table["inferlet"] = TOMLValue(stringLiteral: inferlet)
     if let icon { table["icon"] = TOMLValue(stringLiteral: icon) }
+    if let description { table["description"] = TOMLValue(stringLiteral: description) }
     if let systemPrompt { table["system_prompt"] = TOMLValue(stringLiteral: systemPrompt) }
     let samplingTable = TOMLTable([
       "temperature": TOMLValue(floatLiteral: sampling.temperature),

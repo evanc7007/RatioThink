@@ -31,6 +31,9 @@ struct ProfileEditor: View {
       VStack(alignment: .leading, spacing: 16) {
         if let profile = entry.profile {
           headerRow(profile: profile)
+          if let description = displayDescription(profile.description) {
+            descriptionSection(description)
+          }
           coreSection(profile: profile)
           if !(profile.systemPrompt ?? "").isEmpty {
             systemPromptSection(profile.systemPrompt!)
@@ -165,6 +168,23 @@ struct ProfileEditor: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(RoundedRectangle(cornerRadius: 6).fill(Color.secondary.opacity(0.08)))
     }
+  }
+
+  private func descriptionSection(_ description: String) -> some View {
+    VStack(alignment: .leading, spacing: 6) {
+      SettingsSectionHeader(title: "Description")
+      Text(description)
+        .font(.callout)
+        .textSelection(.enabled)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityIdentifier("ProfileEditorDescription")
+    }
+  }
+
+  private func displayDescription(_ raw: String?) -> String? {
+    guard let raw else { return nil }
+    let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    return trimmed.isEmpty ? nil : trimmed
   }
 
   private func samplingSection(profile: Profile) -> some View {

@@ -21,6 +21,7 @@ final class ProfileTests: XCTestCase {
     let p = try Profile.parse(toml: toml)
     XCTAssertEqual(p.id, "chat")
     XCTAssertEqual(p.name, "Chat")
+    XCTAssertNil(p.description)
     XCTAssertEqual(p.model, "bartowski/Llama-3.2-3B-Instruct-GGUF:Q4_K_M.gguf")
     XCTAssertEqual(p.inferlet, "chat-apc")
     XCTAssertEqual(p.systemPrompt, "You are helpful.")
@@ -28,6 +29,23 @@ final class ProfileTests: XCTestCase {
     XCTAssertEqual(p.sampling.topP, 0.9)
     XCTAssertEqual(p.sampling.maxTokens, 2048)
     XCTAssertEqual(p.inferletArgs["apc_enabled"]?.bool, true)
+  }
+
+  func test_parses_description_distinct_from_system_prompt() throws {
+    let toml = """
+    id = "chat"
+    name = "Chat"
+    description = "A general-purpose assistant profile."
+    model = "m"
+    inferlet = "chat-apc"
+    system_prompt = "You are helpful."
+    """
+
+    let p = try Profile.parse(toml: toml)
+
+    XCTAssertEqual(p.description, "A general-purpose assistant profile.")
+    XCTAssertEqual(p.systemPrompt, "You are helpful.",
+                   "description is user-facing prose and must not replace the engine system prompt")
   }
 
   func test_applies_sampling_defaults_when_section_omitted() throws {
@@ -146,12 +164,22 @@ final class ProfileTests: XCTestCase {
                   "round-trip after clearing must produce an empty inferlet_args, got \(reparsed.inferletArgs)")
   }
 
+  func test_dump_round_trips_description() throws {
+    let p = Profile(id: "chat", name: "Chat", description: "Everyday conversational assistant.",
+                    model: "m", inferlet: "chat-apc", systemPrompt: "You are helpful.")
+
+    let reparsed = try Profile.parse(toml: try p.dump())
+
+    XCTAssertEqual(reparsed.description, "Everyday conversational assistant.")
+    XCTAssertEqual(reparsed.systemPrompt, "You are helpful.")
+  }
+
   /// Review v3 F4: `Profile.dump()` only purged `inferlet_args` via
   /// the symmetric remove+rewrite. A profile parsed with `icon = "X"`
   /// and mutated to `profile.icon = nil` re-emitted with `icon = "X"`
   /// because the cloned table preserved the original key and the
   /// `if let icon` write skipped on nil. Same shape as F3.
-  /// Parameterized over `icon` and `system_prompt` (and re-exercises
+  /// Parameterized over `icon`, `description`, and `system_prompt` (and re-exercises
   /// `inferlet_args` for completeness) so a future regression on any
   /// of the optional typed slices surfaces here.
   func test_dump_drops_optional_keys_when_nil_set_after_parse() throws {
@@ -159,6 +187,7 @@ final class ProfileTests: XCTestCase {
     id = "code"
     name = "Code"
     icon = "bubble.left"
+    description = "Code helper"
     model = "m"
     inferlet = "i"
     system_prompt = "You are helpful."
@@ -167,16 +196,20 @@ final class ProfileTests: XCTestCase {
     foo = 1
     """)
     XCTAssertEqual(profile.icon, "bubble.left")
+    XCTAssertEqual(profile.description, "Code helper")
     XCTAssertEqual(profile.systemPrompt, "You are helpful.")
     XCTAssertEqual(profile.inferletArgs.count, 1)
 
     profile.icon = nil
+    profile.description = nil
     profile.systemPrompt = nil
     profile.inferletArgs = [:]
 
     let dumped = try profile.dump()
     XCTAssertFalse(dumped.contains("icon"),
                    "nil-set icon must NOT appear in dump (regression: F4 only purged inferlet_args)\ndumped:\n\(dumped)")
+    XCTAssertFalse(dumped.contains("description"),
+                   "nil-set description must NOT appear in dump\ndumped:\n\(dumped)")
     XCTAssertFalse(dumped.contains("system_prompt"),
                    "nil-set system_prompt must NOT appear in dump\ndumped:\n\(dumped)")
     XCTAssertFalse(dumped.contains("foo"),
@@ -187,6 +220,7 @@ final class ProfileTests: XCTestCase {
     // through under a different surface).
     let reparsed = try Profile.parse(toml: dumped)
     XCTAssertNil(reparsed.icon)
+    XCTAssertNil(reparsed.description)
     XCTAssertNil(reparsed.systemPrompt)
     XCTAssertTrue(reparsed.inferletArgs.isEmpty)
   }
