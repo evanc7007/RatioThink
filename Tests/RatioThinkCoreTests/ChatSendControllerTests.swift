@@ -493,6 +493,130 @@ final class ChatSendControllerTests: XCTestCase {
     controller.cancel()
   }
 
+  func test_cancel_before_first_flush_keeps_buffered_partial_assistant_and_excludes_it_from_next_request() async throws {
+    let container = try RatioThinkModelContainer.makeInMemory()
+    let context = ModelContext(container)
+    let chat = Chat()
+    context.insert(chat)
+    chat.messages.append(Message(role: "user", content: "first", ts: Date(timeIntervalSinceReferenceDate: 1)))
+    try context.save()
+
+    let engine = ManualChatEngine()
+    let controller = ChatSendController()
+
+    controller.send(
+      chat: chat,
+      context: context,
+      engine: engine,
+      modelLoadCenter: ModelLoadCenter(),
+      persistenceStatus: PersistenceStatus(),
+      options: ChatSendRequestOptions(modelID: "m1")
+    )
+    try await waitUntil("first request starts") { engine.requests.count == 1 && self.assistantMessages(in: chat).count == 1 }
+    let cancelledAssistant = try XCTUnwrap(assistantMessages(in: chat).first)
+
+    engine.yield(.delta(role: .assistant, content: "partial"), at: 0)
+    // Let the send task consume the delta and buffer it in MessageStreamWriter,
+    // but do not yield a flush-boundary event or wait for the 250ms timer.
+    await Task.yield()
+    controller.cancel()
+
+    chat.messages.append(Message(role: "user", content: "second", ts: Date(timeIntervalSinceReferenceDate: 2)))
+    try context.save()
+    controller.send(
+      chat: chat,
+      context: context,
+      engine: engine,
+      modelLoadCenter: ModelLoadCenter(),
+      persistenceStatus: PersistenceStatus(),
+      options: ChatSendRequestOptions(modelID: "m2")
+    )
+    try await waitUntil("second request starts") { engine.requests.count == 2 }
+
+    XCTAssertTrue(
+      chat.messages.contains { $0.id == cancelledAssistant.id },
+      "assistant with buffered-but-unflushed content must be kept on cancel"
+    )
+    XCTAssertEqual(cancelledAssistant.content, "partial")
+    XCTAssertEqual(
+      cancelledAssistant.meta.map { String(data: $0, encoding: .utf8) },
+      #"{"finish_reason":"cancelled"}"#
+    )
+    XCTAssertEqual(
+      engine.requests[1].messages,
+      [
+        ChatMessage(role: .user, content: "first"),
+        ChatMessage(role: .user, content: "second"),
+      ],
+      "cancelled partial assistant output can remain visible but must not be replayed as prompt history"
+    )
+
+    controller.cancel()
+  }
+
+  func test_cancel_before_first_flush_keeps_buffered_reasoning_only_assistant_and_excludes_it_from_next_request() async throws {
+    let container = try RatioThinkModelContainer.makeInMemory()
+    let context = ModelContext(container)
+    let chat = Chat()
+    context.insert(chat)
+    chat.messages.append(Message(role: "user", content: "first", ts: Date(timeIntervalSinceReferenceDate: 1)))
+    try context.save()
+
+    let engine = ManualChatEngine()
+    let controller = ChatSendController()
+
+    controller.send(
+      chat: chat,
+      context: context,
+      engine: engine,
+      modelLoadCenter: ModelLoadCenter(),
+      persistenceStatus: PersistenceStatus(),
+      options: ChatSendRequestOptions(modelID: "m1")
+    )
+    try await waitUntil("first request starts") { engine.requests.count == 1 && self.assistantMessages(in: chat).count == 1 }
+    let cancelledAssistant = try XCTUnwrap(assistantMessages(in: chat).first)
+
+    engine.yield(.reasoningDelta("thinking"), at: 0)
+    // Let the send task consume the reasoning delta and buffer it in
+    // MessageStreamWriter, but do not yield a flush-boundary event or wait for
+    // the 250ms timer.
+    await Task.yield()
+    controller.cancel()
+
+    chat.messages.append(Message(role: "user", content: "second", ts: Date(timeIntervalSinceReferenceDate: 2)))
+    try context.save()
+    controller.send(
+      chat: chat,
+      context: context,
+      engine: engine,
+      modelLoadCenter: ModelLoadCenter(),
+      persistenceStatus: PersistenceStatus(),
+      options: ChatSendRequestOptions(modelID: "m2")
+    )
+    try await waitUntil("second request starts") { engine.requests.count == 2 }
+
+    XCTAssertTrue(
+      chat.messages.contains { $0.id == cancelledAssistant.id },
+      "assistant with buffered-but-unflushed reasoning must be kept on cancel"
+    )
+    XCTAssertEqual(cancelledAssistant.content, "")
+    XCTAssertEqual(cancelledAssistant.reasoning, "thinking")
+    XCTAssertEqual(
+      cancelledAssistant.meta.map { String(data: $0, encoding: .utf8) },
+      #"{"finish_reason":"cancelled"}"#
+    )
+    XCTAssertEqual(
+      engine.requests[1].messages,
+      [
+        ChatMessage(role: .user, content: "first"),
+        ChatMessage(role: .user, content: "second"),
+      ],
+      "cancelled reasoning-only assistant output can remain visible but must not be replayed as prompt history"
+    )
+
+    controller.cancel()
+  }
+
   func test_send_marksContextUsageRequestLocalActiveAndDestroyedOnFinish() async throws {
     let container = try RatioThinkModelContainer.makeInMemory()
     let context = ModelContext(container)
