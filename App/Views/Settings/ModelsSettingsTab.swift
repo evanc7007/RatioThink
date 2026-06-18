@@ -229,9 +229,10 @@ private struct DownloadsInFlightSection: View {
       VStack(alignment: .leading, spacing: 6) {
         SettingsSectionHeader(title: "Downloading")
         ForEach(rows) { row in
-          DownloadRow(entry: row) {
-            downloads.cancel(id: row.id)
-          }
+          DownloadRow(entry: row,
+                      onCancel: { downloads.cancel(id: row.id) },
+                      onRetry: { downloads.retry(id: row.id) },
+                      onDismiss: { downloads.dismiss(id: row.id) })
         }
         if let err = downloads.lastError {
           Text(err)
@@ -248,6 +249,8 @@ private struct DownloadsInFlightSection: View {
 private struct DownloadRow: View {
   let entry: ModelDownloadController.ActiveDownload
   let onCancel: () -> Void
+  let onRetry: () -> Void
+  let onDismiss: () -> Void
 
   /// #218: cancelling a download is a hard cancel (partial progress is
   /// discarded, no resume), so the trailing "Cancel" arms an inline
@@ -268,7 +271,9 @@ private struct DownloadRow: View {
       }
       Spacer()
       progressView
-      if !entry.isTerminal {
+      if entry.progress.phase == .failed {
+        failedControls
+      } else if !entry.isTerminal {
         cancelControl
       }
     }
@@ -302,6 +307,17 @@ private struct DownloadRow: View {
       Button("Cancel") { confirmingCancel = true }
         .buttonStyle(.borderless)
         .accessibilityIdentifier("DownloadRow-Cancel")
+    }
+  }
+
+  private var failedControls: some View {
+    HStack(spacing: 6) {
+      Button("Retry", action: onRetry)
+        .buttonStyle(.bordered)
+        .accessibilityIdentifier("DownloadRow-Retry")
+      Button("Dismiss", action: onDismiss)
+        .buttonStyle(.borderless)
+        .accessibilityIdentifier("DownloadRow-Dismiss")
     }
   }
 

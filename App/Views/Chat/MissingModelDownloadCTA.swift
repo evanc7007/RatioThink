@@ -79,7 +79,7 @@ struct MissingModelDownloadCTA: View {
     }
     .onAppear {
       guard handleID == nil, !didComplete else { return }
-      if let existing = inFlightHandleForTarget() {
+      if let existing = downloads.inFlightHandle(repo: target.repo, file: target.file) {
         // Reflect a download for this target already in flight (started by
         // the sibling surface or Settings → Models) — the controller is
         // shared app-wide — instead of offering a redundant Download.
@@ -175,11 +175,7 @@ struct MissingModelDownloadCTA: View {
     // Adopt an in-flight download for the same target rather than
     // tripping the downloader's dedupe (which would return nil + a
     // confusing "already downloading" error).
-    if let existing = inFlightHandleForTarget() {
-      handleID = existing
-      return
-    }
-    if let id = downloads.enqueue(repo: target.repo, file: target.file) {
+    if let id = downloads.enqueueOrAdopt(repo: target.repo, file: target.file) {
       handleID = id
     } else {
       // `enqueue` returned nil — surface the controller's reason instead
@@ -187,15 +183,6 @@ struct MissingModelDownloadCTA: View {
       handleID = nil
       enqueueError = downloads.lastError ?? "Could not start download"
     }
-  }
-
-  /// Handle id of a non-terminal download already running for this
-  /// target, if any. Lets every surface bound to the shared controller
-  /// (this CTA, its sibling, Settings → Models) reflect one queue.
-  private func inFlightHandleForTarget() -> UUID? {
-    downloads.active.values.first {
-      $0.repo == target.repo && $0.file == target.file && !$0.isTerminal
-    }?.id
   }
 
   /// Whether this target's file is already staged on disk. The download
