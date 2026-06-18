@@ -85,13 +85,19 @@ public enum ChatStartGate {
   ///     when the profile carries no default.
   ///   - profileError: a structural problem with the active-profile
   ///     selection (unreadable marker / unparsable profile), if any.
+  ///   - hasPolledEngineStatus: whether `engineStatus` came from at
+  ///     least one helper poll. `EngineStatusStore` initializes status to
+  ///     `.starting` as an honest "unknown until first reply" placeholder;
+  ///     that placeholder must not be treated as a genuine in-flight start
+  ///     that hides the user's explicit Load action.
   public static func evaluate(
     engineStatus: EngineStatus,
     helperError: String?,
     load: ModelLoadCenter.State,
     resolvedModelID: String?,
     profileDefault: String?,
-    profileError: String? = nil
+    profileError: String? = nil,
+    hasPolledEngineStatus: Bool = true
   ) -> State {
     // A resolvable model wins outright — this is the send-proceeds path
     // and matches `ChatScaffoldView.requestModelID` precedence.
@@ -112,6 +118,9 @@ public enum ChatStartGate {
     case .stopping:
       return .busy(.stoppingEngine)
     case .starting:
+      if !hasPolledEngineStatus {
+        return defaultOrNo(profileDefault: profileDefault, profileError: profileError)
+      }
       // Engine coming up (boot auto-resume / Resume). v1 pie loads the
       // model at `pie serve` boot, so "starting" already implies the
       // default is on its way — wait, don't offer a redundant Load.

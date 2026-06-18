@@ -499,7 +499,8 @@ struct ChatScaffoldView: View {
       load: modelLoadCenter.state,
       resolvedModelID: currentModelID(),
       profileDefault: selectedProfileDefault,
-      profileError: profileStore.lastActiveProfileError?.description
+      profileError: profileStore.lastActiveProfileError?.description,
+      hasPolledEngineStatus: engineStatusStore.pollCount > 0
     )
   }
 

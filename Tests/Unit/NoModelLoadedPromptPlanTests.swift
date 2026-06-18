@@ -109,6 +109,24 @@ final class NoModelLoadedPromptPlanTests: XCTestCase {
 
   // MARK: - F2: busy keeps the download CTA on a fresh install
 
+  func test_initial_starting_placeholder_with_on_disk_default_offers_first_click_load() {
+    let state = ChatStartGate.evaluate(
+      engineStatus: .starting,
+      helperError: nil,
+      load: .idle,
+      resolvedModelID: nil,
+      profileDefault: ProfileStore.defaultChatModelID,
+      profileError: nil,
+      hasPolledEngineStatus: false
+    )
+    XCTAssertEqual(state, .needsDefaultLoad(modelID: ProfileStore.defaultChatModelID))
+
+    let p = plan(state, loadAction)
+    XCTAssertEqual(p.primary, .load)
+    XCTAssertTrue(p.showsModelChip)
+    XCTAssertFalse(p.showsWaitSpinner)
+  }
+
   func test_busy_starting_keeps_download_cta_when_not_downloaded() {
     let p = plan(.busy(.startingEngine), downloadAction)
     XCTAssertEqual(p.headline, "Starting the engine…")
