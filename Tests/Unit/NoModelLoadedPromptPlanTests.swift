@@ -8,6 +8,15 @@ import XCTest
 /// affordances are asserted without a view hierarchy.
 @MainActor
 final class NoModelLoadedPromptPlanTests: XCTestCase {
+  private final class StubXPCClient: AppXPCClient, @unchecked Sendable {
+    func engineStatus() async throws -> EngineStatus {
+      throw AppXPCClientError.proxyTypeMismatch
+    }
+
+    func stopEngine() async throws {}
+
+    func startEngine(profileID: String) async throws {}
+  }
 
   // #326 availability actions, built via the shared recovery decision so
   // no ModelDownloadTarget has to be constructed by hand.
@@ -118,6 +127,33 @@ final class NoModelLoadedPromptPlanTests: XCTestCase {
       profileDefault: ProfileStore.defaultChatModelID,
       profileError: nil,
       hasPolledEngineStatus: false
+    )
+    XCTAssertEqual(state, .needsDefaultLoad(modelID: ProfileStore.defaultChatModelID))
+
+    let p = plan(state, loadAction)
+    XCTAssertEqual(p.primary, .load)
+    XCTAssertTrue(p.showsModelChip)
+    XCTAssertFalse(p.showsWaitSpinner)
+  }
+
+  func test_failed_first_status_poll_still_treats_starting_as_placeholder_for_first_click_load() {
+    let status = EngineStatusStore(
+      client: StubXPCClient(),
+      tierPolicy: StatusTierPolicy(tier1Polls: 2, tier2Polls: 3)
+    )
+    status._applyPollForTesting(next: nil, error: "NSXPCConnectionInterrupted")
+    XCTAssertEqual(status.status, .starting)
+    XCTAssertEqual(status.pollCount, 1)
+    XCTAssertFalse(status.hasReceivedEngineStatus)
+
+    let state = ChatStartGate.evaluate(
+      engineStatus: status.status,
+      helperError: status.lastError,
+      load: .idle,
+      resolvedModelID: nil,
+      profileDefault: ProfileStore.defaultChatModelID,
+      profileError: nil,
+      hasPolledEngineStatus: status.hasReceivedEngineStatus
     )
     XCTAssertEqual(state, .needsDefaultLoad(modelID: ProfileStore.defaultChatModelID))
 

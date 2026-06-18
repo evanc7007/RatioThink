@@ -500,7 +500,7 @@ struct ChatScaffoldView: View {
       resolvedModelID: currentModelID(),
       profileDefault: selectedProfileDefault,
       profileError: profileStore.lastActiveProfileError?.description,
-      hasPolledEngineStatus: engineStatusStore.pollCount > 0
+      hasPolledEngineStatus: engineStatusStore.hasReceivedEngineStatus
     )
   }
 
