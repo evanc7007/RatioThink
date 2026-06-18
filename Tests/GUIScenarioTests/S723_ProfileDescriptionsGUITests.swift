@@ -45,10 +45,13 @@ final class S723_ProfileDescriptionsGUITests: XCTestCase {
     assertDescription("A faster, deterministic chat profile that uses speculative decoding when available.",
                       existsIn: settings)
 
+    let chatDescription = settings.staticTexts["A general-purpose chat profile for everyday questions and tasks."]
+    chatDescription.click()
+
     XCTAssertTrue(settings.staticTexts["Description"].waitForExistence(timeout: 5),
                   "Profile editor should expose a Description section; window: \(settings.debugDescription)")
-    XCTAssertTrue(settings.staticTexts["You are a helpful assistant."].exists,
-                  "System prompt should remain visible as separate engine instructions")
+    XCTAssertTrue(settings.textViews["ProfileEditorSystemPromptEditor"].waitForExistence(timeout: 5),
+                  "System prompt should remain visible as separate editable engine instructions")
   }
 
   @MainActor
