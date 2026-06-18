@@ -55,6 +55,13 @@ DATASETS = os.environ.get("DATASETS", "gsm8k,humaneval").split(",")
 # (value×N-median + partial-step decomposition) — the AFTER re-measure.
 TASK = os.environ.get("TASK", "chat")
 OUT = os.environ.get("WASM_BEFORE_OUT", "tot_wasm_before.json")
+# Tree-dump mode (#657 mechanism analysis): when set, every prompt's FULL tree
+# (each node's id/depth/score/status/content + selected + synthesized answer) is
+# appended to DUMP_OUT as JSONL, so the gap can be decomposed offline: was a
+# correct answer in the tree but not selected (selection/synthesis loss) vs
+# never generated (decomposition loss), branch variation, score spread, etc.
+DUMP_TREE = os.environ.get("DUMP_TREE") == "1"
+DUMP_OUT = os.environ.get("DUMP_OUT", "tot_tree_dump.jsonl")
 _FAITHFUL = {"gsm8k": 0.750, "humaneval": 1.000, "mbpp": 0.800}  # ToT col, credible matrix
 
 
@@ -98,6 +105,18 @@ async def _tot_once(http_c: httpx.AsyncClient, base_url: str, prompt: str,
             "ok_nodes": ok_nodes, "n_frames": len(kinds)}
     if term.get("event") != "tree_complete":
         diag["error"] = f"terminal={term.get('event')!r} (no tree_complete)"
+    if DUMP_TREE:
+        # Capture the full tree for offline mechanism analysis. node_complete
+        # carries node.{id,depth,branch_index,score,status,content}.
+        nodes = []
+        for e in events:
+            if e.get("event") != "node_complete":
+                continue
+            nd = e.get("node") or {}
+            nodes.append({k: nd.get(k) for k in
+                          ("id", "depth", "branch_index", "score", "status", "content")})
+        diag["nodes"] = nodes
+        diag["final_answer"] = term.get("final_answer") or ""
     return term.get("final_answer") or "", diag
 
 
@@ -131,6 +150,13 @@ async def _run_dataset(http_c, base_url, key, grader):
         print(f"[wasm-before]   {key} {i}/{len(records)} {verdict} "
               f"sel={diag.get('selected')!r} ok_nodes={diag.get('ok_nodes')} "
               f"{dt:.0f}s", flush=True)
+        if DUMP_TREE and "nodes" in diag:
+            rec_out = {"dataset": key, "index": i, "prompt": rec["prompt"],
+                       "reference": rec["reference"], "grader": grader,
+                       "final_verdict": verdict, "selected": diag.get("selected"),
+                       "final_answer": diag.get("final_answer"), "nodes": diag["nodes"]}
+            with open(DUMP_OUT, "a") as fh:
+                fh.write(json.dumps(rec_out) + "\n")
     acc = (correct / graded) if graded else None
     return {"dataset": key, "family": family, "grader": grader, "depth": depth,
             "graded": graded, "correct": correct, "errored": errored,
