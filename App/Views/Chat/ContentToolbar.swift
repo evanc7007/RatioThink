@@ -30,6 +30,11 @@ struct ContentToolbar: View {
   /// #459's collapsed model-menu summary (concrete leaf + optional
   /// annotation). `ChatScaffoldView` derives it from `Chat.modelID`.
   let currentModelSummary: ToolbarModelOptions.CurrentSummary?
+  /// #711: engine-true occupancy for this chat's latest turn, read from
+  /// `ContextUsageTracker` (the single source). `nil` ⇒ the meter is
+  /// hidden (no turn has reported usage yet; snapshot/preview call sites
+  /// omit it so their reference PNGs are unchanged).
+  let contextUsage: ContextUsage?
   /// #460: the chat's persisted selected model (`Chat.modelID`) — the single
   /// selection authority. Resolves the swap-policy "from model" and the
   /// model-menu clear-vs-load decision; `nil` ⇒ the chat follows the active
@@ -113,6 +118,7 @@ struct ContentToolbar: View {
     availableProfiles: [String] = ["chat"],
     modelOptions: [ToolbarModelOptions.Option] = [],
     currentModelSummary: ToolbarModelOptions.CurrentSummary? = nil,
+    contextUsage: ContextUsage? = nil,
     selectedModelID: String? = nil,
     profileDefaultModel: String? = nil,
     commitSwap: @escaping ProfileSwapCoordinator.SwapCommit = { _, _ in true },
@@ -132,6 +138,7 @@ struct ContentToolbar: View {
     self.availableProfiles = availableProfiles
     self.modelOptions = modelOptions
     self.currentModelSummary = currentModelSummary
+    self.contextUsage = contextUsage
     self.selectedModelID = selectedModelID
     self.profileDefaultModel = profileDefaultModel
     self.commitSwap = commitSwap
@@ -179,6 +186,7 @@ struct ContentToolbar: View {
 
       Spacer(minLength: 12)
 
+      contextMeter
       paramsButton
       attachButton
       systemPromptButton
@@ -705,6 +713,15 @@ struct ContentToolbar: View {
     openSettings()
   }
 
+  /// #711: context-occupancy meter. Hidden until the active conversation
+  /// reports usage (snapshot/preview call sites omit `contextUsage`, so
+  /// their reference PNGs are unchanged).
+  @ViewBuilder private var contextMeter: some View {
+    if let usage = contextUsage {
+      ContextMeterView(usage: usage)
+    }
+  }
+
   private var paramsButton: some View {
     Button {
       showParamsPopover.toggle()
@@ -764,6 +781,61 @@ struct ContentToolbar: View {
       ))
     }
     .accessibilityIdentifier("toolbar.sys")
+  }
+}
+
+// MARK: - context meter (#711)
+
+/// Compact context-occupancy bar — ~3 SF-symbol-widths wide, sits between
+/// the trailing spacer and the params button. Fill = used/window; the
+/// colour escalates green → amber → red as the conversation fills toward
+/// the engine-true context window. `internal` (not `private`) so the pure
+/// colour/label logic is unit-testable (`ContextMeterViewTests`) and the
+/// bar can be rendered to a PNG in a snapshot test.
+struct ContextMeterView: View {
+  let usage: ContextUsage
+
+  /// ~3 SF-symbol widths.
+  private let trackWidth: CGFloat = 44
+  private let trackHeight: CGFloat = 6
+
+  var body: some View {
+    ZStack(alignment: .leading) {
+      Capsule().fill(Color.secondary.opacity(0.2))
+      if let fraction = usage.fraction {
+        Capsule()
+          .fill(Self.fillColor(fraction))
+          .frame(width: max(2, trackWidth * CGFloat(fraction)))
+      }
+    }
+    .frame(width: trackWidth, height: trackHeight)
+    .help(Self.label(for: usage))
+    .accessibilityElement()
+    .accessibilityIdentifier("toolbar.contextMeter")
+    .accessibilityLabel("Context usage")
+    .accessibilityValue(Self.label(for: usage))
+  }
+
+  /// Green under 75 %, amber 75–90 %, red above — a coarse "how close to
+  /// the wall" signal that doesn't demand the user read the number.
+  static func fillColor(_ fraction: Double) -> Color {
+    switch fraction {
+    case ..<0.75: return .green
+    case ..<0.9:  return .orange
+    default:      return .red
+    }
+  }
+
+  /// Tooltip + VoiceOver value. Shows the percentage only when the window
+  /// is known; otherwise reports the raw count and that the window is
+  /// unmeasured (so the empty track is not read as "0 %").
+  static func label(for usage: ContextUsage) -> String {
+    let used = usage.usedTokens.formatted()
+    if let window = usage.windowTokens, window > 0 {
+      let pct = Int((usage.fraction ?? 0) * 100)
+      return "Context: \(used) / \(window.formatted()) tokens (\(pct)%)"
+    }
+    return "Context: \(used) tokens (window unknown)"
   }
 }
 
