@@ -62,6 +62,10 @@ OUT = os.environ.get("WASM_BEFORE_OUT", "tot_wasm_before.json")
 # never generated (decomposition loss), branch variation, score spread, etc.
 DUMP_TREE = os.environ.get("DUMP_TREE") == "1"
 DUMP_OUT = os.environ.get("DUMP_OUT", "tot_tree_dump.jsonl")
+# Restrict the run to specific 1-based prompt indices (into the SAME records the
+# full run loads), so the mechanism dump targets only the divergent prompts
+# instead of re-running all 30. Empty = all. e.g. PROMPT_INDICES="1,5,6,9".
+PROMPT_INDICES = {int(x) for x in os.environ.get("PROMPT_INDICES", "").split(",") if x.strip()}
 _FAITHFUL = {"gsm8k": 0.750, "humaneval": 1.000, "mbpp": 0.800}  # ToT col, credible matrix
 
 
@@ -132,6 +136,8 @@ async def _run_dataset(http_c, base_url, key, grader):
     first_error = None
     loop = asyncio.get_event_loop()
     for i, rec in enumerate(records, 1):
+        if PROMPT_INDICES and i not in PROMPT_INDICES:
+            continue  # mechanism dump: only the requested (e.g. divergent) prompts
         t0 = loop.time()
         ans, diag = await _tot_once(http_c, base_url, rec["prompt"], depth)
         dt = loop.time() - t0
