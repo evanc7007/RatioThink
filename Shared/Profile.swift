@@ -58,6 +58,7 @@ public struct Profile {
   public var id: String
   public var name: String
   public var icon: String?
+  public var description: String?
   /// Default model slug for this profile. `nil` is an explicit
   /// no-default state: the UI should prompt the operator to choose or
   /// download a model instead of inventing a fallback.
@@ -82,6 +83,7 @@ public struct Profile {
     id: String,
     name: String,
     icon: String? = nil,
+    description: String? = nil,
     model: String?,
     inferlet: String,
     systemPrompt: String? = nil,
@@ -94,6 +96,7 @@ public struct Profile {
     self.id = id
     self.name = name
     self.icon = icon
+    self.description = description
     self.model = model
     self.inferlet = inferlet
     self.systemPrompt = systemPrompt
@@ -126,6 +129,15 @@ public struct Profile {
     let inferlet = try requireString("inferlet")
 
     let icon = table["icon"]?.string
+    let description: String?
+    if let rawDescription = table["description"] {
+      guard let stringDescription = rawDescription.string else {
+        throw ProfileError.invalidValue(field: "description", reason: "expected string")
+      }
+      description = stringDescription
+    } else {
+      description = nil
+    }
     let systemPrompt = table["system_prompt"]?.string
 
     var sampling = Sampling()
@@ -163,6 +175,7 @@ public struct Profile {
 
     return Profile(
       id: id, name: name, icon: icon,
+      description: description,
       model: model, inferlet: inferlet,
       systemPrompt: systemPrompt,
       sampling: sampling,
@@ -214,6 +227,7 @@ public struct Profile {
     // keys only when the Swift side still has a value (review v3
     // F4 — prior code only purged inferlet_args).
     table.remove(at: "icon")
+    table.remove(at: "description")
     table.remove(at: "system_prompt")
     table.remove(at: "inferlet_args")
     table.remove(at: "speculation")
@@ -224,6 +238,7 @@ public struct Profile {
     table["inferlet"] = TOMLValue(stringLiteral: inferlet)
     if let model, !model.isEmpty { table["model"] = TOMLValue(stringLiteral: model) }
     if let icon { table["icon"] = TOMLValue(stringLiteral: icon) }
+    if let description { table["description"] = TOMLValue(stringLiteral: description) }
     if let systemPrompt { table["system_prompt"] = TOMLValue(stringLiteral: systemPrompt) }
     let samplingTable = TOMLTable([
       "temperature": TOMLValue(floatLiteral: sampling.temperature),

@@ -261,6 +261,14 @@ final class ProfileStoreTests: XCTestCase {
                    "defaultProfileID must equal the `id =` literal inside defaultChatTOML; drift reproduces ")
   }
 
+  func test_default_chat_toml_has_user_facing_description() throws {
+    let parsed = try Profile.parse(toml: ProfileStore.defaultChatTOML)
+    XCTAssertEqual(parsed.description,
+                   "A general-purpose chat profile for everyday questions and tasks.")
+    XCTAssertEqual(parsed.systemPrompt, "You are a helpful assistant.",
+                   "the user-facing description must stay distinct from the engine system prompt")
+  }
+
   ///  review v1 F2 + F8 (refined under review v2 F1):
   /// marker-write failure must surface `.activeProfileSeedFailed`
   /// via `lastActiveProfileError`. The fault must break ONLY the
@@ -2273,6 +2281,8 @@ final class ProfileStoreTests: XCTestCase {
         $0.profile?.id == ProfileStore.defaultRepeatBoostProfileID
       })
       XCTAssertNil(entry.error)
+      XCTAssertEqual(entry.profile?.description,
+                     "A faster, deterministic chat profile that uses speculative decoding when available.")
       XCTAssertEqual(entry.profile?.speculation, Profile.Speculation(enabled: true))
       XCTAssertEqual(entry.profile?.sampling.temperature, 0,
                      "Repeat Boost is greedy — temperature must be 0")

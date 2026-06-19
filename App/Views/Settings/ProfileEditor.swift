@@ -59,6 +59,9 @@ struct ProfileEditor: View {
       VStack(alignment: .leading, spacing: 16) {
         if let profile = entry.profile {
           headerRow(profile: profile)
+          if let description = displayDescription(profile.description) {
+            descriptionSection(description)
+          }
           coreSection(profile: profile)
           editableDefaultsSection(profile: profile)
           if profile.speculation != nil {
@@ -316,6 +319,23 @@ struct ProfileEditor: View {
         Spacer()
       }
     }
+  }
+
+  private func descriptionSection(_ description: String) -> some View {
+    VStack(alignment: .leading, spacing: 6) {
+      SettingsSectionHeader(title: "Description")
+      Text(description)
+        .font(.callout)
+        .textSelection(.enabled)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityIdentifier("ProfileEditorDescription")
+    }
+  }
+
+  private func displayDescription(_ raw: String?) -> String? {
+    guard let raw else { return nil }
+    let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    return trimmed.isEmpty ? nil : trimmed
   }
 
   private func profileSlider(_ label: String,

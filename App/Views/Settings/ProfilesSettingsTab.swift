@@ -153,10 +153,11 @@ private struct ProfileListRow: View {
       VStack(alignment: .leading) {
         Text(displayName)
           .lineLimit(1)
-        if let p = entry.profile {
-          Text(p.id)
+        if let caption {
+          Text(caption)
             .font(.caption)
             .foregroundStyle(.secondary)
+            .lineLimit(2)
         }
       }
     }
@@ -164,5 +165,11 @@ private struct ProfileListRow: View {
 
   private var displayName: String {
     entry.profile?.name ?? entry.url.deletingPathExtension().lastPathComponent
+  }
+
+  private var caption: String? {
+    guard let p = entry.profile else { return nil }
+    let trimmed = p.description?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    return trimmed.isEmpty ? p.id : trimmed
   }
 }
