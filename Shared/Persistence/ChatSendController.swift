@@ -760,11 +760,22 @@ public final class ChatSendController: ObservableObject {
   public struct BestOfNResume: Equatable, Sendable {
     public let pickedName: String
     public let pickedText: String
+    /// Optional per-round user guidance for the next level (#715). Nil preserves
+    /// the exact #690 resume wire/behavior.
+    public let selectedComment: String?
     public let unpicked: [String]
     public let level: Int
-    public init(pickedName: String, pickedText: String, unpicked: [String], level: Int) {
+    public init(
+      pickedName: String,
+      pickedText: String,
+      selectedComment: String? = nil,
+      unpicked: [String],
+      level: Int
+    ) {
       self.pickedName = pickedName
       self.pickedText = pickedText
+      let trimmed = selectedComment?.trimmingCharacters(in: .whitespacesAndNewlines)
+      self.selectedComment = trimmed?.isEmpty == false ? trimmed : nil
       self.unpicked = unpicked
       self.level = level
     }
@@ -921,6 +932,7 @@ public final class ChatSendController: ObservableObject {
       topP: options.sampling.topP,
       resumeFrom: resume?.pickedName,
       pickedText: resume?.pickedText,
+      selectedComment: resume?.selectedComment,
       unpicked: resume?.unpicked,
       level: resume?.level
     )
@@ -1178,6 +1190,7 @@ private struct BestOfNRequestInput: Encodable {
   let topP: Double
   let resumeFrom: String?
   let pickedText: String?
+  let selectedComment: String?
   let unpicked: [String]?
   let level: Int?
 
@@ -1187,6 +1200,7 @@ private struct BestOfNRequestInput: Encodable {
     case topP = "top_p"
     case resumeFrom = "resume_from"
     case pickedText = "picked_text"
+    case selectedComment = "selected_comment"
   }
 }
 

@@ -240,6 +240,54 @@ final class BestOfNTests: XCTestCase {
       ["a0", "a1", "b0", "b1"])
   }
 
+
+  // MARK: Think-more guidance comment wire (#715)
+
+  /// #715: a non-empty per-round comment entered after selecting a candidate
+  /// must travel on the think-more resume request as `selected_comment`; the
+  /// inferlet appends it after the picked branch prefix before generating the
+  /// next level.
+  @MainActor
+  func test_thinkMore_resume_request_includes_selected_comment() async throws {
+    let container = try RatioThinkModelContainer.makeInMemory()
+    let context = ModelContext(container)
+    let chat = Chat()
+    context.insert(chat)
+    chat.messages.append(Message(role: "user", content: "Plan a launch", ts: Date(timeIntervalSinceReferenceDate: 1)))
+    try context.save()
+
+    let engine = ReleaseCapturingEngine()
+    let controller = ChatSendController()
+    controller.sendBestOfN(
+      chat: chat,
+      context: context,
+      engine: engine,
+      config: BestOfNProfileConfig(n: 3),
+      persistenceStatus: PersistenceStatus(),
+      options: ChatSendRequestOptions(modelID: "m"),
+      resume: ChatSendController.BestOfNResume(
+        pickedName: "bon/r0/1/1",
+        pickedText: "Use a phased launch.",
+        selectedComment: "Emphasize launch risks and mitigations.",
+        unpicked: ["bon/r0/1/0", "bon/r0/1/2"],
+        level: 2))
+
+    let deadline = Date().addingTimeInterval(2)
+    while Date() < deadline, engine.lastRequest == nil {
+      try await Task.sleep(nanoseconds: 10_000_000)
+    }
+    controller.cancel()
+
+    let req = try XCTUnwrap(engine.lastRequest, "think-more must dispatch a best-of-n request")
+    XCTAssertEqual(req.inferlet, "best-of-n")
+    let input = try JSONDecoder().decode(BestOfNResumeWire.self, from: req.input)
+    XCTAssertEqual(input.resumeFrom, "bon/r0/1/1")
+    XCTAssertEqual(input.pickedText, "Use a phased launch.")
+    XCTAssertEqual(input.selectedComment, "Emphasize launch risks and mitigations.")
+    XCTAssertEqual(input.unpicked, ["bon/r0/1/0", "bon/r0/1/2"])
+    XCTAssertEqual(input.level, 2)
+  }
+
   // MARK: Release-ack observability (#703 F4)
 
   /// A release that freed every requested snapshot is silent — no short-release
@@ -329,6 +377,21 @@ final class BestOfNTests: XCTestCase {
   private struct ReleaseWire: Decodable {
     let model: String
     let release: [String]
+  }
+
+  private struct BestOfNResumeWire: Decodable {
+    let resumeFrom: String?
+    let pickedText: String?
+    let selectedComment: String?
+    let unpicked: [String]?
+    let level: Int?
+
+    private enum CodingKeys: String, CodingKey {
+      case resumeFrom = "resume_from"
+      case pickedText = "picked_text"
+      case selectedComment = "selected_comment"
+      case unpicked, level
+    }
   }
 
   // MARK: liveness rule (#708) — only the trailing, uncommitted round is live

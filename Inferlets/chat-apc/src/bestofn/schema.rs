@@ -44,6 +44,9 @@ pub struct BestOfNInput {
     /// The picked candidate's text. Required with `resume_from`: it re-prefills
     /// the base if the snapshot was LRU-evicted during the pick.
     pub picked_text: Option<String>,
+    /// Optional user guidance for the next round, appended after the picked
+    /// branch context. Empty/whitespace is treated as absent.
+    pub selected_comment: Option<String>,
     /// Snapshot names of the unpicked siblings to delete (deterministic free).
     pub unpicked: Option<Vec<String>>,
     /// Current depth: round 1 = 1; think-more increments.
@@ -96,7 +99,12 @@ pub fn resolve(input: &BestOfNInput) -> Result<BestOfNParams, (&'static str, Str
     let temperature = match input.temperature {
         None => DEFAULT_TEMPERATURE,
         Some(v) if (0.0..=2.0).contains(&v) => v,
-        Some(_) => return Err(("temperature", "temperature must be in [0.0, 2.0]".to_string())),
+        Some(_) => {
+            return Err((
+                "temperature",
+                "temperature must be in [0.0, 2.0]".to_string(),
+            ));
+        }
     };
     let top_p = match input.top_p {
         None => DEFAULT_TOP_P,
@@ -150,15 +158,30 @@ mod tests {
     #[test]
     fn n_is_capped_and_floored() {
         assert_eq!(
-            resolve(&BestOfNInput { n: Some(0), ..Default::default() }).unwrap_err().0,
+            resolve(&BestOfNInput {
+                n: Some(0),
+                ..Default::default()
+            })
+            .unwrap_err()
+            .0,
             "n"
         );
         assert_eq!(
-            resolve(&BestOfNInput { n: Some(MAX_N + 1), ..Default::default() }).unwrap_err().0,
+            resolve(&BestOfNInput {
+                n: Some(MAX_N + 1),
+                ..Default::default()
+            })
+            .unwrap_err()
+            .0,
             "n"
         );
         assert_eq!(
-            resolve(&BestOfNInput { n: Some(3), ..Default::default() }).unwrap().n,
+            resolve(&BestOfNInput {
+                n: Some(3),
+                ..Default::default()
+            })
+            .unwrap()
+            .n,
             3
         );
     }
@@ -166,9 +189,12 @@ mod tests {
     #[test]
     fn token_budgets_reject_zero_and_over_cap() {
         assert_eq!(
-            resolve(&BestOfNInput { max_tokens_per_candidate: Some(0), ..Default::default() })
-                .unwrap_err()
-                .0,
+            resolve(&BestOfNInput {
+                max_tokens_per_candidate: Some(0),
+                ..Default::default()
+            })
+            .unwrap_err()
+            .0,
             "max_tokens_per_candidate"
         );
         assert_eq!(
@@ -194,28 +220,63 @@ mod tests {
     #[test]
     fn sampling_ranges_are_validated() {
         assert_eq!(
-            resolve(&BestOfNInput { temperature: Some(2.5), ..Default::default() }).unwrap_err().0,
+            resolve(&BestOfNInput {
+                temperature: Some(2.5),
+                ..Default::default()
+            })
+            .unwrap_err()
+            .0,
             "temperature"
         );
         assert_eq!(
-            resolve(&BestOfNInput { top_p: Some(0.0), ..Default::default() }).unwrap_err().0,
+            resolve(&BestOfNInput {
+                top_p: Some(0.0),
+                ..Default::default()
+            })
+            .unwrap_err()
+            .0,
             "top_p"
         );
         assert_eq!(
-            resolve(&BestOfNInput { top_p: Some(1.0), ..Default::default() }).unwrap().top_p,
+            resolve(&BestOfNInput {
+                top_p: Some(1.0),
+                ..Default::default()
+            })
+            .unwrap()
+            .top_p,
             1.0
         );
     }
 
     #[test]
     fn thinking_opt_in_is_honored() {
-        let p = resolve(&BestOfNInput { thinking: Some(true), ..Default::default() }).unwrap();
+        let p = resolve(&BestOfNInput {
+            thinking: Some(true),
+            ..Default::default()
+        })
+        .unwrap();
         assert!(p.thinking);
     }
 
     #[test]
     fn level_defaults_to_one_and_floors() {
-        assert_eq!(resolve(&BestOfNInput { level: Some(0), ..Default::default() }).unwrap().level, 1);
-        assert_eq!(resolve(&BestOfNInput { level: Some(3), ..Default::default() }).unwrap().level, 3);
+        assert_eq!(
+            resolve(&BestOfNInput {
+                level: Some(0),
+                ..Default::default()
+            })
+            .unwrap()
+            .level,
+            1
+        );
+        assert_eq!(
+            resolve(&BestOfNInput {
+                level: Some(3),
+                ..Default::default()
+            })
+            .unwrap()
+            .level,
+            3
+        );
     }
 }
