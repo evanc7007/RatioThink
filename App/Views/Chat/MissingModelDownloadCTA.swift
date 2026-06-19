@@ -79,7 +79,7 @@ struct MissingModelDownloadCTA: View {
     }
     .onAppear {
       guard handleID == nil, !didComplete else { return }
-      if let existing = inFlightHandleForTarget() {
+      if let existing = downloads.inFlightHandle(repo: target.repo, file: target.file) {
         // Reflect a download for this target already in flight (started by
         // the sibling surface or Settings → Models) — the controller is
         // shared app-wide — instead of offering a redundant Download.
@@ -165,39 +165,81 @@ struct MissingModelDownloadCTA: View {
       Text(entry.errorMessage ?? "Download failed")
         .font(.caption).foregroundStyle(.secondary)
         .lineLimit(2).truncationMode(.tail)
-      Button("Retry", action: startDownload)
+      Button("Retry") { retryDownload(entry) }
         .buttonStyle(.bordered)
         .accessibilityIdentifier("missingModel.retry")
     }
   }
 
   private func startDownload() {
-    enqueueError = nil
+    applyDownloadAction(Self.startDownload(downloads: downloads, target: target))
+  }
+
+  private func retryDownload(_ entry: ModelDownloadController.ActiveDownload) {
+    applyDownloadAction(Self.retryFailedDownload(entryID: entry.id, downloads: downloads))
+  }
+
+  private func applyDownloadAction(_ result: DownloadActionResult) {
+    enqueueError = result.enqueueError
     didComplete = false
+    handleID = result.handleID
+  }
+
+  struct DownloadActionResult: Equatable {
+    let handleID: UUID?
+    let enqueueError: String?
+  }
+
+  @MainActor
+  static func startDownload(
+    downloads: ModelDownloadController,
+    target: ModelDownloadTarget
+  ) -> DownloadActionResult {
     // Adopt an in-flight download for the same target rather than
     // tripping the downloader's dedupe (which would return nil + a
     // confusing "already downloading" error).
-    if let existing = inFlightHandleForTarget() {
-      handleID = existing
-      return
-    }
-    if let id = downloads.enqueue(repo: target.repo, file: target.file) {
-      handleID = id
-    } else {
+    guard let id = downloads.enqueueOrAdopt(repo: target.repo, file: target.file) else {
       // `enqueue` returned nil — surface the controller's reason instead
       // of looking like the button did nothing.
-      handleID = nil
-      enqueueError = downloads.lastError ?? "Could not start download"
+      return DownloadActionResult(
+        handleID: nil,
+        enqueueError: downloads.lastError ?? "Could not start download")
     }
+    return DownloadActionResult(handleID: id, enqueueError: nil)
   }
 
-  /// Handle id of a non-terminal download already running for this
-  /// target, if any. Lets every surface bound to the shared controller
-  /// (this CTA, its sibling, Settings → Models) reflect one queue.
-  private func inFlightHandleForTarget() -> UUID? {
-    downloads.active.values.first {
-      $0.repo == target.repo && $0.file == target.file && !$0.isTerminal
-    }?.id
+  @MainActor
+  static func retryFailedDownload(
+    entryID: UUID,
+    downloads: ModelDownloadController
+  ) -> DownloadActionResult {
+    guard let id = downloads.retry(id: entryID) else {
+      // `retry(id:)` deliberately preserves the failed row when the new
+      // start returns nil. Keep tracking that retained row so the CTA stays
+      // on the failed-row Retry surface instead of falling back to the
+      // initial Download path, which would use enqueueOrAdopt and orphan the
+      // persisted failure.
+      let retainedFailedID: UUID? = {
+        guard downloads.active[entryID]?.progress.phase == .failed else { return nil }
+        return entryID
+      }()
+      return DownloadActionResult(
+        handleID: retainedFailedID,
+        enqueueError: downloads.lastError ?? "Could not start download")
+    }
+    return DownloadActionResult(handleID: id, enqueueError: nil)
+  }
+
+
+  @MainActor
+  static func retryAffordanceIsRenderable(
+    handleID: UUID?,
+    downloads: ModelDownloadController
+  ) -> Bool {
+    guard let handleID,
+      let entry = downloads.active[handleID]
+    else { return false }
+    return entry.progress.phase == .failed
   }
 
   /// Whether this target's file is already staged on disk. The download
