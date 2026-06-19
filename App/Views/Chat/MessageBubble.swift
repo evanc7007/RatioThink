@@ -425,4 +425,3 @@ enum SafeLinkOpenURLAction {
     return .systemAction(url)
   }
 }
-

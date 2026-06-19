@@ -1523,7 +1523,8 @@ struct ChatScaffoldView: View {
       // (#459 repro 1 vs #460's engine-running nil). #497: the full
       // `ModelTarget` (id + source) so the prompt frames a pin honestly.
       target: gateTarget(for: chat),
-      profileError: profileStore.lastActiveProfileError?.description
+      profileError: profileStore.lastActiveProfileError?.description,
+      hasReceivedEngineStatus: engineStatusStore.hasReceivedEngineStatus
     )
   }
 
@@ -1650,19 +1651,15 @@ struct ChatScaffoldView: View {
       // the resident one rebuilds the engine onto it (a live `/v1/models/load`
       // can't swap the boot model); the already-resident case short-circuits.
       swapCoordinator.loadDirect(modelID: model, profileID: viewModel.selectedProfileID)
-    case .stopped:
+    case .stopped, .starting:
       // Bring the engine up bound to this chat's profile; v1 pie loads
       // the profile's model at boot, and `reconcileEngineResidentModel`
-      // picks it up once `.running`.
+      // picks it up once `.running`. `.starting` also covers the initial
+      // unknown placeholder; the helper start path is idempotent for a
+      // genuine in-flight start.
       startEngineForSelectedProfile()
-    case let .failed(code, _):
-      // #397 F3: only re-start for a retryable failure. memoryRisk /
-      // killRejected re-fire a guaranteed-to-fail or refused start, so
-      // do NOT — the prompt shows those as terminal (Open Settings /
-      // reason), never an active Load/Retry that loops.
-      if code.invitesResumeRetry { startEngineForSelectedProfile() }
-    case .starting, .stopping:
-      break  // already in flight — the busy state already reflects this
+    case .failed, .stopping:
+      break
     }
   }
 

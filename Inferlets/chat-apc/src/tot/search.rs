@@ -3140,8 +3140,8 @@ mod tests {
     fn synthesis_directive_trims_whitespace_only_reasoning() {
         // Whitespace-only reasoning must not open an empty notes section.
         let d = build_synthesis_directive(
-            "Answer.", "   
-  ",
+            "Answer.",
+            "   \n  ",
         );
         assert!(!d.contains("Private supporting notes"));
     }
