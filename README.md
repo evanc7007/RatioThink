@@ -4,12 +4,14 @@
 
 # Rational
 
-**Private, local AI chat for macOS — powered by various thinking modes.**
+**Private, local AI chat for macOS — powered by various thinking profiles.**
 
 ![macOS 14+](https://img.shields.io/badge/macOS-14%2B-black?logo=apple)
 ![Apple Silicon](https://img.shields.io/badge/Apple%20Silicon-arm64-black)
 ![Version](https://img.shields.io/badge/version-v0.1.5-blue)
 ![License](https://img.shields.io/badge/license-Apache--2.0-green)
+
+### [Download Rational v0.1.5](https://github.com/shsym/RatioThink/releases/download/v0.1.5/Rational-arm64.dmg)
 
 </div>
 
@@ -25,8 +27,8 @@ Feel free to report any issues you find!
 
 ## Why Rational
 
-**Local models, with thinking modes.** Ollama and LM Studio hand you a model and
-a prompt box. Rational adds **thinking modes**, named _profiles_, you switch in
+**Local models, with thinking profiles.** Ollama and LM Studio hand you a model and
+a prompt box. Rational adds **thinking profiles**, named _profiles_, you switch in
 one click, each a saved preset bundling a model, sampling, a system prompt, and a
 chat workflow.
 
@@ -145,8 +147,8 @@ RatioThink/
 ## Documentation
 
 - [`docs/landing.html`](docs/landing.html) — an animated walkthrough of Rational's
-  thinking modes (profiles, the live Tree of Thought search, and Repeat Boost
-  speculative decoding). Open it in a browser.
+  thinking profiles (the live Tree of Thought search, and Repeat Boost
+  speculative decoding, and more). Open it in a browser.
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — how the app, helper, pie engine, and
   `chat-apc` inferlet fit together (plus an interactive [`architecture.html`](docs/architecture.html)).
 - [`TEST.md`](TEST.md) — test catalog and pre-PR gate: what to run for each change type.
