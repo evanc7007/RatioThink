@@ -13,9 +13,9 @@ classifies, for failures:
   GENERATION LOSS — no node in the tree was correct. The decomposition / step
     generation never produced the right reasoning. A harder, model-side gap.
 
-Plus the sub-diagnostics: branch variation (distinct vs near-dup siblings per
-level), score spread (does value×N discriminate or saturate?), and synthesis
-corruption (selected node correct but synthesized final answer wrong).
+Plus the sub-diagnostics: branch variation (distinct vs near-dup siblings under
+the same parent), score spread (does value×N discriminate or saturate?), and
+synthesis corruption (selected node correct but synthesized final answer wrong).
 
 Run::
 
@@ -42,7 +42,8 @@ def _norm(s: str) -> str:
 
 
 def analyze(path: str) -> None:
-    records = [json.loads(line) for line in open(path) if line.strip()]
+    with open(path) as fh:
+        records = [json.loads(line) for line in fh if line.strip()]
     if not records:
         print("empty dump")
         return
@@ -70,11 +71,15 @@ def analyze(path: str) -> None:
             sc = nd.get("score")
             score_hist[sc if sc is not None else "none"] += 1
 
-        # branch variation: per depth, distinct contents / total siblings
-        by_depth: dict = {}
+        # branch variation: siblings are nodes at the same depth with the same
+        # parent. Grouping by depth alone mixes cousins and can make separate
+        # branches look like duplicate siblings. Older dumps lack parent_id;
+        # they fall back to one depth-level group for backward compatibility.
+        by_sibling_group: dict = {}
         for nd in nodes:
-            by_depth.setdefault(nd.get("depth"), []).append(_norm(nd.get("content") or ""))
-        for sibs in by_depth.values():
+            key = (nd.get("depth"), nd.get("parent_id"))
+            by_sibling_group.setdefault(key, []).append(_norm(nd.get("content") or ""))
+        for sibs in by_sibling_group.values():
             if len(sibs) > 1:
                 dup_ratios.append(len(set(sibs)) / len(sibs))  # 1.0 = all distinct
 

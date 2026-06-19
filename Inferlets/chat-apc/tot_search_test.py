@@ -161,8 +161,6 @@ class BFS(unittest.TestCase):
         # breadth=2 from a wide level-1 (4 children via breadth=4 at L1)? Keep it
         # simple: breadth=2 means each level keeps 2; with depth 3 the frontier
         # never exceeds breadth*breadth before prune. Assert frontier size law.
-        sizes = []
-
         def router(cue, msgs):
             if cue.startswith("rate"):
                 return "SCORE: 5"

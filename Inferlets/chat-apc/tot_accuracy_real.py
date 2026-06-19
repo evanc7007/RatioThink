@@ -320,7 +320,10 @@ async def _run(base: str, count) -> tuple[dict, list[str]]:
             rows.append(row)
             for arm, c in row["cells"].items():
                 if c["n_error"] and c.get("first_error") and "N/A" not in c["first_error"]:
-                    failures.append(f"[{key} {arm}] {c['n_error']} errored: {c['first_error'][:160]}")
+                    failures.append(
+                        f"[{key} {arm}] {c['n_error']} errored: "
+                        f"{c['first_error'][:160]}"
+                    )
     artifact = {
         "model": MODEL,
         "driver": "portable/metal",
@@ -331,7 +334,9 @@ async def _run(base: str, count) -> tuple[dict, list[str]]:
         "decode_settings": {
             "max_tokens": MAX_TOKENS, "max_prompts": MAX_PROMPTS, "breadth_k": TOT_WIDTH,
             "tot_temperature": TOT_TEMPERATURE,
-            "single_temperature": SINGLE_TEMPERATURE if SINGLE_TEMPERATURE is not None else "match-family",
+            "single_temperature": (
+                SINGLE_TEMPERATURE if SINGLE_TEMPERATURE is not None else "match-family"
+            ),
             "code_temperature": CODE_TEMPERATURE, "math_depth": MATH_DEPTH,
             "code_depth": CODE_DEPTH,
         },

@@ -164,20 +164,23 @@ impl ExecStrategy {
     }
 }
 
-/// Task mode (#657 math arm). Gates the accuracy-oriented scoring behaviour
-/// without touching the default conversational path: `chat` (the default) is
-/// EXACTLY the shipped whole-answer + single greedy value-judge + synthesis
-/// path (#523/#555/#649/#661, byte-identical), and `reasoning` opts into the
-/// value×N-median scorer ported from the faithful harness. The mode is an
-/// explicit request field only — never inferred from a grader or family hint —
-/// so a caller that omits it keeps today's behaviour.
+/// Task mode (#657 math arm). Gates the accuracy-oriented scoring and output
+/// contract without touching the default conversational path: `chat` (the
+/// default) is EXACTLY the shipped whole-answer generation + single greedy
+/// value-judge + final synthesis path (#523/#555/#649/#661, byte-identical).
+/// `reasoning` opts into partial-step generation, value×N-median scoring,
+/// final numeric-token majority over leaf answers (score/order only break ties),
+/// and returns the selected leaf verbatim with no final synthesis. The mode is
+/// an explicit request field only — never inferred from a grader or family hint
+/// — so a caller that omits it keeps today's behaviour.
 #[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum TotTask {
-    /// Conversational ToT — unchanged shipped behaviour.
+    /// Conversational ToT — unchanged whole-answer/value-judge/synthesis path.
     #[default]
     Chat,
-    /// Reasoning/math ToT — value×N-median scoring (Yao §4.1).
+    /// Reasoning/math ToT — partial steps, value×N scoring, numeric-majority
+    /// leaf selection, and selected-leaf verbatim output (no synthesis).
     Reasoning,
 }
 
@@ -217,7 +220,9 @@ pub struct TotInput {
     /// to the production [`ExecStrategy`]. Does not change the returned tree.
     pub exec: Option<ExecStrategy>,
     /// Task mode (#657). Defaults to [`TotTask::Chat`] = the shipped
-    /// conversational path; `reasoning` opts into value×N-median scoring.
+    /// conversational whole-answer/value-judge/synthesis path. `reasoning`
+    /// switches to partial-step generation, value×N scoring, numeric-majority
+    /// leaf selection, and selected-leaf verbatim output with no synthesis.
     pub task: Option<TotTask>,
 }
 

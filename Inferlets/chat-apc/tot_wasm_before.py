@@ -47,13 +47,23 @@ WIDTH = int(os.environ.get("TOT_WIDTH", "4"))          # breadth + beam_width (k
 MATH_DEPTH = int(os.environ.get("MATH_DEPTH", "2"))
 CODE_DEPTH = int(os.environ.get("CODE_DEPTH", "2"))
 MAX_TOKENS_PER_NODE = int(os.environ.get("MAX_TOKENS", "512"))
-# gsm8k = the decisive math row; one code row (humaneval, matching the matrix's
-# strongest faithful ToT lift) makes the LLM-judge-vs-execute gap concrete.
-DATASETS = os.environ.get("DATASETS", "gsm8k,humaneval").split(",")
 # Task mode sent to the shipped inferlet. "chat" (default) = the honest BEFORE
-# (whole-answer + single greedy judge); "reasoning" = the #657 math arm
-# (value×N-median + partial-step decomposition) — the AFTER re-measure.
+# (whole-answer + single greedy judge + synthesis); "reasoning" = the #657
+# math arm (partial-step generation + value×N scoring + numeric-majority leaf
+# selection, returned verbatim without final synthesis).
 TASK = os.environ.get("TASK", "chat")
+
+
+def _default_datasets(task: str) -> list[str]:
+    if task == "reasoning":
+        return ["gsm8k"]
+    # gsm8k = the decisive math row; one code row (humaneval, matching the
+    # matrix's strongest faithful ToT lift) makes the LLM-judge-vs-execute gap
+    # concrete for the shipped chat/value-judge path.
+    return ["gsm8k", "humaneval"]
+
+
+DATASETS = os.environ.get("DATASETS", ",".join(_default_datasets(TASK))).split(",")
 OUT = os.environ.get("WASM_BEFORE_OUT", "tot_wasm_before.json")
 # Tree-dump mode (#657 mechanism analysis): when set, every prompt's FULL tree
 # (each node's id/depth/score/status/content + selected + synthesized answer) is
@@ -117,8 +127,9 @@ async def _tot_once(http_c: httpx.AsyncClient, base_url: str, prompt: str,
             if e.get("event") != "node_complete":
                 continue
             nd = e.get("node") or {}
-            nodes.append({k: nd.get(k) for k in
-                          ("id", "depth", "branch_index", "score", "status", "content")})
+            nodes.append({k: nd.get(k) for k in (
+                "id", "parent_id", "depth", "branch_index", "score", "status", "content"
+            )})
         diag["nodes"] = nodes
         diag["final_answer"] = term.get("final_answer") or ""
     return term.get("final_answer") or "", diag
@@ -132,7 +143,7 @@ async def _run_dataset(http_c, base_url, key, grader):
     print(f"[wasm-before] dataset={key!r} family={family} grader={grader!r} "
           f"shipped-wasm ToT breadth={WIDTH} depth={depth} beam={WIDTH} "
           f"measuring {len(records)}/{total}", flush=True)
-    correct = graded = errored = 0
+    correct = graded = ungradable = errored = measured = 0
     first_error = None
     loop = asyncio.get_event_loop()
     for i, rec in enumerate(records, 1):
@@ -140,6 +151,7 @@ async def _run_dataset(http_c, base_url, key, grader):
             continue  # mechanism dump: only the requested (e.g. divergent) prompts
         t0 = loop.time()
         ans, diag = await _tot_once(http_c, base_url, rec["prompt"], depth)
+        measured += 1
         dt = loop.time() - t0
         if diag.get("error"):
             errored += 1
@@ -148,6 +160,7 @@ async def _run_dataset(http_c, base_url, key, grader):
         else:
             res = g.grade(grader, ans, rec["reference"])
             if res.passed is None:
+                ungradable += 1
                 verdict = "ungradable"
             else:
                 graded += 1
@@ -165,7 +178,9 @@ async def _run_dataset(http_c, base_url, key, grader):
                 fh.write(json.dumps(rec_out) + "\n")
     acc = (correct / graded) if graded else None
     return {"dataset": key, "family": family, "grader": grader, "depth": depth,
-            "graded": graded, "correct": correct, "errored": errored,
+            "measured": measured, "graded": graded, "correct": correct,
+            "n_ungradable": ungradable, "errored": errored,
+            "coverage": {"measured": measured, "total": total},
             "accuracy": acc, "first_error": first_error}
 
 
@@ -177,6 +192,17 @@ async def _run(base_url: str) -> dict:
             grader = lock["datasets"][key]["grader"]
             rows.append(await _run_dataset(http_c, base_url, key, grader))
     return {"model": base.MODEL, "width": WIDTH, "task": TASK, "rows": rows}
+
+
+def _legend(task: str) -> str:
+    if task == "reasoning":
+        return ("wasm-ToT = SHIPPED inferlet reasoning/math path "
+                "(partial-step generation, value×N scoring, numeric-majority leaf "
+                "selection, no final synthesis; selected leaf returned verbatim). "
+                "faithful = Python harness ToT (execute-rank code where applicable). "
+                "gap = wasm - faithful.")
+    return ("wasm-ToT = SHIPPED inferlet (LLM value-judge select, code NOT executed). "
+            "faithful = Python harness ToT (execute-rank code). gap = wasm - faithful.")
 
 
 def _print(artifact: dict) -> None:
@@ -191,7 +217,8 @@ def _print(artifact: dict) -> None:
         w = r["accuracy"]
         f = _FAITHFUL.get(r["dataset"])
         gap = (w - f) if (w is not None and f is not None) else None
-        cover = f"{r['graded']}/{r['graded'] + r['errored']}"
+        measured = r.get("measured", r["graded"] + r.get("n_ungradable", 0) + r["errored"])
+        cover = f"{measured}/{r.get('coverage', {}).get('total', measured)}"
         print(f"{r['dataset']:11} {cover:>8} "
               f"{('--' if w is None else f'{w:.3f}'):>9} "
               f"{('--' if f is None else f'{f:.3f}'):>9} "
@@ -199,8 +226,7 @@ def _print(artifact: dict) -> None:
         if r["first_error"]:
             print(f"            first_error: {r['first_error']}")
     print("-" * 78)
-    print("wasm-ToT = SHIPPED inferlet (LLM value-judge select, code NOT executed). "
-          "faithful = Python harness ToT (execute-rank code). gap = wasm - faithful.")
+    print(_legend(TASK))
 
 
 async def main() -> int:
