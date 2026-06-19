@@ -78,6 +78,43 @@ pub struct BestOfNParams {
 
 /// Apply defaults + bounds. `Err((field, message))` is an OpenAI-shape 400.
 pub fn resolve(input: &BestOfNInput) -> Result<BestOfNParams, (&'static str, String)> {
+    let resume_from = input
+        .resume_from
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let selected_comment = input
+        .selected_comment
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let picked_text = input
+        .picked_text
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    if input.resume_from.is_some() && resume_from.is_none() {
+        return Err((
+            "resume_from",
+            "resume_from must be a non-empty snapshot name when provided".to_string(),
+        ));
+    }
+    if selected_comment.is_some() && resume_from.is_none() {
+        return Err((
+            "resume_from",
+            "selected_comment requires resume_from so guidance is applied to a picked branch"
+                .to_string(),
+        ));
+    }
+    if selected_comment.is_some() && picked_text.is_none() {
+        return Err((
+            "picked_text",
+            "selected_comment requires picked_text so guidance can recover on snapshot miss"
+                .to_string(),
+        ));
+    }
+
     let n = match input.n {
         None => DEFAULT_N,
         Some(0) => return Err(("n", "n must be >= 1".to_string())),
@@ -246,6 +283,56 @@ mod tests {
             .top_p,
             1.0
         );
+    }
+
+    #[test]
+    fn selected_comment_requires_non_empty_resume_from() {
+        assert_eq!(
+            resolve(&BestOfNInput {
+                selected_comment: Some("Make it more concrete".to_string()),
+                picked_text: Some("Chosen answer".to_string()),
+                ..Default::default()
+            })
+            .unwrap_err()
+            .0,
+            "resume_from"
+        );
+        assert_eq!(
+            resolve(&BestOfNInput {
+                resume_from: Some("   ".to_string()),
+                selected_comment: Some("Make it more concrete".to_string()),
+                picked_text: Some("Chosen answer".to_string()),
+                ..Default::default()
+            })
+            .unwrap_err()
+            .0,
+            "resume_from"
+        );
+    }
+
+    #[test]
+    fn selected_comment_requires_picked_text_on_resume() {
+        assert_eq!(
+            resolve(&BestOfNInput {
+                resume_from: Some("bon/r0/1/1".to_string()),
+                selected_comment: Some("Make it more concrete".to_string()),
+                picked_text: Some("  ".to_string()),
+                ..Default::default()
+            })
+            .unwrap_err()
+            .0,
+            "picked_text"
+        );
+    }
+
+    #[test]
+    fn whitespace_selected_comment_preserves_fresh_round() {
+        let p = resolve(&BestOfNInput {
+            selected_comment: Some("  \n\t ".to_string()),
+            ..Default::default()
+        })
+        .expect("whitespace-only guidance is absent");
+        assert_eq!(p.level, 1);
     }
 
     #[test]

@@ -156,7 +156,10 @@ pub async fn dispatch(
         return release::dispatch_release(&model, &names, res).await;
     }
 
-    let is_resume = input.resume_from.is_some();
+    let is_resume = input
+        .resume_from
+        .as_deref()
+        .is_some_and(|name| !name.trim().is_empty());
 
     let mut messages = match (input.messages.clone(), messages) {
         (Some(m), _) => m,
