@@ -28,7 +28,7 @@ pub(crate) use super::search::{generate_branch, Demux, DemuxKind};
 pub(crate) use super::stream::{emit_level, emit_tree_start, BranchSink};
 pub(crate) use super::tree::{Node, NodeStatus};
 
-use super::schema::{ExecStrategy, TotParams};
+use super::schema::{ExecStrategy, TotParams, TotTask};
 
 /// Build the generation params that drive [`generate_branch`] for one
 /// Best-of-N round (#690). N sibling candidates at a single level
@@ -58,6 +58,8 @@ pub(crate) fn round_params(
         top_p,
         thinking,
         exec: ExecStrategy::default(),
+        // Best-of-N rounds are a conversational path — keep the shipped scorer.
+        task: TotTask::Chat,
         // Best-of-N's divergence is the per-candidate directive pair; it does
         // not use the ToT cross-sibling token penalty (#693c).
         sibling_penalty: 0.0,

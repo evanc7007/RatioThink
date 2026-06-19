@@ -73,6 +73,7 @@ endef
         test-ci-v2-static-gate test-lint-gui-only-testing test-assert-gui-tests-executed test-lint-e2e-gui-gating test-xcode-chat-scaffold test-app-unit test-xcode-helper \
         test-unit test-scenario test-smoke test-tot-real-smoke-unit test-tot-real-smoke test-curated-hf test-install-guards test-sandbox-diagnostics test-readme-harness test-e2e-http \
         test-spec-smoke test-spec-bench test-spec-matrix-selftest bench-spec-matrix bench-datasets-prep bench-datasets-verify \
+        test-tot-accuracy-selftest bench-tot-accuracy \
         test-gui-script test-gui-history test-gui-first-launch-package test-gui-stream-cancel test-gui-chat-retry test-gui-load-default test-gui test-ssh test-all \
         test-gui-shell test-gui-first-launch test-gui-helper test-gui-chat test-gui-chat-lifecycle test-gui-chat-switch test-gui-bestofn test-gui-menu test-gui-engine-status test-gui-model-download test-menubar-icon-template \
         test-e2e-engine test-e2e-large-model test-e2e-models test-e2e-chat test-e2e-tot test-e2e-tot-batched test-e2e-budget-sweep bench-tot test-e2e-full test-e2e-package test-tot-leak test-helper-respawn test-helper-recovery test-quit-structured \
@@ -507,6 +508,21 @@ bench-spec-matrix: $(LOGDIR) ## Spec-decode benefit MATRIX: method × workload o
 	@set +e +o pipefail; \
 	  LOG=$(LOGDIR)/test-$$(date +%Y%m%d-%H%M%S)-spec-matrix.log; \
 	  Scripts/run-spec-matrix.sh 2>&1 | tee $$LOG | tail -80; \
+	  status=$${PIPESTATUS[0]}; \
+	  echo "log: $$LOG"; \
+	  exit $$status
+
+test-tot-accuracy-selftest: ## Engine-free unit guards for the faithful ToT harness (#657): graders, BFS controller (tot_search), baselines (B0/B1/B2), arm orchestration (B0/B1/B2/ToT + ToT-minus-B2). Deterministic, CI-safe.
+	@set -e; for t in tot_search_test baselines_test tot_arms_test tot_accuracy_real_test; do \
+	  echo "== $$t =="; \
+	  uv run --project Vendor/pie/client/python --with httpx --with jsonschema \
+	    python Inferlets/chat-apc/$$t.py; \
+	done
+
+bench-tot-accuracy: $(LOGDIR) ## ToT task-ACCURACY matrix: single-chain CoT vs ToT(width=k, depth=1) on PUBLIC graded datasets (#657, extends #652). Opt-in, portable Metal, needs uv + real 7-14B weights. Knobs: MODEL, MAX_TOKENS, MAX_PROMPTS, TOT_WIDTH, DATASETS, ACCURACY_OUT.
+	@set +e +o pipefail; \
+	  LOG=$(LOGDIR)/test-$$(date +%Y%m%d-%H%M%S)-tot-accuracy.log; \
+	  Scripts/run-tot-accuracy.sh 2>&1 | tee $$LOG | tail -80; \
 	  status=$${PIPESTATUS[0]}; \
 	  echo "log: $$LOG"; \
 	  exit $$status

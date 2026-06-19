@@ -174,6 +174,42 @@ impl ExecStrategy {
     }
 }
 
+/// Task mode (#657 math arm). Gates the accuracy-oriented scoring and output
+/// contract without touching the default conversational path: `chat` (the
+/// default) is EXACTLY the shipped whole-answer generation + single greedy
+/// value-judge + final synthesis path (#523/#555/#649/#661, byte-identical).
+/// `reasoning` opts into partial-step generation, value×N-median scoring,
+/// final numeric-token majority over leaf answers (score/order only break ties),
+/// and returns the selected leaf verbatim with no final synthesis. The mode is
+/// an explicit request field only — never inferred from a grader or family hint
+/// — so a caller that omits it keeps today's behaviour.
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TotTask {
+    /// Conversational ToT — unchanged whole-answer/value-judge/synthesis path.
+    #[default]
+    Chat,
+    /// Reasoning/math ToT — partial steps, value×N scoring, numeric-majority
+    /// leaf selection, and selected-leaf verbatim output (no synthesis).
+    Reasoning,
+}
+
+impl TotTask {
+    /// Number of independent value-evaluator samples per node. `chat` keeps the
+    /// single deterministic greedy judge; `reasoning` runs N sampled judges and
+    /// medians them so one noisy verdict cannot mis-prune the beam.
+    pub fn score_samples(self) -> usize {
+        match self {
+            Self::Chat => 1,
+            Self::Reasoning => REASONING_SCORE_SAMPLES,
+        }
+    }
+}
+
+/// `reasoning`-mode value×N width (Yao §4.1 used ×3). One home so the e2e and
+/// the search agree.
+pub const REASONING_SCORE_SAMPLES: usize = 3;
+
 /// Raw `input` payload for `inferlet:"tree-of-thought"`. Every field is
 /// optional; missing fields take the defaults above. `messages` may also
 /// be supplied at the top level of the dispatch envelope (handled by the
@@ -193,6 +229,11 @@ pub struct TotInput {
     /// Sibling execution strategy (#458). Optional execution hint; defaults
     /// to the production [`ExecStrategy`]. Does not change the returned tree.
     pub exec: Option<ExecStrategy>,
+    /// Task mode (#657). Defaults to [`TotTask::Chat`] = the shipped
+    /// conversational whole-answer/value-judge/synthesis path. `reasoning`
+    /// switches to partial-step generation, value×N scoring, numeric-majority
+    /// leaf selection, and selected-leaf verbatim output with no synthesis.
+    pub task: Option<TotTask>,
     /// Cross-sibling logit penalty (#693c). `0.0` (default) disables it.
     pub sibling_penalty: Option<f32>,
 }
@@ -221,6 +262,9 @@ pub struct TotParams {
     /// Sibling execution strategy (#458) — how branches are generated/scored.
     /// Production default; never changes the returned tree.
     pub exec: ExecStrategy,
+    /// Task mode (#657). `Chat` (default) preserves the shipped scorer exactly;
+    /// `Reasoning` selects value×N-median scoring.
+    pub task: TotTask,
     /// Cross-sibling logit penalty magnitude (#693c). `0.0` disables it (the
     /// default, preserving sibling co-batching); a positive value forces
     /// sequential within-group generation so each explorer down-biases the
@@ -253,6 +297,7 @@ pub fn resolve(input: &TotInput) -> Result<TotParams, (&'static str, String)> {
     let top_p = input.top_p.unwrap_or(DEFAULT_TOP_P);
     let thinking = input.thinking.unwrap_or(DEFAULT_THINKING);
     let exec = input.exec.unwrap_or_default();
+    let task = input.task.unwrap_or_default();
     let sibling_penalty = input.sibling_penalty.unwrap_or(DEFAULT_SIBLING_PENALTY);
     // #465 gate: production builds (feature off) support the two *coupled*
     // strategies — `coupled_concurrent` (the re-measured default) and
@@ -334,6 +379,7 @@ pub fn resolve(input: &TotInput) -> Result<TotParams, (&'static str, String)> {
         top_p,
         thinking,
         exec,
+        task,
         sibling_penalty,
     })
 }
@@ -468,6 +514,29 @@ mod tests {
     fn exec_deserializes_snake_case() {
         let i: TotInput = serde_json::from_str(r#"{"exec":"coupled_concurrent"}"#).unwrap();
         assert_eq!(resolve(&i).unwrap().exec, ExecStrategy::CoupledConcurrent);
+    }
+
+    #[test]
+    fn task_defaults_to_chat_single_judge() {
+        // Omitted task → Chat → the shipped single greedy judge (samples == 1).
+        let p = resolve(&input()).unwrap();
+        assert_eq!(p.task, TotTask::Chat);
+        assert_eq!(p.task.score_samples(), 1);
+    }
+
+    #[test]
+    fn task_reasoning_selects_value_n_median() {
+        let i: TotInput = serde_json::from_str(r#"{"task":"reasoning"}"#).unwrap();
+        let p = resolve(&i).unwrap();
+        assert_eq!(p.task, TotTask::Reasoning);
+        assert_eq!(p.task.score_samples(), REASONING_SCORE_SAMPLES);
+        assert_eq!(REASONING_SCORE_SAMPLES, 3);
+    }
+
+    #[test]
+    fn task_chat_deserializes_explicitly() {
+        let i: TotInput = serde_json::from_str(r#"{"task":"chat"}"#).unwrap();
+        assert_eq!(resolve(&i).unwrap().task, TotTask::Chat);
     }
 
     #[test]
