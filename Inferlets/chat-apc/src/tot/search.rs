@@ -502,7 +502,13 @@ fn extract_last_money_amount(text: &str) -> Option<String> {
 fn money_amounts(text: &str) -> impl Iterator<Item = String> + '_ {
     text.split_whitespace().filter_map(|word| {
         let cleaned = word.trim_matches(|c: char| {
-            c == '.' || c == ',' || c == ';' || c == ':' || c == ')' || c == '(' || c == '"'
+            c == '.'
+                || c == ','
+                || c == ';'
+                || c == ':'
+                || c == ')'
+                || c == '('
+                || c == '"'
                 || c == '\''
         });
         if cleaned.starts_with('$') && cleaned.chars().skip(1).any(|c| c.is_ascii_digit()) {
@@ -1280,19 +1286,27 @@ pub async fn run(
     // `final_answer` stays null). Synthesis streams as `final_delta`; on any
     // failure it returns `None` and the raw final-depth best-leaf content
     // stands when eligible.
-    let selected_id = best_leaf(&last_level);
-    // Synthesis is grounded on the original conversation fork. Branch
-    // contexts contain ToT control turns (option labels/directives/candidate
-    // assistant text) that must never be part of the final-answer context;
-    // selected-path material is passed only through the sanitized directive.
+    let selected_id = select_leaf_for_task(&last_level, params.task);
+    let best = if params.task == TotTask::Chat {
+        // Synthesis is grounded on the original conversation fork. Branch
+        // contexts contain ToT control turns (option labels/directives/candidate
+        // assistant text) that must never be part of the final-answer context;
+        // selected-path material is passed only through the sanitized directive.
+        selected_id.as_ref().and_then(|id| {
+            let node = flat.iter().find(|n| &n.id == id)?;
+            let content =
+                selected_synthesis_content(&flat, id).unwrap_or_else(|| node.content.clone());
+            Some((content, node.reasoning.clone()))
+        })
+    } else {
+        None
+    };
     let synth_ctx = choose_synthesis_context(synth_base, None::<Context>);
-    let best = selected_id.and_then(|id| {
-        let node = flat.iter().find(|n| n.id == id)?;
-        let content =
-            selected_synthesis_content(&flat, &id).unwrap_or_else(|| node.content.clone());
-        Some((content, node.reasoning.clone()))
-    });
-    let mut outcome = finalize(flat, &last_level, params.depth);
+    let mut outcome = finalize_for_task(flat, &last_level, params.depth, params.task);
+    if params.task == TotTask::Reasoning {
+        outcome.total_generated_tokens = total_generated_tokens;
+        return outcome;
+    }
     // Attempt synthesis only when an ok leaf exists AND its grounding fork
     // survived; on any skip/failure emit a one-shot host diagnostic with the
     // reason so a dead synthesizer is visible in production (#523 Part A F1),
@@ -1328,7 +1342,7 @@ pub async fn run(
         // failure is already surfaced by the `error` terminal).
         (None, _) => None,
     };
-    reconcile_synthesis(&mut outcome, synth);
+    reconcile_synthesis_for_task(&mut outcome, synth, params.task);
     outcome.total_generated_tokens = total_generated_tokens;
     outcome
 }
@@ -1343,6 +1357,15 @@ fn reconcile_synthesis(outcome: &mut SearchOutcome, synth: Option<String>) {
     if let Some(answer) = synth {
         outcome.final_answer = Some(answer);
         outcome.synthesized = true;
+    }
+}
+
+/// Task-gated synthesis fold. `chat` keeps the shipped post-search synthesis
+/// path; `reasoning` deliberately ignores synthesis so the selected leaf is
+/// what reaches the math grader verbatim (#657 parity fix).
+fn reconcile_synthesis_for_task(outcome: &mut SearchOutcome, synth: Option<String>, task: TotTask) {
+    if task == TotTask::Chat {
+        reconcile_synthesis(outcome, synth);
     }
 }
 
@@ -1524,8 +1547,18 @@ fn selected_synthesis_content(flat: &[Node], selected_id: &str) -> Option<String
 /// full failure, synthesis may still replace it later; without synthesis the
 /// terminal `final_answer` stays null rather than presenting an intermediate
 /// step as a direct answer. Pure → unit-tested.
+#[cfg(test)]
 fn finalize(flat: Vec<Node>, last_level: &[Candidate], final_answer_depth: usize) -> SearchOutcome {
-    let best = best_leaf(last_level);
+    finalize_for_task(flat, last_level, final_answer_depth, TotTask::Chat)
+}
+
+fn finalize_for_task(
+    flat: Vec<Node>,
+    last_level: &[Candidate],
+    final_answer_depth: usize,
+    task: TotTask,
+) -> SearchOutcome {
+    let best = select_leaf_for_task(last_level, task);
     let final_answer = best.as_ref().and_then(|id| {
         let candidate = last_level.iter().find(|c| &c.id == id)?;
         if candidate.depth < final_answer_depth {
@@ -1545,6 +1578,122 @@ fn finalize(flat: Vec<Node>, last_level: &[Candidate], final_answer_depth: usize
         // Filled by `run`, which owns the engine-bound token accounting.
         total_generated_tokens: 0,
     }
+}
+
+fn select_leaf_for_task(candidates: &[Candidate], task: TotTask) -> Option<String> {
+    match task {
+        TotTask::Chat => best_leaf(candidates),
+        TotTask::Reasoning => numeric_majority_leaf(candidates).or_else(|| best_leaf(candidates)),
+    }
+}
+
+/// Math self-consistency leaf selection (#657): bucket ok candidates by their
+/// final numeric answer token (commas stripped) and choose the largest bucket.
+/// Existing score/order ranking is used only as a deterministic tie-breaker:
+/// first between equal-sized buckets (the bucket whose best member would win
+/// the old scorer path wins), then within the winning bucket.
+fn numeric_majority_leaf(candidates: &[Candidate]) -> Option<String> {
+    struct Bucket<'a> {
+        answer: String,
+        members: Vec<(usize, &'a Candidate)>,
+    }
+
+    let mut buckets: Vec<Bucket<'_>> = Vec::new();
+    for (order, candidate) in candidates.iter().enumerate() {
+        if !candidate.ok {
+            continue;
+        }
+        let Some(answer) = final_numeric_token(&candidate.content) else {
+            continue;
+        };
+        match buckets.iter_mut().find(|b| b.answer == answer) {
+            Some(bucket) => bucket.members.push((order, candidate)),
+            None => buckets.push(Bucket {
+                answer,
+                members: vec![(order, candidate)],
+            }),
+        }
+    }
+    if buckets.is_empty() {
+        return None;
+    }
+
+    fn better_member(a: (usize, &Candidate), b: (usize, &Candidate)) -> bool {
+        a.1.score > b.1.score || (a.1.score == b.1.score && a.0 < b.0)
+    }
+
+    fn best_member<'a>(members: &[(usize, &'a Candidate)]) -> (usize, &'a Candidate) {
+        let mut best = members[0];
+        for &member in &members[1..] {
+            if better_member(member, best) {
+                best = member;
+            }
+        }
+        best
+    }
+
+    let mut best_bucket = 0usize;
+    for i in 1..buckets.len() {
+        let count = buckets[i].members.len();
+        let best_count = buckets[best_bucket].members.len();
+        if count > best_count
+            || (count == best_count
+                && better_member(
+                    best_member(&buckets[i].members),
+                    best_member(&buckets[best_bucket].members),
+                ))
+        {
+            best_bucket = i;
+        }
+    }
+
+    Some(best_member(&buckets[best_bucket].members).1.id.clone())
+}
+
+/// Final numeric token in `text`, with comma separators stripped. Mirrors the
+/// harness `grade.last_number` convention (`-?\d[\d,]*(?:\.\d+)?`) without a
+/// regex dependency in the wasm crate.
+fn final_numeric_token(text: &str) -> Option<String> {
+    let mut last = None;
+    let mut iter = text.char_indices().peekable();
+    while let Some((start, ch)) = iter.next() {
+        let starts_number = ch.is_ascii_digit()
+            || (ch == '-' && iter.peek().is_some_and(|(_, next)| next.is_ascii_digit()));
+        if !starts_number {
+            continue;
+        }
+
+        let mut end = start + ch.len_utf8();
+        while let Some(&(idx, next)) = iter.peek() {
+            if next.is_ascii_digit() || next == ',' {
+                end = idx + next.len_utf8();
+                iter.next();
+            } else {
+                break;
+            }
+        }
+        if let Some(&(dot_idx, '.')) = iter.peek() {
+            let mut clone = iter.clone();
+            clone.next();
+            if clone
+                .peek()
+                .is_some_and(|(_, after_dot)| after_dot.is_ascii_digit())
+            {
+                end = dot_idx + 1;
+                iter.next();
+                while let Some(&(idx, next)) = iter.peek() {
+                    if next.is_ascii_digit() {
+                        end = idx + next.len_utf8();
+                        iter.next();
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+        last = Some(text[start..end].replace(',', ""));
+    }
+    last
 }
 
 /// Generate + score one level's branches per the [`ExecStrategy`](super::schema::ExecStrategy),
@@ -1589,9 +1738,9 @@ async fn resolve_level(
             // All siblings decode in flight at once, so the scheduler batches
             // their forward passes; `sink` (Copy) interleaves their deltas.
             join_all(
-                ctxs.into_iter()
-                    .zip(metas.iter())
-                    .map(|(c, m)| generate_tot_branch(c, model, params, sink, &m.0, &m.1, level, m.2)),
+                ctxs.into_iter().zip(metas.iter()).map(|(c, m)| {
+                    generate_tot_branch(c, model, params, sink, &m.0, &m.1, level, m.2)
+                }),
             )
             .await
         } else {
@@ -1606,29 +1755,27 @@ async fn resolve_level(
         // (#458): the short greedy scoring generations decode in flight at
         // once so the engine coalesces them, instead of one score forward
         // pass at a time. `Incomplete`/`Error` nodes have no answer to rate.
-        let scores: Vec<Option<ScoreResult>> = join_all(
-            gens.iter()
-                .zip(child_paths.iter())
-                .map(|((ctx, demux), path)| async move {
-                    if matches!(demux.kind, DemuxKind::Answered) {
-                        Some(
-                            score_answered_n(
-                                params.task.score_samples(),
-                                score_temperature(params.task),
-                                score_base,
-                                ctx,
-                                path,
-                                &demux.answer,
-                                model,
-                                level == params.depth,
-                            )
-                            .await,
+        let scores: Vec<Option<ScoreResult>> = join_all(gens.iter().zip(child_paths.iter()).map(
+            |((ctx, demux), path)| async move {
+                if matches!(demux.kind, DemuxKind::Answered) {
+                    Some(
+                        score_answered_n(
+                            params.task.score_samples(),
+                            score_temperature(params.task),
+                            score_base,
+                            ctx,
+                            path,
+                            &demux.answer,
+                            model,
+                            level == params.depth,
                         )
-                    } else {
-                        None
-                    }
-                }),
-        )
+                        .await,
+                    )
+                } else {
+                    None
+                }
+            },
+        ))
         .await;
 
         gens.into_iter()
@@ -1646,7 +1793,9 @@ async fn resolve_level(
                     .zip(metas.iter())
                     .zip(child_paths.iter())
                     .map(|((c, m), path)| {
-                        expand(c, model, params, sink, score_base, path, &m.0, &m.1, level, m.2)
+                        expand(
+                            c, model, params, sink, score_base, path, &m.0, &m.1, level, m.2,
+                        )
                     }),
             )
             .await
@@ -1654,7 +1803,10 @@ async fn resolve_level(
             let mut out = Vec::with_capacity(ctxs.len());
             for ((c, m), path) in ctxs.into_iter().zip(metas.iter()).zip(child_paths.iter()) {
                 out.push(
-                    expand(c, model, params, sink, score_base, path, &m.0, &m.1, level, m.2).await,
+                    expand(
+                        c, model, params, sink, score_base, path, &m.0, &m.1, level, m.2,
+                    )
+                    .await,
                 );
             }
             out
@@ -1898,7 +2050,13 @@ async fn generate_tot_branch(
             reasoning_retry_branch_directive(level, params.depth, branch_index, params.breadth),
         ),
         TotTask::Chat => (
-            branch_directive(level, params.depth, branch_index, params.breadth, params.thinking),
+            branch_directive(
+                level,
+                params.depth,
+                branch_index,
+                params.breadth,
+                params.thinking,
+            ),
             retry_branch_directive(level, params.depth, branch_index, params.breadth),
         ),
     };
@@ -1998,9 +2156,17 @@ async fn expand(
     level: usize,
     branch_index: usize,
 ) -> (Context, NodeOutcome) {
-    let (ctx, demux) =
-        generate_tot_branch(ctx, model, params, sink, node_id, parent_id, level, branch_index)
-            .await;
+    let (ctx, demux) = generate_tot_branch(
+        ctx,
+        model,
+        params,
+        sink,
+        node_id,
+        parent_id,
+        level,
+        branch_index,
+    )
+    .await;
     let score = if matches!(demux.kind, DemuxKind::Answered) {
         Some(
             score_answered_n(
@@ -2110,8 +2276,16 @@ async fn score_answered_n(
 ) -> ScoreResult {
     if samples <= 1 {
         // chat: greedy single judge, identical to the shipped path.
-        return score_answered(score_base, branch_ctx, path, answer, model, is_final_level, 0.0)
-            .await;
+        return score_answered(
+            score_base,
+            branch_ctx,
+            path,
+            answer,
+            model,
+            is_final_level,
+            0.0,
+        )
+        .await;
     }
     let results = join_all((0..samples).map(|_| {
         score_answered(
@@ -2473,6 +2647,16 @@ mod tests {
         }
     }
 
+    fn cand_text(id: &str, score: Option<u8>, content: &str) -> Candidate {
+        Candidate {
+            id: id.to_string(),
+            score,
+            ok: true,
+            depth: 1,
+            content: content.to_string(),
+        }
+    }
+
     #[test]
     fn no_think_reasoning_salvage_accepts_concise_answer_text() {
         assert_eq!(
@@ -2542,7 +2726,10 @@ mod tests {
             "Tom bought 18 new stickers, so he has 27."
         );
         assert_eq!(strip_think_delimiters("</think>"), "");
-        assert_eq!(strip_think_delimiters("Cara is shortest.</thinks>"), "Cara is shortest.");
+        assert_eq!(
+            strip_think_delimiters("Cara is shortest.</thinks>"),
+            "Cara is shortest."
+        );
         assert_eq!(
             strip_think_delimiters("The ball costs $0.05.</think>"),
             "The ball costs $0.05."
@@ -2551,7 +2738,10 @@ mod tests {
 
     #[test]
     fn strip_think_delimiters_is_inert_on_clean_text_and_unicode() {
-        assert_eq!(strip_think_delimiters("They weigh the same."), "They weigh the same.");
+        assert_eq!(
+            strip_think_delimiters("They weigh the same."),
+            "They weigh the same."
+        );
         // A real `<` that is not a think delimiter survives.
         assert_eq!(strip_think_delimiters("3 < 5 is true"), "3 < 5 is true");
         // Non-ASCII content is preserved byte-correctly.
@@ -2829,7 +3019,10 @@ mod tests {
     fn reasoning_final_cues_the_answer_grounded_on_steps() {
         let d = reasoning_branch_directive(3, 3, 1, 3, true);
         assert!(d.contains("FINAL answer"), "{d}");
-        assert!(d.contains("reasoning steps already in this conversation"), "{d}");
+        assert!(
+            d.contains("reasoning steps already in this conversation"),
+            "{d}"
+        );
         assert!(d.contains("$18 instead of 18"), "{d}");
         assert!(!d.contains("Do NOT state the final answer yet"), "{d}");
     }
@@ -2861,7 +3054,10 @@ mod tests {
     fn reasoning_retry_leads_with_step_or_answer_by_level() {
         let inter = reasoning_retry_branch_directive(1, 3, 0, 3);
         assert!(inter.starts_with("Give the next step now"), "{inter}");
-        assert!(inter.contains("/no_think"), "retry suppresses thinking: {inter}");
+        assert!(
+            inter.contains("/no_think"),
+            "retry suppresses thinking: {inter}"
+        );
         let final_ = reasoning_retry_branch_directive(3, 3, 0, 3);
         assert!(final_.starts_with("Give the final answer now"), "{final_}");
     }
@@ -4139,6 +4335,146 @@ mod tests {
         assert_eq!(out.final_answer.as_deref(), Some("L1-best"));
     }
 
+    #[test]
+    fn reasoning_final_selection_uses_numeric_majority_idx5_modal_20_beats_lone_60() {
+        let flat = vec![
+            Node::root(),
+            ok_leaf("wrong", "The answer is 60.", Some(10)),
+            ok_leaf("right_a", "So the answer is 20.", Some(4)),
+            ok_leaf("right_b", "Final answer: 20", Some(3)),
+        ];
+        let last = vec![
+            cand_text("wrong", Some(10), "The answer is 60."),
+            cand_text("right_a", Some(4), "So the answer is 20."),
+            cand_text("right_b", Some(3), "Final answer: 20"),
+        ];
+
+        let out = finalize_for_task(flat, &last, 1, TotTask::Reasoning);
+
+        assert_eq!(out.selected_node_id.as_deref(), Some("right_a"));
+        assert_eq!(out.final_answer.as_deref(), Some("So the answer is 20."));
+    }
+
+    #[test]
+    fn reasoning_final_selection_uses_numeric_majority_idx26_modal_2_beats_lone_33() {
+        let flat = vec![
+            Node::root(),
+            ok_leaf("wrong", "The result is 33.", Some(10)),
+            ok_leaf("right_a", "The answer is 2.", Some(5)),
+            ok_leaf("right_b", "Final: 2", Some(4)),
+        ];
+        let last = vec![
+            cand_text("wrong", Some(10), "The result is 33."),
+            cand_text("right_a", Some(5), "The answer is 2."),
+            cand_text("right_b", Some(4), "Final: 2"),
+        ];
+
+        let out = finalize_for_task(flat, &last, 1, TotTask::Reasoning);
+
+        assert_eq!(out.selected_node_id.as_deref(), Some("right_a"));
+        assert_eq!(out.final_answer.as_deref(), Some("The answer is 2."));
+    }
+
+    #[test]
+    fn reasoning_final_selection_ignores_prose_distractor_and_picks_modal_64() {
+        let flat = vec![
+            Node::root(),
+            ok_leaf("prose", "The value is not enough information.", Some(10)),
+            ok_leaf(
+                "distractor",
+                "A tempting intermediate is 8, but no final number.",
+                Some(9),
+            ),
+            ok_leaf("right_a", "So the final answer is 64.", Some(5)),
+            ok_leaf("right_b", "Answer: 64", Some(4)),
+        ];
+        let last = vec![
+            cand_text("prose", Some(10), "The value is not enough information."),
+            cand_text(
+                "distractor",
+                Some(9),
+                "A tempting intermediate is 8, but no final number.",
+            ),
+            cand_text("right_a", Some(5), "So the final answer is 64."),
+            cand_text("right_b", Some(4), "Answer: 64"),
+        ];
+
+        let out = finalize_for_task(flat, &last, 1, TotTask::Reasoning);
+
+        assert_eq!(out.selected_node_id.as_deref(), Some("right_a"));
+        assert_eq!(
+            out.final_answer.as_deref(),
+            Some("So the final answer is 64.")
+        );
+    }
+
+    #[test]
+    fn reasoning_numeric_extraction_uses_final_token_and_strips_commas() {
+        assert_eq!(
+            final_numeric_token("Costs were 1,200 and 34.5, so final is -2,345.67."),
+            Some("-2345.67".to_string())
+        );
+        assert_eq!(final_numeric_token("no numeric answer"), None);
+    }
+
+    #[test]
+    fn chat_final_selection_still_uses_existing_score_path() {
+        let flat = vec![
+            Node::root(),
+            ok_leaf("wrong", "The answer is 60.", Some(10)),
+            ok_leaf("right_a", "So the answer is 20.", Some(4)),
+            ok_leaf("right_b", "Final answer: 20", Some(3)),
+        ];
+        let last = vec![
+            cand_text("wrong", Some(10), "The answer is 60."),
+            cand_text("right_a", Some(4), "So the answer is 20."),
+            cand_text("right_b", Some(3), "Final answer: 20"),
+        ];
+
+        let out = finalize_for_task(flat, &last, 1, TotTask::Chat);
+
+        assert_eq!(out.selected_node_id.as_deref(), Some("wrong"));
+        assert_eq!(out.final_answer.as_deref(), Some("The answer is 60."));
+    }
+
+    #[test]
+    fn reasoning_synthesis_gate_returns_selected_leaf_verbatim() {
+        let mut out = finalize_for_task(
+            vec![Node::root(), ok_leaf("leaf", "raw selected leaf", Some(9))],
+            &[cand_text("leaf", Some(9), "raw selected leaf")],
+            1,
+            TotTask::Reasoning,
+        );
+
+        reconcile_synthesis_for_task(
+            &mut out,
+            Some("rewritten synthesis".to_string()),
+            TotTask::Reasoning,
+        );
+
+        assert_eq!(out.final_answer.as_deref(), Some("raw selected leaf"));
+        assert!(!out.synthesized);
+    }
+
+    #[test]
+    fn chat_synthesis_gate_preserves_existing_rewrite_path() {
+        let mut out = finalize_for_task(
+            vec![Node::root(), ok_leaf("leaf", "raw selected leaf", Some(9))],
+            &[cand_text("leaf", Some(9), "raw selected leaf")],
+            1,
+            TotTask::Chat,
+        );
+
+        reconcile_synthesis_for_task(
+            &mut out,
+            Some("rewritten synthesis".to_string()),
+            TotTask::Chat,
+        );
+
+        assert_eq!(out.final_answer.as_deref(), Some("rewritten synthesis"));
+        assert!(out.synthesized);
+    }
+
     // ── reconcile_synthesis (run()'s synthesis fold; the engine-bound
     //    synthesize() can't run natively, so the reconciliation is its own
     //    pure seam — #523 Part A F1/F3) ──
@@ -4192,13 +4528,22 @@ mod tests {
     // --- value×N-median scoring (#657 math arm 1a) ----------------------
 
     fn scored(v: u8, tok: usize) -> ScoreResult {
-        ScoreResult { outcome: ScoreOutcome::Scored(v), generated_tokens: tok }
+        ScoreResult {
+            outcome: ScoreOutcome::Scored(v),
+            generated_tokens: tok,
+        }
     }
     fn unparseable(tok: usize) -> ScoreResult {
-        ScoreResult { outcome: ScoreOutcome::Unparseable, generated_tokens: tok }
+        ScoreResult {
+            outcome: ScoreOutcome::Unparseable,
+            generated_tokens: tok,
+        }
     }
     fn failed(msg: &str, tok: usize) -> ScoreResult {
-        ScoreResult { outcome: ScoreOutcome::Failed(msg.to_string()), generated_tokens: tok }
+        ScoreResult {
+            outcome: ScoreOutcome::Failed(msg.to_string()),
+            generated_tokens: tok,
+        }
     }
     fn score_of(r: &ScoreResult) -> Option<u8> {
         match r.outcome {
@@ -4277,7 +4622,10 @@ mod tests {
         // The chat scorer MUST stay greedy (deterministic pruning, shipped
         // design); only reasoning runs warm so its value×N forks diverge.
         assert_eq!(score_temperature(TotTask::Chat), 0.0);
-        assert_eq!(score_temperature(TotTask::Reasoning), SCORE_SAMPLE_TEMPERATURE);
+        assert_eq!(
+            score_temperature(TotTask::Reasoning),
+            SCORE_SAMPLE_TEMPERATURE
+        );
         assert!(SCORE_SAMPLE_TEMPERATURE > 0.0);
     }
 
