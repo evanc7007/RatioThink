@@ -49,7 +49,8 @@ def analyze(path: str) -> None:
         return
 
     n = len(records)
-    fails = sel_loss = gen_loss = synth_corrupt = 0
+    passes = fails = n_error = n_ungradable = n_other = 0
+    sel_loss = gen_loss = synth_corrupt = 0
     correct_in_tree_count = 0
     score_hist: Counter = Counter()
     dup_ratios: list[float] = []
@@ -58,7 +59,20 @@ def analyze(path: str) -> None:
     for r in records:
         grader, ref = r["grader"], r["reference"]
         nodes = r.get("nodes") or []
-        final_ok = r.get("final_verdict") == "PASS"
+        verdict_raw = r.get("final_verdict")
+        verdict = (verdict_raw or "").lower()
+        final_ok = verdict == "pass"
+        final_fail = verdict == "fail"
+        if final_ok:
+            passes += 1
+        elif final_fail:
+            fails += 1
+        elif verdict == "err":
+            n_error += 1
+        elif verdict == "ungradable":
+            n_ungradable += 1
+        else:
+            n_other += 1
         # grade every node
         graded = [(_passed(grader, nd.get("content"), ref), nd) for nd in nodes]
         correct_nodes = [nd for ok, nd in graded if ok is True]
@@ -88,25 +102,26 @@ def analyze(path: str) -> None:
         sel_node = next((nd for nd in nodes if nd.get("id") == sel_id), None)
         sel_node_ok = _passed(grader, (sel_node or {}).get("content"), ref) if sel_node else None
 
-        if not final_ok:
-            fails += 1
+        if final_fail:
             if any_correct:
                 sel_loss += 1
             else:
                 gen_loss += 1
         # synthesis corruption: the SELECTED node was correct but the final
         # (synthesized) answer scored wrong → synthesis turned right into wrong.
-        if sel_node_ok is True and not final_ok:
+        if sel_node_ok is True and final_fail:
             synth_corrupt += 1
 
         per_prompt.append({
-            "index": r.get("index"), "final_ok": final_ok,
-            "correct_in_tree": any_correct, "selected_node_ok": sel_node_ok,
+            "index": r.get("index"), "verdict": verdict_raw, "final_ok": final_ok,
+            "final_fail": final_fail, "correct_in_tree": any_correct,
+            "selected_node_ok": sel_node_ok,
             "n_correct_nodes": len(correct_nodes), "n_nodes": len(nodes),
         })
 
     print(f"=== ToT tree-dump mechanism analysis ({path}) ===")
-    print(f"prompts: {n} | final PASS: {n - fails} | final FAIL: {fails}")
+    print(f"prompts: {n} | final PASS: {passes} | final FAIL: {fails} | "
+          f"ERR: {n_error} | ungradable: {n_ungradable} | other: {n_other}")
     print(f"correct answer present somewhere in the tree: {correct_in_tree_count}/{n}")
     print()
     print("FAILURE DECOMPOSITION:")
@@ -121,9 +136,15 @@ def analyze(path: str) -> None:
     print()
     print("per-prompt (index: final / correct_in_tree / selected_node_ok / #correct_nodes):")
     for p in per_prompt:
-        flag = "" if p["final_ok"] else ("  <- SEL-LOSS" if p["correct_in_tree"]
-                                         else "  <- GEN-LOSS")
-        print(f"  {p['index']:>3}: {'PASS' if p['final_ok'] else 'FAIL'} / "
+        flag = ""
+        if p["final_fail"]:
+            flag = "  <- SEL-LOSS" if p["correct_in_tree"] else "  <- GEN-LOSS"
+        verdict_label = p.get("verdict") or "other"
+        if p["final_ok"]:
+            verdict_label = "PASS"
+        elif p["final_fail"]:
+            verdict_label = "FAIL"
+        print(f"  {p['index']:>3}: {verdict_label} / "
               f"in_tree={p['correct_in_tree']} / sel_ok={p['selected_node_ok']} / "
               f"{p['n_correct_nodes']}/{p['n_nodes']}{flag}")
 
