@@ -31,9 +31,9 @@ extension ModelDownloader: ModelDownloading {}
 @MainActor
 public final class ModelDownloadController: ObservableObject {
 
-  /// One in-flight or recently-finished download. Kept around for
-  /// ~5 seconds after a terminal phase so the UI shows the outcome
-  /// (`completed` / `cancelled` / `failed`) before the row disappears.
+  /// One in-flight, failed, or recently-finished download. Completed and
+  /// cancelled rows are kept around briefly so the UI shows the outcome;
+  /// failed rows persist until Retry or Dismiss so recovery stays reachable.
   public struct ActiveDownload: Identifiable, Equatable {
     public let id: UUID
     public let repo: String
@@ -43,6 +43,13 @@ public final class ModelDownloadController: ObservableObject {
     public var errorMessage: String?
 
     public var isTerminal: Bool { progress.phase.isTerminal }
+
+    fileprivate var shouldAutoEvict: Bool {
+      switch progress.phase {
+      case .completed, .cancelled: return true
+      case .failed, .starting, .downloading, .verifying: return false
+      }
+    }
   }
 
   /// `start`-time errors that bypass the progress stream — surfaced in
@@ -82,8 +89,10 @@ public final class ModelDownloadController: ObservableObject {
     let result = downloader.start(repo: repo, file: file)
     switch result {
     case .failure(let err):
+      // #720: surface clean, user-facing copy in the action-error slot;
+      // the raw structured error stays in the logs / diagnostics only.
       let msg = String(describing: err)
-      lastError = "start(repo: \(repo), file: \(file)) failed: \(msg)"
+      lastError = err.userFacingMessage
       Self.log.error("ModelDownloadController enqueue failed: \(msg, privacy: .public)")
       Diag.app.event("download.fail", [("phase", "start"), ("file", file),
                                        ("reason", DiagnosticLog.redactHome(msg))])
@@ -108,6 +117,53 @@ public final class ModelDownloadController: ObservableObject {
       }
       return handle.id
     }
+  }
+
+  /// Return the handle id for a non-terminal download already running for
+  /// `repo`/`file`, if any. Surfaces use this before starting a retry so the
+  /// shared queue adopts existing work instead of tripping the downloader's
+  /// dedupe path.
+  public func inFlightHandle(repo: String, file: String) -> UUID? {
+    active.values.first {
+      $0.repo == repo && $0.file == file && !$0.isTerminal
+    }?.id
+  }
+
+  /// Start `repo`/`file`, or adopt an existing in-flight row for that exact
+  /// target. Returns nil only when the producer refuses to start and writes
+  /// `lastError` with the reason.
+  @discardableResult
+  public func enqueueOrAdopt(repo: String, file: String) -> UUID? {
+    if let existing = inFlightHandle(repo: repo, file: file) {
+      return existing
+    }
+    return enqueue(repo: repo, file: file)
+  }
+
+  /// Retry a failed row. The failed row persists until this succeeds (or an
+  /// existing in-flight row is adopted) so a transient start failure doesn't
+  /// erase the user's recovery affordance.
+  @discardableResult
+  public func retry(id: UUID) -> UUID? {
+    guard let entry = active[id], entry.progress.phase == .failed else {
+      return nil
+    }
+    if let existing = inFlightHandle(repo: entry.repo, file: entry.file) {
+      active.removeValue(forKey: id)
+      return existing
+    }
+    guard let retryID = enqueue(repo: entry.repo, file: entry.file) else {
+      return nil
+    }
+    active.removeValue(forKey: id)
+    return retryID
+  }
+
+  /// Explicitly clear a failed row. Other terminal rows remain governed by
+  /// their linger timer; non-terminal rows must be cancelled instead.
+  public func dismiss(id: UUID) {
+    guard active[id]?.progress.phase == .failed else { return }
+    active.removeValue(forKey: id)
   }
 
   /// Cancel an in-flight download. No-op if the handle is unknown
@@ -301,9 +357,10 @@ public final class ModelDownloadController: ObservableObject {
     Task { [weak self, terminalRowLingerSeconds] in
       try? await Task.sleep(nanoseconds: terminalRowLingerSeconds * 1_000_000_000)
       await MainActor.run {
-        // Only evict if the row is still terminal — a retry could have
-        // overwritten it with a fresh `.starting`.
-        if let entry = self?.active[id], entry.isTerminal {
+        // Only evict terminal rows whose policy still allows auto-eviction —
+        // a retry could have replaced the old handle with a fresh `.starting`,
+        // and failed rows intentionally persist so Retry remains reachable.
+        if let entry = self?.active[id], entry.shouldAutoEvict {
           self?.active.removeValue(forKey: id)
         }
       }

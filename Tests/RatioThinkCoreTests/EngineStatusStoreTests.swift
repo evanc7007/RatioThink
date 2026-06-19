@@ -597,6 +597,7 @@ final class EngineStatusStoreTests: XCTestCase {
     XCTAssertNil(store.baseURL)
     XCTAssertNil(store.lastError)
     XCTAssertEqual(store.pollCount, 0)
+    XCTAssertFalse(store.hasReceivedEngineStatus)
   }
 
   func test_initial_status_override_is_respected() {
@@ -709,6 +710,24 @@ final class EngineStatusStoreTests: XCTestCase {
     XCTAssertEqual(store.baseURL, URL(string: "http://127.0.0.1:51234"))
     XCTAssertNil(store.lastError,
                  "a transient blip must NOT surface a user-facing helper-unreachable fault (#1)")
+  }
+
+  func test_successful_status_signal_ignores_failed_polls_until_helper_answers() {
+    let store = EngineStatusStore(
+      client: StubXPCClient(),
+      tierPolicy: StatusTierPolicy(tier1Polls: 2, tier2Polls: 3)
+    )
+
+    store._applyPollForTesting(next: nil, error: "NSXPCConnectionInterrupted")
+    XCTAssertEqual(store.pollCount, 1)
+    XCTAssertEqual(store.status, .starting)
+    XCTAssertFalse(store.hasReceivedEngineStatus,
+                   "a failed first poll must not make the initial .starting placeholder look helper-reported")
+
+    store._applyPollForTesting(next: .starting, error: nil)
+    XCTAssertEqual(store.pollCount, 2)
+    XCTAssertTrue(store.hasReceivedEngineStatus,
+                  "the signal flips only once the helper returns an EngineStatus value")
   }
 
   /// #5a: SUSTAINED transport loss escalates to a real, recoverable

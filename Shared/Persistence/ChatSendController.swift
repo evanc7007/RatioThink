@@ -175,6 +175,23 @@ public final class ChatSendController: ObservableObject {
               self.activeAssistant = nil
               self.activeContext = nil
               self.activePersistenceStatus = nil
+            case let .usage(used, window):
+              // #711: the usage frame trails `.finish`. It carries the
+              // conversation's engine-true occupancy (committed + working +
+              // buffered tokens), NOT this turn's token count — so it lands
+              // on the ContextUsageTracker (the single source for the meter +
+              // memory estimate) and is NOT written to `Message.tokens`, whose
+              // per-message meaning the writer owns. Keyed on this request's
+              // identity, so a frame from a superseded turn can't clobber a
+              // newer one.
+              if let usage = self.activeUsageIdentity, usage.requestID == usageRequestID {
+                usage.tracker.markUsage(
+                  chatID: usage.chatID,
+                  modelID: usage.modelID,
+                  requestID: usage.requestID,
+                  usage: ContextUsage(usedTokens: used, windowTokens: window)
+                )
+              }
             }
           }
           // Stream completed cleanly — no retry.
@@ -433,10 +450,11 @@ public final class ChatSendController: ObservableObject {
             assistant.content += text
           case .levelPruned:
             Self.persistTree(context, status: persistenceStatus)
-          case .treeStart, .nodeStart, .nodeDelta, .nodeComplete:
+          case .treeStart, .nodeStart, .nodeDelta, .nodeScoring, .nodeComplete:
             // In-memory tot re-encode above already drives the live tree
-            // (incl. per-token node_delta fill, #413 phase B); disk persistence
-            // stays throttled to level boundaries + the terminal.
+            // (incl. per-token node_delta fill, #413 phase B, and the
+            // `nodeScoring` live-phase flip); disk persistence stays throttled
+            // to level boundaries + the terminal.
             break
           case .awaitingSelection:
             // Best-of-N terminal (#690) — never emitted on the tree-of-thought
@@ -518,6 +536,12 @@ public final class ChatSendController: ObservableObject {
     generation &+= 1
     task?.cancel()
     task = nil
+    // `MessageStreamWriter.cancel()` intentionally drops unflushed buffers.
+    // For a user-visible cancel decision, first land any delta already
+    // delivered to this writer so `recordCancelledAssistant` distinguishes
+    // a truly blank preallocated row from a partial assistant turn that was
+    // cancelled before the timer's first flush boundary.
+    activeWriter?.flush()
     activeWriter?.cancel()
     if let assistant = activeAssistant,
        let context = activeContext,
@@ -808,6 +832,18 @@ public final class ChatSendController: ObservableObject {
       var reachedTerminal = false
       let encoder = JSONEncoder()
       var lastLiveEncode = Date.distantPast
+
+      // #708 selection-flash fix (root cause): flag the turn as Best-of-N from
+      // the FIRST frame — an empty pick set, no choice — so `MessageBubble`
+      // renders it in the option presentation throughout generation. Without
+      // this, candidates stream into `tot` while `bestOfN` is nil, so
+      // `MessageBubble` takes the tree-of-thought branch and each `kept`
+      // candidate draws a GREEN beam checkmark, which flips to a hollow option
+      // glyph the instant `awaiting_selection` sets `bestOfN` (the
+      // green-checkmark-then-unselected flash). The `awaiting_selection` handler
+      // below swaps in the real pick set; until then the candidates show neutral,
+      // not-yet-pickable option glyphs with no chosen/kept indicator.
+      assistant.bestOfN = try? encoder.encode(BestOfNRound(level: 0, candidates: [], chosenID: nil))
       do {
         for try await event in toTEventStream(from: engine.dispatchInferlet(request)) {
           guard self.generation == myGeneration, !Task.isCancelled else { return }
@@ -831,10 +867,11 @@ public final class ChatSendController: ObservableObject {
             self.activePersistenceStatus = nil
           case .levelPruned:
             Self.persistTree(context, status: persistenceStatus)
-          case .treeStart, .nodeStart, .nodeDelta, .nodeComplete,
+          case .treeStart, .nodeStart, .nodeDelta, .nodeScoring, .nodeComplete,
                .treeComplete, .finalDelta, .generationMetrics:
             // Best-of-N never auto-selects (no treeComplete/finalDelta) and
-            // emits no metrics; the live re-encode above drives the tree.
+            // emits no metrics; the live re-encode above drives the tree
+            // (incl. the `nodeScoring` live-phase flip).
             break
           }
         }
@@ -879,6 +916,7 @@ public final class ChatSendController: ObservableObject {
       messages: transcriptTurns(chat: chat, options: options),
       n: config.n,
       maxTokensPerCandidate: config.maxTokensPerCandidate,
+      thinking: config.thinking,
       temperature: options.sampling.temperature,
       topP: options.sampling.topP,
       resumeFrom: resume?.pickedName,
@@ -911,13 +949,23 @@ public final class ChatSendController: ObservableObject {
     else { return }
     Task { @MainActor in
       do {
-        // Drain the response so the request completes. The server frees the KV
-        // pages on its side; HTTP failures throw here (`assertOK`) and are
-        // logged. Release-ack observability (short-release accounting) is a
-        // deferred follow-up — `dispatch_release` returns an unframed JSON ack
-        // that the SSE frame reader strips, so there is nothing to inspect on
-        // this path today.
-        for try await _ in engine.dispatchInferlet(request) {}
+        // Drain the unary release ack and check the accounting (#703 F4). The
+        // request sets `stream: false`, so `dispatchInferlet` takes the unary
+        // control transport and yields the server's `application/json`
+        // ReleaseReport as a single frame (the old SSE path stripped it). HTTP
+        // failures throw here (`assertOK`) and are logged below; a short
+        // release — fewer freed than requested — is surfaced so a release that
+        // freed nothing no longer reports silent success.
+        var frames: [Data] = []
+        for try await frame in engine.dispatchInferlet(request) { frames.append(frame) }
+        // Decode with `try` (review F1): a 2xx body that is NOT a decodable
+        // ReleaseReport (proxy mangling, a 200-wrapped error envelope,
+        // truncation, schema drift) must NOT read as a silent clean release —
+        // the `DecodingError` propagates to the `catch` below and is logged.
+        if let ack = try Self.decodeReleaseAck(frames: frames),
+           let message = Self.shortReleaseLog(ack) {
+          Log.engine.notice("ChatSendController: \(message, privacy: .public)")
+        }
       } catch {
         let detail = (error as? LocalizedError)?.errorDescription ?? "\(error)"
         Log.engine.error(
@@ -933,6 +981,33 @@ public final class ChatSendController: ObservableObject {
     guard let data = try? JSONEncoder().encode(BestOfNReleaseInput(model: modelID, release: names))
     else { return nil }
     return InferletRequest(inferlet: "best-of-n", input: data, messages: nil, stream: false)
+  }
+
+  /// Decode the unary release ack from the dispatched frames (#703 F4/F1).
+  /// Returns nil ONLY when no frame arrived; a frame whose body is not a
+  /// decodable `ReleaseReport` THROWS the `DecodingError` rather than collapsing
+  /// to a silent success — `releaseBestOfNSnapshots` lets it reach the logging
+  /// `catch`. `nonisolated` + pure so the decode-failure contract is
+  /// unit-tested without a live engine.
+  nonisolated static func decodeReleaseAck(frames: [Data]) throws -> BestOfNReleaseAck? {
+    var ack: BestOfNReleaseAck?
+    for frame in frames {
+      ack = try JSONDecoder().decode(BestOfNReleaseAck.self, from: frame)
+    }
+    return ack
+  }
+
+  /// #703 F4: the human-readable short-release line, or nil when the engine
+  /// freed every requested snapshot. A short release (`released < requested`)
+  /// is benign for a re-release (some names already evicted), but a FULL miss
+  /// (`released == 0`) signals the release reached the wrong engine or the
+  /// round's snapshots were already gone. Pure so the accounting decision is
+  /// unit-tested without a live engine. `nonisolated` — pure over its argument,
+  /// touches no actor state.
+  nonisolated static func shortReleaseLog(_ ack: BestOfNReleaseAck) -> String? {
+    guard ack.released < ack.requested else { return nil }
+    return "best-of-n release freed \(ack.released)/\(ack.requested) snapshots "
+      + "(\(ack.absent) already absent)"
   }
 
   /// Canonical wire string for a finish reason. Shared by `finishMeta`
@@ -1046,7 +1121,7 @@ public final class ChatSendController: ObservableObject {
     context: ModelContext,
     persistenceStatus: PersistenceStatus
   ) {
-    if assistant.content.isEmpty {
+    if assistant.content.isEmpty && assistant.reasoning.isEmpty {
       assistant.chat?.messages.removeAll { $0.id == assistant.id }
       context.delete(assistant)
     } else {
@@ -1098,6 +1173,7 @@ private struct BestOfNRequestInput: Encodable {
   let messages: [ChatMessage]
   let n: Int
   let maxTokensPerCandidate: Int
+  let thinking: Bool
   let temperature: Double
   let topP: Double
   let resumeFrom: String?
@@ -1106,7 +1182,7 @@ private struct BestOfNRequestInput: Encodable {
   let level: Int?
 
   private enum CodingKeys: String, CodingKey {
-    case model, messages, n, temperature, level, unpicked
+    case model, messages, n, temperature, level, unpicked, thinking
     case maxTokensPerCandidate = "max_tokens_per_candidate"
     case topP = "top_p"
     case resumeFrom = "resume_from"
@@ -1130,6 +1206,18 @@ private struct BestOfNReleaseInput: Encodable {
   }
 
   private enum CodingKeys: String, CodingKey { case model, release }
+}
+
+/// The unary `application/json` ack `bestofn::release::dispatch_release` returns
+/// (#703): the snapshot-release accounting. `released + absent == requested`
+/// always; `released < requested` means some names were already gone (a
+/// re-release or an earlier eviction). Decoded from the single frame the unary
+/// control transport yields so a release that freed nothing no longer reports
+/// silent success.
+struct BestOfNReleaseAck: Decodable, Equatable {
+  let requested: Int
+  let released: Int
+  let absent: Int
 }
 
 /// Failure constructing a tree-of-thought send.

@@ -92,13 +92,20 @@ public enum ChatStartGate {
   ///     neither exists.
   ///   - profileError: a structural problem with the active-profile
   ///     selection (unreadable marker / unparsable profile), if any.
+  ///   - hasReceivedEngineStatus: whether `engineStatus` came from at
+  ///     least one successful helper status reply. `EngineStatusStore`
+  ///     initializes status to `.starting` as an honest "unknown until
+  ///     first reply" placeholder, and failed polls can leave that
+  ///     placeholder in place; the placeholder must not be treated as a
+  ///     genuine in-flight start that hides the user's explicit Load action.
   public static func evaluate(
     engineStatus: EngineStatus,
     helperError: String?,
     resolvedModelID: String?,
     residentModelID: String? = nil,
     target: ModelTarget?,
-    profileError: String? = nil
+    profileError: String? = nil,
+    hasReceivedEngineStatus: Bool = true
   ) -> State {
     // Helper transport down: the polled status is stale/placeholder, so
     // surface the reachability failure rather than misreading it as
@@ -113,6 +120,9 @@ public enum ChatStartGate {
     case .stopping:
       return .busy(.stoppingEngine)
     case .starting:
+      if !hasReceivedEngineStatus {
+        return targetOrNo(target: target, profileError: profileError)
+      }
       // Engine coming up via launch prompt/user-confirm, explicit Restart,
       // Local API, post-download startEngine, or crash auto-relaunch. v1 pie
       // loads the model at `pie serve` boot, so "starting" already implies

@@ -5,13 +5,24 @@ final class EnvironmentFakeModelDownloader: ModelDownloading, @unchecked Sendabl
   private let lock = NSLock()
   private var continuations: [UUID: AsyncStream<DownloadProgress>.Continuation] = [:]
   private var cancelledHandles: Set<UUID> = []
+  private var attemptsByTarget: [String: Int] = [:]
+  private var failedHandles: Set<UUID> = []
 
   init(environment: [String: String] = ProcessInfo.processInfo.environment) {
     self.environment = environment
   }
 
   func start(repo: String, file: String) -> Result<DownloadHandle, DownloadError> {
-    .success(DownloadHandle(repo: repo, file: file))
+    let handle = DownloadHandle(repo: repo, file: file)
+    let target = "\(repo)/\(file)"
+    lock.lock()
+    let attempt = (attemptsByTarget[target] ?? 0) + 1
+    attemptsByTarget[target] = attempt
+    if shouldFail(attempt: attempt) {
+      failedHandles.insert(handle.id)
+    }
+    lock.unlock()
+    return .success(handle)
   }
 
   /// #218: honor cancel so the GUI cancel → "Discard?" confirm →
@@ -79,7 +90,8 @@ final class EnvironmentFakeModelDownloader: ModelDownloading, @unchecked Sendabl
           etaSeconds: 60
         ))
         if let failure = self.environment["PIE_TEST_FAKE_DOWNLOAD_FAILURE"],
-           !failure.isEmpty {
+           !failure.isEmpty,
+           self.shouldFail(handle.id) {
           try? await Task.sleep(nanoseconds: 150_000_000)
           if self.isCancelled(handle.id) { return }
           continuation.yield(DownloadProgress(
@@ -113,6 +125,20 @@ final class EnvironmentFakeModelDownloader: ModelDownloading, @unchecked Sendabl
         // cancelable until `cancel(handle:)` yields `.cancelled`.
       }
     }
+  }
+
+  private func shouldFail(attempt: Int) -> Bool {
+    guard let raw = environment["PIE_TEST_FAKE_DOWNLOAD_FAILURE_ATTEMPTS"],
+          let limit = Int(raw) else {
+      return true
+    }
+    return attempt <= limit
+  }
+
+  private func shouldFail(_ id: UUID) -> Bool {
+    lock.lock()
+    defer { lock.unlock() }
+    return failedHandles.contains(id)
   }
 
   private func isCancelled(_ id: UUID) -> Bool {

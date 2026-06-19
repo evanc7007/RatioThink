@@ -156,14 +156,11 @@ final class ModelDownloadControllerTests: XCTestCase {
     XCTAssertEqual(controller.active[handle.id]?.isTerminal, true,
                    "isTerminal must be true after a real cancel failure")
 
-    // F37: eviction was scheduled — with linger=0 the row should be
-    // gone within a small wall-clock budget.
-    let deadline = Date().addingTimeInterval(2.0)
-    while controller.active[handle.id] != nil && Date() < deadline {
-      try? await Task.sleep(nanoseconds: 50_000_000)
-    }
-    XCTAssertNil(controller.active[handle.id],
-                 "review v5 F37: scheduleEviction must have removed the row within the linger window")
+    // #722: terminal failures no longer auto-evict; the row must remain
+    // visible so the user can retry or dismiss it.
+    try? await Task.sleep(nanoseconds: 50_000_000)
+    XCTAssertNotNil(controller.active[handle.id],
+                    "failed rows must remain visible for Retry/Dismiss instead of auto-evicting")
   }
 
   func test_cancel_unknownHandle_short_circuits_no_error_state_written() {
@@ -205,6 +202,136 @@ final class ModelDownloadControllerTests: XCTestCase {
     XCTAssertNil(controller.active[handle.id]?.errorMessage,
                  "review v4 F31: .cancelled from the producer means it already terminated — short-circuit, no caption")
     XCTAssertNil(controller.lastError)
+  }
+
+  // MARK: - #722 failed rows persist and can be retried/dismissed
+
+  func test_failed_phase_is_not_auto_evicted_so_retry_remains_reachable() async {
+    let controller = ModelDownloadController(terminalRowLingerSeconds: 0)
+    let handle = DownloadHandle(repo: "owner/repo", file: "m.gguf")
+
+    controller._testOnly_apply(
+      DownloadProgress(handleID: handle.id,
+                       phase: .failed,
+                       bytesReceived: 5,
+                       bytesExpected: 100,
+                       etaSeconds: nil,
+                       failureReason: "timeout"),
+      handle: handle)
+
+    try? await Task.sleep(nanoseconds: 50_000_000)
+
+    XCTAssertEqual(controller.active[handle.id]?.progress.phase, .failed,
+                   "failed rows must persist instead of disappearing before the user can click Retry")
+    XCTAssertEqual(controller.active[handle.id]?.errorMessage, "timeout")
+  }
+
+  func test_completed_and_cancelled_rows_still_auto_evict_after_linger() async {
+    let controller = ModelDownloadController(terminalRowLingerSeconds: 0)
+    let completed = DownloadHandle(repo: "owner/repo", file: "done.gguf")
+    let cancelled = DownloadHandle(repo: "owner/repo", file: "cancel.gguf")
+
+    controller._testOnly_apply(
+      DownloadProgress(handleID: completed.id,
+                       phase: .completed,
+                       bytesReceived: 100,
+                       bytesExpected: 100,
+                       etaSeconds: nil,
+                       verification: .verified),
+      handle: completed)
+    controller._testOnly_apply(
+      DownloadProgress(handleID: cancelled.id,
+                       phase: .cancelled,
+                       bytesReceived: 10,
+                       bytesExpected: 100,
+                       etaSeconds: nil),
+      handle: cancelled)
+
+    let deadline = Date().addingTimeInterval(2.0)
+    while (!controller.active.isEmpty) && Date() < deadline {
+      try? await Task.sleep(nanoseconds: 50_000_000)
+    }
+
+    XCTAssertNil(controller.active[completed.id], "completed rows should still clear after the terminal linger")
+    XCTAssertNil(controller.active[cancelled.id], "cancelled rows should still clear after the terminal linger")
+  }
+
+  func test_retry_failed_row_reenqueues_same_repo_file_and_removes_failed_row() {
+    let stub = StubDownloader()
+    let controller = ModelDownloadController(downloader: stub, terminalRowLingerSeconds: 60)
+    let failed = DownloadHandle(repo: "owner/repo", file: "m.gguf")
+    controller._testOnly_apply(
+      DownloadProgress(handleID: failed.id,
+                       phase: .failed,
+                       bytesReceived: 5,
+                       bytesExpected: 100,
+                       etaSeconds: nil,
+                       failureReason: "timeout"),
+      handle: failed)
+
+    let retryID = controller.retry(id: failed.id)
+
+    XCTAssertNotNil(retryID, "Retry should start the same target again")
+    XCTAssertEqual(stub.startedTargets, ["owner/repo/m.gguf"])
+    XCTAssertNil(controller.active[failed.id], "the stale failed row should be cleared after a retry starts")
+    XCTAssertEqual(controller.active[retryID!]?.repo, "owner/repo")
+    XCTAssertEqual(controller.active[retryID!]?.file, "m.gguf")
+    XCTAssertEqual(controller.active[retryID!]?.progress.phase, .starting)
+  }
+
+  func test_retry_failed_row_adopts_existing_inflight_target_instead_of_duplicate_start() {
+    let stub = StubDownloader()
+    let controller = ModelDownloadController(downloader: stub, terminalRowLingerSeconds: 60)
+    let failed = DownloadHandle(repo: "owner/repo", file: "m.gguf")
+    let inflight = DownloadHandle(repo: "owner/repo", file: "m.gguf")
+    controller._testOnly_apply(
+      DownloadProgress(handleID: failed.id,
+                       phase: .failed,
+                       bytesReceived: 5,
+                       bytesExpected: 100,
+                       etaSeconds: nil,
+                       failureReason: "timeout"),
+      handle: failed)
+    controller._testOnly_apply(
+      DownloadProgress(handleID: inflight.id,
+                       phase: .downloading,
+                       bytesReceived: 10,
+                       bytesExpected: 100,
+                       etaSeconds: nil),
+      handle: inflight)
+
+    let retryID = controller.retry(id: failed.id)
+
+    XCTAssertEqual(retryID, inflight.id)
+    XCTAssertTrue(stub.startedTargets.isEmpty, "Retry should adopt the already-running target instead of triggering the downloader dedupe path")
+    XCTAssertNil(controller.active[failed.id], "adopting an in-flight row should clear the stale failed row")
+    XCTAssertEqual(controller.active[inflight.id]?.progress.phase, .downloading)
+  }
+
+  func test_dismiss_failed_row_clears_it_without_touching_inflight_rows() {
+    let controller = ModelDownloadController(terminalRowLingerSeconds: 60)
+    let failed = DownloadHandle(repo: "owner/repo", file: "m.gguf")
+    let inflight = DownloadHandle(repo: "owner/repo", file: "other.gguf")
+    controller._testOnly_apply(
+      DownloadProgress(handleID: failed.id,
+                       phase: .failed,
+                       bytesReceived: 5,
+                       bytesExpected: 100,
+                       etaSeconds: nil,
+                       failureReason: "timeout"),
+      handle: failed)
+    controller._testOnly_apply(
+      DownloadProgress(handleID: inflight.id,
+                       phase: .downloading,
+                       bytesReceived: 10,
+                       bytesExpected: 100,
+                       etaSeconds: nil),
+      handle: inflight)
+
+    controller.dismiss(id: failed.id)
+
+    XCTAssertNil(controller.active[failed.id])
+    XCTAssertNotNil(controller.active[inflight.id])
   }
 
   // MARK: - F32: stale errorMessage cleared on recovery / completion
@@ -295,9 +422,11 @@ final class ModelDownloadControllerTests: XCTestCase {
 private final class StubDownloader: ModelDownloading, @unchecked Sendable {
   var nextCancelError: DownloadError?
   var cancelInvocations = 0
+  var startedTargets: [String] = []
 
   func start(repo: String, file: String) -> Result<DownloadHandle, DownloadError> {
-    .success(DownloadHandle(repo: repo, file: file))
+    startedTargets.append("\(repo)/\(file)")
+    return .success(DownloadHandle(repo: repo, file: file))
   }
 
   func cancel(handle: DownloadHandle) -> DownloadError? {

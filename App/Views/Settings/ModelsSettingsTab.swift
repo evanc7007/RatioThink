@@ -339,9 +339,10 @@ private struct DownloadsInFlightSection: View {
       VStack(alignment: .leading, spacing: 6) {
         SettingsSectionHeader(title: "Downloading")
         ForEach(rows) { row in
-          DownloadRow(entry: row) {
-            downloads.cancel(id: row.id)
-          }
+          DownloadRow(entry: row,
+                      onCancel: { downloads.cancel(id: row.id) },
+                      onRetry: { downloads.retry(id: row.id) },
+                      onDismiss: { downloads.dismiss(id: row.id) })
         }
         if let err = downloads.lastError {
           Text(err)
@@ -358,6 +359,8 @@ private struct DownloadsInFlightSection: View {
 private struct DownloadRow: View {
   let entry: ModelDownloadController.ActiveDownload
   let onCancel: () -> Void
+  let onRetry: () -> Void
+  let onDismiss: () -> Void
 
   /// #218: cancelling a download is a hard cancel (partial progress is
   /// discarded, no resume), so the trailing "Cancel" arms an inline
@@ -378,7 +381,9 @@ private struct DownloadRow: View {
       }
       Spacer()
       progressView
-      if !entry.isTerminal {
+      if entry.progress.phase == .failed {
+        failedControls
+      } else if !entry.isTerminal {
         cancelControl
       }
     }
@@ -412,6 +417,17 @@ private struct DownloadRow: View {
       Button("Cancel") { confirmingCancel = true }
         .buttonStyle(.borderless)
         .accessibilityIdentifier("DownloadRow-Cancel")
+    }
+  }
+
+  private var failedControls: some View {
+    HStack(spacing: 6) {
+      Button("Retry", action: onRetry)
+        .buttonStyle(.bordered)
+        .accessibilityIdentifier("DownloadRow-Retry")
+      Button("Dismiss", action: onDismiss)
+        .buttonStyle(.borderless)
+        .accessibilityIdentifier("DownloadRow-Dismiss")
     }
   }
 
@@ -536,8 +552,9 @@ private struct InstalledModelsTable: View {
               }
               // #580: within a base-name section the row's primary text is
               // the quant tag (the distinguishing part), falling back to the
-              // full leaf when there is no clean quant.
-              Text(ModelNameParts.parse(row.filename).quantOrLeaf)
+              // full leaf when there is no clean quant. #667: prefer the
+              // authoritative GGUF header quant over the filename guess.
+              Text(row.effectiveQuant ?? ModelNameParts.parse(row.filename).quantOrLeaf)
                 .lineLimit(1).truncationMode(.middle)
               if row.source == .huggingFaceCache {
                 // Cached HF models are read-only here (the app does not
@@ -562,6 +579,20 @@ private struct InstalledModelsTable: View {
                   .background(Capsule().fill(Color.orange.opacity(0.15)))
                   .help(warning)
                   .accessibilityIdentifier("InstalledRow-SupportWarning-\(row.id)")
+              }
+              if let mismatch = row.quantMismatchWarning {
+                // #667: the filename's quant token contradicts the real GGUF
+                // header quant. Flag it so a mislabeled file is not trusted on
+                // its name alone (the displayed quant above is the real one).
+                Label("Name mismatch", systemImage: "exclamationmark.octagon.fill")
+                  .labelStyle(.titleAndIcon)
+                  .font(.caption2)
+                  .foregroundStyle(.orange)
+                  .padding(.horizontal, 5)
+                  .padding(.vertical, 1)
+                  .background(Capsule().fill(Color.orange.opacity(0.15)))
+                  .help(mismatch)
+                  .accessibilityIdentifier("InstalledRow-QuantMismatch-\(row.id)")
               }
             }
           }
@@ -684,6 +715,10 @@ private struct MemoryGuardrailSection: View {
   @State private var fraction: Double = GuardrailSettings.defaultFraction
   @State private var saveError: String?
   @State private var loadError: String?
+  /// #711: single source for the engine-true context window of the loaded
+  /// model, surfaced as "expected max context". Each turn's `usage` frame
+  /// records it; `nil` until a turn has run this session.
+  @EnvironmentObject private var contextUsageTracker: ContextUsageTracker
 
   private enum FractionChoice: Hashable {
     case preset(Double)
@@ -742,6 +777,13 @@ private struct MemoryGuardrailSection: View {
           .fixedSize(horizontal: false, vertical: true)
           .accessibilityIdentifier("GuardrailLoadError")
       }
+
+      Text(contextWindowPreview)
+        .font(.callout)
+        .foregroundStyle(.secondary)
+        .fixedSize(horizontal: false, vertical: true)
+        .accessibilityIdentifier("ContextWindowPreview")
+
       if let saveError {
         Text(saveError).font(.callout).foregroundStyle(.red)
       }
@@ -776,6 +818,17 @@ private struct MemoryGuardrailSection: View {
       line += "  (\(derivation))"
     }
     return line
+  }
+
+  /// #711: the engine-true context window of the loaded model
+  /// (`budget_pages × tokens_per_page`), or a measure-it hint until a chat
+  /// turn has reported usage this session. Distinct from the size ceiling
+  /// above — this is how many context tokens the model can actually hold.
+  private var contextWindowPreview: String {
+    guard let tokens = contextUsageTracker.latestWindow, tokens > 0 else {
+      return "Expected max context: send a message to measure the loaded model's window."
+    }
+    return "Expected max context ≈ \(tokens.formatted()) tokens (loaded model)."
   }
 
   private func load() {

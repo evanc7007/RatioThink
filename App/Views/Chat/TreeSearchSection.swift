@@ -9,11 +9,19 @@ import SwiftUI
 /// adapts to appearance), `.primary` / `.secondary`, and alpha-based dimming —
 /// never a hardcoded lightness, which would invert between light and dark.
 struct BestOfNSelectionContext {
-  /// Node ids the user may pick (the engine-saved candidates).
+  /// Node ids the user may pick (the engine-saved candidates). Empty for a
+  /// read-only (historical/finalized) round.
   var pickableIDs: Set<String>
   /// The chosen node id, or nil while awaiting a choice.
   var chosenID: String?
-  /// Invoked with a candidate's node id when the user picks it.
+  /// Interactive iff this is the LIVE round (the one `TranscriptView` wires
+  /// `onBestOfN` for). Live: every candidate stays pickable so the user can
+  /// freely re-pick by tapping another (all snapshots are alive until
+  /// think-more/use-this); unpicked rows stay full-strength + readable.
+  /// Read-only (false): no pickable rows, no "pick one" state — just highlight
+  /// which candidate was chosen and dim the rest (#708).
+  var isInteractive: Bool
+  /// Invoked with a candidate's node id when the user picks (or re-picks) it.
   var onPick: (String) -> Void
 
   var hasChoice: Bool { chosenID != nil }
@@ -87,6 +95,9 @@ struct TreeSearchSection: View {
       }
       .buttonStyle(.plain)
       .help(isExpanded ? "Hide the tree-of-thought search" : "Show the tree-of-thought search")
+      // Stable handle for the seated GUI test to (re-)expand a Best-of-N round
+      // — e.g. a finalized read-only round, which auto-folds once committed.
+      .modifier(OptionalAccessibilityIdentifier(id: isBestOfN ? "bestofn.disclosure" : nil))
 
       if isExpanded {
         VStack(alignment: .leading, spacing: 4) {
@@ -122,6 +133,8 @@ struct TreeSearchSection: View {
       case .idle, .searching:
         return "generating…"
       case .complete:
+        // Read-only history: never prompt "pick one" — just note the outcome.
+        if !selection.isInteractive { return selection.hasChoice ? "chosen" : "options" }
         return selection.hasChoice ? "chosen" : "pick one"
       case .failed:
         return "failed"
@@ -159,11 +172,27 @@ private struct ToTNodeRow: View {
 
   // MARK: Best-of-N selection state (#690)
   private var isBestOfN: Bool { selection != nil }
+  private var isInteractive: Bool { selection?.isInteractive ?? false }
   private var isPickable: Bool { selection?.pickableIDs.contains(node.id) ?? false }
   private var isChosen: Bool { selection?.chosenID == node.id }
   private var hasChoice: Bool { selection?.hasChoice ?? false }
-  /// An unpicked candidate after the user has chosen: collapse + dim it.
-  private var isDimmed: Bool { hasChoice && !isChosen }
+  /// An unpicked candidate in a READ-ONLY (historical/finalized) round: collapse
+  /// + dim it so the chosen one stands out. On the live round nothing dims —
+  /// every candidate stays full-strength and re-pickable until think-more/use-
+  /// this (#708 click-to-reselect).
+  private var isDimmed: Bool { hasChoice && !isChosen && !isInteractive }
+  /// True when tapping the WHOLE card PICKS this candidate (#708 native
+  /// tap-to-select + click-to-reselect): a pickable candidate on the live round
+  /// that is NOT the current choice. The chosen card is excluded so its answer
+  /// text becomes drag-selectable (you committed to reading it); re-selection is
+  /// tapping a DIFFERENT, still-pickable card. Read-only rows are never pick
+  /// targets (text always selectable, tap toggles expand).
+  private var isPickAction: Bool { isInteractive && isPickable && !isChosen }
+  /// Help text for the row's single tap action — pick vs expand/collapse.
+  private var rowActionHelp: String {
+    if isPickAction { return "Pick this answer" }
+    return isExpanded ? "Collapse this branch" : "Expand this branch"
+  }
   private var children: [ToTTree.Node] { tree.children(of: node.id) }
   private var answer: String {
     node.content.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -184,121 +213,114 @@ private struct ToTNodeRow: View {
   }
 
   var body: some View {
+    // Best-of-N candidates render FLAT (#708): the answer is always visible,
+    // there is no card-level expand/collapse and no headline/title — only the
+    // per-candidate Thinking section folds (its own disclosure). Tree-of-thought
+    // keeps its foldable header + title via `cardStack`.
+    if isBestOfN {
+      bestOfNCandidate
+    } else {
+      cardStack(answerSelectable: true, headerTogglesExpand: true)
+    }
+  }
+
+  /// A flat Best-of-N candidate: option glyph + the always-visible answer, with
+  /// the chosen one accent-highlighted and the Thinking disclosure below. No
+  /// card fold, no title — the only foldable part is the reasoning section.
+  @ViewBuilder private var bestOfNCandidate: some View {
     VStack(alignment: .leading, spacing: 4) {
-      HStack(alignment: .firstTextBaseline, spacing: 6) {
-        // Expand/collapse toggle. Holds only the glyph + headline + chevron —
-        // the Select affordance is a SIBLING (below), never nested inside this
-        // Button: a Button inside a Button both fires the toggle on a Select tap
-        // AND hides Select from the accessibility tree (it gets absorbed into
-        // the outer element), so Select must stand on its own.
-        Button {
-          userExpanded = !isExpanded
-        } label: {
-          HStack(alignment: .firstTextBaseline, spacing: 6) {
-            if isBestOfN {
-              optionGlyph
-            } else {
-              beamGlyph
-              scoreBadge
-            }
-            Text(headline)
-              .font(.caption.monospaced())
-              .foregroundStyle(headlineTint)
-              .lineLimit(isBestOfN && !isDimmed ? 3 : 1)
-              .strikethrough(isPruned, color: .secondary)
-              .frame(maxWidth: .infinity, alignment: .leading)
-            if hasDetail {
-              Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
-            }
+      // The answer card. A live pickable candidate makes the WHOLE card one
+      // pick Button (its answer text is NOT selectable so a tap picks rather
+      // than starting a text drag); the chosen card and read-only-history rows
+      // are not pick targets, so their answer text is drag-selectable.
+      Group {
+        if isPickAction {
+          Button { selection?.onPick(node.id) } label: {
+            flatCard(answerSelectable: false)
+              // The whole card rectangle is the hit area (#708) — without this
+              // a tap on a gap or the answer text is dropped and the pick
+              // silently no-ops.
+              .contentShape(Rectangle())
           }
-          .contentShape(Rectangle())
+          .buttonStyle(.plain)
+          .frame(maxWidth: .infinity, alignment: .leading)
+          .help("Pick this answer")
+          .accessibilityIdentifier("bestofn.option.\(node.branchIndex ?? 0)")
+        } else {
+          flatCard(answerSelectable: true)
+            .accessibilityIdentifier("bestofn.option.\(node.branchIndex ?? 0)")
         }
-        .buttonStyle(.plain)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .help(isExpanded ? "Collapse this branch" : "Expand this branch")
-
-        // The Select affordance — only before a choice is made, only for a
-        // pickable (engine-saved) candidate. `borderedProminent` paints in the
-        // system accent (adaptive). Sibling of the toggle so it is its own tap
-        // target + its own accessibility element.
-        if let selection, isPickable, !hasChoice {
-          Button("Select") { selection.onPick(node.id) }
-            .buttonStyle(.borderedProminent)
-            .controlSize(.small)
-            .accessibilityIdentifier("bestofn.select.\(node.branchIndex ?? 0)")
+      }
+      // Chosen candidate: accent-tinted card + border (adaptive semantic color,
+      // reads in light + dark). Every candidate reserves the SAME 8pt inset so
+      // the accent only fades in/out as the choice moves — rows never shift.
+      .padding(8)
+      .background {
+        if isChosen {
+          RoundedRectangle(cornerRadius: 8, style: .continuous)
+            .fill(Color.accentColor.opacity(0.12))
+        }
+      }
+      .overlay {
+        if isChosen {
+          RoundedRectangle(cornerRadius: 8, style: .continuous)
+            .strokeBorder(Color.accentColor.opacity(0.55), lineWidth: 1)
         }
       }
 
-      if isExpanded {
-        // The node's reasoning — shown, never stripped, folded behind the
-        // same disclosure the chat answer uses (#329). Auto-expands for an
-        // unanswered (incomplete) node so its partial thought is visible.
-        if !node.reasoning.isEmpty {
-          ReasoningDisclosure(
-            reasoning: node.reasoning,
-            answerStarted: hasAnswer,
-            labelFont: .caption2,
-            bodyFont: .caption2.monospaced()
-          )
-          .padding(.leading, 4)
-        }
-        detail
-          .padding(.leading, 4)
-        ForEach(children) { child in
-          ToTNodeRow(tree: tree, node: child)
-            .padding(.leading, 14)
-        }
-      }
-    }
-    // Chosen candidate: accent-tinted card + accent border. Unpicked-after-
-    // choice: alpha dim. Both use semantic `Color.accentColor` / opacity, which
-    // adapt across light + dark — never a hardcoded lightness (#690).
-    .padding(isChosen ? 8 : 0)
-    .background {
-      if isChosen {
-        RoundedRectangle(cornerRadius: 8, style: .continuous)
-          .fill(Color.accentColor.opacity(0.12))
-      }
-    }
-    .overlay {
-      if isChosen {
-        RoundedRectangle(cornerRadius: 8, style: .continuous)
-          .strokeBorder(Color.accentColor.opacity(0.55), lineWidth: 1)
+      // #708 C — the candidate's reasoning renders below the answer card on the
+      // plain surface (never under the chosen accent fill), pushed to `.tertiary`
+      // (`deEmphasized`) so it reads as subordinate to the `.primary` answer.
+      // This disclosure is now the ONLY foldable part of a candidate; it folds
+      // by default once an answer exists. Absent when there is no reasoning.
+      if !node.reasoning.isEmpty {
+        ReasoningDisclosure(
+          reasoning: node.reasoning,
+          answerStarted: hasAnswer,
+          labelFont: .caption2,
+          bodyFont: .caption2.monospaced(),
+          deEmphasized: true
+        )
+        .padding(.leading, 8)
+        // Stable handle for the seated GUI test (#708).
+        .accessibilityIdentifier("bestofn.candidate.\(node.branchIndex ?? 0).thinking")
       }
     }
     .opacity(isDimmed ? 0.5 : 1.0)
     .animation(.easeInOut(duration: 0.18), value: hasChoice)
-    // Stable identity + a semantic state value for the Best-of-N selection GUI
-    // test (#690): the chosen-vs-unpicked EMPHASIS is built from adaptive color
-    // (asserted for light/dark by the ImageRenderer snapshot test), which
-    // XCUITest cannot read — so the row also exposes its state as an
-    // accessibility value the seated test can assert (`chosen` highlighted,
-    // `unpicked` collapsed/dimmed, `pickable` before a choice). Empty on a
-    // tree-of-thought node, which is not a Best-of-N candidate.
-    // Selection-state probe for the seated GUI test (#690). A dedicated,
-    // non-interactive marker in an OVERLAY (zero layout impact) encodes the
-    // row's state INTO its accessibility identifier (`bestofn.candidate.<i>.
-    // pickable` → `.chosen` / `.unpicked`) — the assertable proxy for the
-    // adaptive-color emphasis XCUITest cannot see. State is in the identifier,
-    // not a value, because XCUITest reliably matches identifiers but does not
-    // surface `accessibilityValue` on a trait-less element. Kept OUT of the
-    // row's interactive subtree so it neither combines with nor hides the
-    // Select button (its own sibling element). Only on a candidate row.
+    // Selection-state probe for the seated GUI test (#690): a non-interactive
+    // 1pt overlay marker encodes the row's state into its accessibility
+    // identifier (`bestofn.candidate.<i>.pickable` → `.chosen` / `.unpicked`),
+    // the assertable proxy for the adaptive-color emphasis XCUITest cannot read.
+    // Kept OUT of the interactive subtree so it neither combines with nor hides
+    // the tappable option row.
     .overlay(alignment: .topLeading) {
-      if isBestOfN {
-        Color.clear
-          .frame(width: 1, height: 1)
-          .accessibilityElement()
-          .accessibilityIdentifier("bestofn.candidate.\(node.branchIndex ?? 0).\(bestOfNRowState)")
-      }
+      Color.clear
+        .frame(width: 1, height: 1)
+        .accessibilityElement()
+        .accessibilityIdentifier("bestofn.candidate.\(node.branchIndex ?? 0).\(bestOfNRowState)")
     }
+  }
+
+  /// The flat candidate card body: option glyph + the answer, always visible
+  /// (no fold, no title). `answerSelectable` is false while the whole card is a
+  /// pick target so a tap picks instead of starting a text drag.
+  @ViewBuilder private func flatCard(answerSelectable: Bool) -> some View {
+    HStack(alignment: .top, spacing: 6) {
+      optionGlyph
+      detail(selectable: answerSelectable)
+    }
+    .frame(maxWidth: .infinity, alignment: .leading)
   }
 
   /// Best-of-N selection state as a stable string for the seated GUI test —
   /// the assertable proxy for the adaptive-color emphasis. Empty for a
   /// tree-of-thought node (not a candidate).
+  ///  - `chosen`: the picked candidate (accent-highlighted).
+  ///  - `unpicked`: a non-chosen candidate in a READ-ONLY round (dimmed).
+  ///  - `pickable`: a candidate on the LIVE round — selectable AND re-selectable,
+  ///    so siblings stay `pickable` even after a choice (#708 click-to-reselect).
+  ///  - `unavailable`: a read-only round with no recorded choice.
   private var bestOfNRowState: String {
     guard isBestOfN else { return "" }
     if isChosen { return "chosen" }
@@ -332,15 +354,17 @@ private struct ToTNodeRow: View {
   }
 
   /// The node's answer, or an honest note for a non-`ok` node — never
-  /// rendered tag-soup.
-  @ViewBuilder private var detail: some View {
+  /// rendered tag-soup. `selectable` is false while the whole card is a pick
+  /// target (#708), so a tap on the answer body picks instead of starting a
+  /// text drag; true once the card is no longer pickable (drag-to-copy).
+  @ViewBuilder private func detail(selectable: Bool) -> some View {
     switch node.status {
     case .error:
       Text(node.error ?? "generation failed")
         .font(.caption2)
         .foregroundStyle(.red)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .textSelection(.enabled)
+        .textSelectable(selectable)
     case .incomplete:
       Text(node.error ?? "Incomplete — the node reasoned but produced no answer.")
         .font(.caption2)
@@ -354,7 +378,77 @@ private struct ToTNodeRow: View {
           .foregroundStyle(isPruned ? .tertiary : .primary)
           .strikethrough(isPruned, color: .secondary)
           .frame(maxWidth: .infinity, alignment: .leading)
-          .textSelection(.enabled)
+          .textSelectable(selectable)
+      }
+    }
+  }
+
+  /// The card's header line — option/beam glyph + headline + (when this is not a
+  /// pick target) an expand chevron. Plain content; the enclosing `cardStack`
+  /// decides whether it sits inside a pick Button or an expand-toggle Button.
+  @ViewBuilder private var headerRow: some View {
+    HStack(alignment: .firstTextBaseline, spacing: 6) {
+      if isBestOfN {
+        optionGlyph
+      } else {
+        beamGlyph
+        scoreBadge
+      }
+      // The node's answer as a one-line title above its full-answer detail.
+      // (Tree-of-thought only — Best-of-N candidates render flat with no title.)
+      Text(headline)
+        .font(.caption.monospaced())
+        .foregroundStyle(headlineTint)
+        .lineLimit(1)
+        .strikethrough(isPruned, color: .secondary)
+        .frame(maxWidth: .infinity, alignment: .leading)
+      // No chevron while the card is a pick target — a live pickable candidate
+      // is always shown expanded and the only affordance is "tap to pick".
+      if hasDetail, !isPickAction {
+        Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+          .font(.caption2)
+          .foregroundStyle(.tertiary)
+      }
+    }
+    .contentShape(Rectangle())
+  }
+
+  /// The answer card's content: header + (when expanded) the answer detail and
+  /// child subtree. When `headerTogglesExpand` the header is its own toggle
+  /// Button (carrying the `bestofn.option.<i>` id for the seated test);
+  /// otherwise the header is plain content inside the enclosing pick Button.
+  @ViewBuilder private func cardStack(answerSelectable: Bool, headerTogglesExpand: Bool) -> some View {
+    VStack(alignment: .leading, spacing: 4) {
+      if headerTogglesExpand {
+        Button { userExpanded = !isExpanded } label: { headerRow }
+          .buttonStyle(.plain)
+          .frame(maxWidth: .infinity, alignment: .leading)
+          .help(rowActionHelp)
+          .modifier(OptionalAccessibilityIdentifier(
+            id: isBestOfN ? "bestofn.option.\(node.branchIndex ?? 0)" : nil))
+      } else {
+        headerRow
+      }
+
+      if isExpanded {
+        // Tree-of-thought keeps its reasoning inline above the answer (#329/
+        // #413, unchanged). A Best-of-N candidate's reasoning is moved out of
+        // this card (rendered below) so the chosen accent fill never washes it.
+        if !isBestOfN, !node.reasoning.isEmpty {
+          ReasoningDisclosure(
+            reasoning: node.reasoning,
+            answerStarted: hasAnswer,
+            labelFont: .caption2,
+            bodyFont: .caption2.monospaced()
+          )
+          .padding(.leading, 4)
+        }
+        detail(selectable: answerSelectable)
+          .padding(.leading, 4)
+        ForEach(children) { child in
+          ToTNodeRow(tree: tree, node: child)
+            .padding(.leading, 14)
+        }
       }
     }
   }
@@ -382,26 +476,40 @@ private struct ToTNodeRow: View {
     }
   }
 
-  /// Score capsule: the 1–10 value, "err" for a failed node, "…" for an
-  /// incomplete (reasoned-but-unanswered) node, "—" when the scorer returned
-  /// nothing parseable.
+  /// Score capsule: a live "Scoring…" indicator while the value scorer runs
+  /// (content done, score not yet landed — the gap can be several seconds),
+  /// then the 1–10 value, "err" for a failed node, "…" for an incomplete
+  /// (reasoned-but-unanswered) node, "—" when the scorer returned nothing
+  /// parseable.
   @ViewBuilder private var scoreBadge: some View {
-    let (text, tint): (String, Color) = {
-      switch node.status {
-      case .error: return ("err", .red)
-      case .incomplete: return ("…", .orange)
-      default:
-        if let s = node.score { return ("\(s)", .accentColor) }
-        return ("—", .secondary)
+    if node.livePhase == .scoring {
+      HStack(spacing: 3) {
+        ProgressView().controlSize(.mini)
+        Text("Scoring…").font(.caption2)
       }
-    }()
-    Text(text)
-      .font(.caption2.monospacedDigit())
-      .foregroundStyle(tint)
-      .frame(minWidth: 20)
+      .foregroundStyle(.secondary)
       .padding(.horizontal, 4)
       .padding(.vertical, 1)
-      .background(tint.opacity(0.12), in: Capsule())
+      .background(Color.secondary.opacity(0.12), in: Capsule())
+      .help("Generating this node's value score")
+    } else {
+      let (text, tint): (String, Color) = {
+        switch node.status {
+        case .error: return ("err", .red)
+        case .incomplete: return ("…", .orange)
+        default:
+          if let s = node.score { return ("\(s)", .accentColor) }
+          return ("—", .secondary)
+        }
+      }()
+      Text(text)
+        .font(.caption2.monospacedDigit())
+        .foregroundStyle(tint)
+        .frame(minWidth: 20)
+        .padding(.horizontal, 4)
+        .padding(.vertical, 1)
+        .background(tint.opacity(0.12), in: Capsule())
+    }
   }
 
   /// One-line header preview: the answer's first line, a status word for an
@@ -415,6 +523,28 @@ private struct ToTNodeRow: View {
     default:
       if hasAnswer { return answer }
       return node.reasoning.isEmpty ? "…" : "thinking…"
+    }
+  }
+}
+
+private extension View {
+  /// Enables or disables text selection — `.textSelection(.enabled)` and
+  /// `.textSelection(.disabled)` have different result types, so a ternary
+  /// cannot pick between them; this branches at the modifier level instead.
+  @ViewBuilder func textSelectable(_ enabled: Bool) -> some View {
+    if enabled { textSelection(.enabled) } else { textSelection(.disabled) }
+  }
+}
+
+/// Applies an `accessibilityIdentifier` only when one is provided, leaving a
+/// tree-of-thought node's row untouched (it carries no Best-of-N identity).
+private struct OptionalAccessibilityIdentifier: ViewModifier {
+  let id: String?
+  func body(content: Content) -> some View {
+    if let id {
+      content.accessibilityIdentifier(id)
+    } else {
+      content
     }
   }
 }
@@ -434,10 +564,14 @@ private func bestOfNDemoTree() -> ToTTree {
     "Assign one owner per action item before anyone leaves.",
     "Open with the decision you need, not a status recap.",
   ]
+  // n1 carries a reasoning trace so the chosen-card "thinking vs answer"
+  // contrast (#708 C) is visible; the others have none (thinking is OFF for the
+  // best-of-n profile by default, #679 — the no-reasoning rows must show no box).
+  let reasoning = ["", "They want low-effort but memorable; an owner makes it stick.", ""]
   for (i, a) in answers.enumerated() {
     tree.apply(.nodeComplete(ToTNode(
       id: "n\(i)", parentID: "root", depth: 1, branchIndex: i,
-      content: a, score: nil, status: .ok)))
+      content: a, reasoning: reasoning[i], score: nil, status: .ok)))
   }
   tree.apply(.levelPruned(level: 1, kept: ["n0", "n1", "n2"]))
   tree.apply(.awaitingSelection(level: 1, candidates: [
@@ -450,16 +584,19 @@ private func bestOfNDemoTree() -> ToTTree {
 
 /// Renders the section with a candidate already chosen (`n1`) so the highlight
 /// + dim are visible. `chosenID` is interactive so the canvas can also exercise
-/// picking from the no-choice state.
+/// picking from the no-choice state. `interactive` toggles the live (re-pickable,
+/// nothing dimmed) vs read-only (chosen highlighted, rest dimmed) presentation.
 struct BestOfNHighlightPreviewHarness: View {
   @State var chosenID: String? = "n1"
+  var interactive: Bool = true
   var body: some View {
     TreeSearchSection(
       tree: bestOfNDemoTree(),
       answerStarted: false,
       selection: BestOfNSelectionContext(
-        pickableIDs: ["n0", "n1", "n2"],
+        pickableIDs: interactive ? ["n0", "n1", "n2"] : [],
         chosenID: chosenID,
+        isInteractive: interactive,
         onPick: { chosenID = $0 }))
       .padding()
       .frame(width: 420)
@@ -472,5 +609,9 @@ struct BestOfNHighlightPreviewHarness: View {
 
 #Preview("Best-of-N highlight — dark") {
   BestOfNHighlightPreviewHarness().preferredColorScheme(.dark)
+}
+
+#Preview("Best-of-N read-only history") {
+  BestOfNHighlightPreviewHarness(interactive: false).preferredColorScheme(.dark)
 }
 #endif

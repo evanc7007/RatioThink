@@ -8,6 +8,21 @@ import XCTest
 /// affordances are asserted without a view hierarchy.
 @MainActor
 final class NoModelLoadedPromptPlanTests: XCTestCase {
+  private final class StubXPCClient: AppXPCClient, @unchecked Sendable {
+    func helperProtocolVersion() async throws -> Int {
+      HelperProtocolCompatibility.currentVersion
+    }
+
+    func engineStatus() async throws -> EngineStatus {
+      throw AppXPCClientError.proxyTypeMismatch
+    }
+
+    func stopEngine() async throws {}
+
+    func startEngine(profileID: String, modelOverride: String?) async throws {}
+
+    func restartEngine(profileID: String, modelOverride: String?) async throws {}
+  }
 
   // #326 availability actions, built via the shared recovery decision so
   // no ModelDownloadTarget has to be constructed by hand.
@@ -144,6 +159,51 @@ final class NoModelLoadedPromptPlanTests: XCTestCase {
   }
 
   // MARK: - F2: busy keeps the download CTA on a fresh install
+
+  func test_initial_starting_placeholder_with_on_disk_default_offers_first_click_load() {
+    let target = ModelTarget(modelID: ProfileStore.defaultChatModelID, source: .profileDefault)
+    let state = ChatStartGate.evaluate(
+      engineStatus: .starting,
+      helperError: nil,
+      resolvedModelID: nil,
+      target: target,
+      profileError: nil,
+      hasReceivedEngineStatus: false
+    )
+    XCTAssertEqual(state, .needsLoad(target: target))
+
+    let p = plan(state, loadAction)
+    XCTAssertEqual(p.primary, .load)
+    XCTAssertTrue(p.showsModelChip)
+    XCTAssertFalse(p.showsWaitSpinner)
+  }
+
+  func test_failed_first_status_poll_still_treats_starting_as_placeholder_for_first_click_load() {
+    let status = EngineStatusStore(
+      client: StubXPCClient(),
+      tierPolicy: StatusTierPolicy(tier1Polls: 2, tier2Polls: 3)
+    )
+    status._applyPollForTesting(next: nil, error: "NSXPCConnectionInterrupted")
+    XCTAssertEqual(status.status, .starting)
+    XCTAssertEqual(status.pollCount, 1)
+    XCTAssertFalse(status.hasReceivedEngineStatus)
+
+    let target = ModelTarget(modelID: ProfileStore.defaultChatModelID, source: .profileDefault)
+    let state = ChatStartGate.evaluate(
+      engineStatus: status.status,
+      helperError: status.lastError,
+      resolvedModelID: nil,
+      target: target,
+      profileError: nil,
+      hasReceivedEngineStatus: status.hasReceivedEngineStatus
+    )
+    XCTAssertEqual(state, .needsLoad(target: target))
+
+    let p = plan(state, loadAction)
+    XCTAssertEqual(p.primary, .load)
+    XCTAssertTrue(p.showsModelChip)
+    XCTAssertFalse(p.showsWaitSpinner)
+  }
 
   func test_busy_starting_keeps_download_cta_when_not_downloaded() {
     let p = plan(.busy(.startingEngine), downloadAction)

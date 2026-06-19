@@ -70,6 +70,19 @@ final class ChatStartGateTests: XCTestCase {
                    .busy(.startingEngine))
   }
 
+  func test_initial_starting_placeholder_with_default_needs_default_load() {
+    XCTAssertEqual(
+      ChatStartGate.evaluate(
+        engineStatus: .starting,
+        helperError: nil,
+        resolvedModelID: nil,
+        target: ModelTarget(modelID: model, source: .profileDefault),
+        hasReceivedEngineStatus: false
+      ),
+      defaultTarget(model)
+    )
+  }
+
   func test_engine_stopping_is_busy() {
     XCTAssertEqual(eval(engine: .stopping, profileDefault: model),
                    .busy(.stoppingEngine))

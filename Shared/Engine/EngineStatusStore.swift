@@ -59,6 +59,14 @@ public final class EngineStatusStore: ObservableObject {
   /// `@Published` and change-guarded; tests observe those.
   public private(set) var pollCount: UInt64 = 0
 
+  /// Whether at least one helper `engineStatus()` poll returned an
+  /// `EngineStatus` value. Unlike `pollCount`, this does NOT flip for
+  /// transient transport failures, because those leave the initial
+  /// `.starting` placeholder semantically unknown. Chat's no-model gate
+  /// uses this to distinguish the placeholder from a genuine
+  /// helper-reported `.starting` engine.
+  @Published public private(set) var hasReceivedEngineStatus = false
+
   /// Signature of the engine failure the user has dismissed from the
   /// in-window error banner. The banner shows only while a failure is
   /// live AND its signature differs from this — so a Dismiss hides the
@@ -693,6 +701,7 @@ public final class EngineStatusStore: ObservableObject {
 
   private func apply(next: EngineStatus?, error: String?) {
     if let next {
+      if !hasReceivedEngineStatus { hasReceivedEngineStatus = true }
       // Successful poll — the helper answered. Clear the transport-loss
       // counter and mirror the reported status verbatim.
       consecutiveFailures = 0

@@ -253,6 +253,53 @@ final class HTTPEngineClientTests: XCTestCase {
     ])
   }
 
+  func test_chatCompletion_demuxes_usage_meta_frame() async throws {
+    // #711: the engine-true context meter rides a trailing `event:"usage"`
+    // meta-frame between the terminal chunk and `[DONE]`. It must demux to
+    // a `.usage` event (off the `.delta`/`.finish` content path) carrying
+    // the occupancy + window.
+    FakeSSEURLProtocol.handler = { _ in
+      .sse(chunks: [
+        "data: {\"event\":\"model_ready\"}\n\n",
+        #"data: {"choices":[{"index":0,"delta":{"role":"assistant","content":"hi"}}]}"# + "\n\n",
+        #"data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"# + "\n\n",
+        #"data: {"event":"usage","prompt_tokens":40,"completion_tokens":8,"total_tokens":48,"context_window":4096}"# + "\n\n",
+        "data: [DONE]\n\n",
+      ])
+    }
+    let req = ChatRequest(model: "m1", messages: [ChatMessage(role: .user, content: "hi")])
+    var events: [ChatEvent] = []
+    for try await ev in makeClient().chatCompletion(req) {
+      events.append(ev)
+    }
+    XCTAssertEqual(events, [
+      .modelReady,
+      .delta(role: .assistant, content: "hi"),
+      .finish(reason: .stop),
+      .usage(used: 48, window: 4096),
+    ])
+  }
+
+  func test_chatCompletion_usage_frame_without_window_yields_nil_window() async throws {
+    // The engine omits `context_window` when it could not measure the KV
+    // budget; the meter must surface `window: nil` (indeterminate) rather
+    // than defaulting to a wrong denominator.
+    FakeSSEURLProtocol.handler = { _ in
+      .sse(chunks: [
+        "data: {\"event\":\"model_ready\"}\n\n",
+        #"data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"# + "\n\n",
+        #"data: {"event":"usage","prompt_tokens":10,"completion_tokens":2,"total_tokens":12}"# + "\n\n",
+        "data: [DONE]\n\n",
+      ])
+    }
+    let req = ChatRequest(model: "m1", messages: [ChatMessage(role: .user, content: "hi")])
+    var events: [ChatEvent] = []
+    for try await ev in makeClient().chatCompletion(req) {
+      events.append(ev)
+    }
+    XCTAssertEqual(events.last, .usage(used: 12, window: nil))
+  }
+
   func test_chatCompletion_routes_reasoning_content_to_its_own_channel() async throws {
     // chat-apc wire order for a Qwen thinking turn: model_ready,
     // role chunk, reasoning_content deltas, then visible content, finish.
@@ -588,6 +635,51 @@ final class HTTPEngineClientTests: XCTestCase {
       frames.append(String(decoding: frame, as: UTF8.self))
     }
     XCTAssertEqual(frames, [#"{"frame":1}"#, #"{"frame":2}"#])
+  }
+
+  /// #703 transport decision: a `stream: false` CONTROL dispatch takes the
+  /// UNARY path — the inferlet's plain `application/json` ack (no `data:`
+  /// framing) is buffered whole and yielded as the stream's single frame. The
+  /// old SSE-only path would strip it (no `data:` lines) and surface zero
+  /// frames, hiding the release accounting.
+  func test_dispatchInferlet_unary_control_yields_unframed_json_body() async throws {
+    FakeSSEURLProtocol.handler = { _ in
+      .json(
+        status: 200,
+        body: #"{"object":"best_of_n.release","requested":3,"released":2,"absent":1}"#)
+    }
+    let req = InferletRequest(
+      inferlet: "best-of-n",
+      input: Data(#"{"release":["a","b","c"]}"#.utf8),
+      messages: nil,
+      stream: false)
+    var frames: [Data] = []
+    for try await frame in makeClient().dispatchInferlet(req) {
+      frames.append(frame)
+    }
+    XCTAssertEqual(frames.count, 1, "unary control returns exactly one buffered frame")
+    let ack = try JSONDecoder().decode(BestOfNReleaseAck.self, from: try XCTUnwrap(frames.first))
+    XCTAssertEqual(ack, BestOfNReleaseAck(requested: 3, released: 2, absent: 1))
+  }
+
+  /// The unary control path surfaces a non-2xx as an error (via `assertOK`)
+  /// rather than yielding a frame — the release must not silently "succeed" on
+  /// an HTTP failure.
+  func test_dispatchInferlet_unary_control_non_2xx_throws() async {
+    FakeSSEURLProtocol.handler = { _ in
+      .json(status: 500, body: #"{"error":{"code":"boom","message":"nope"}}"#)
+    }
+    let req = InferletRequest(
+      inferlet: "best-of-n",
+      input: Data(#"{"release":["a"]}"#.utf8),
+      messages: nil,
+      stream: false)
+    do {
+      for try await _ in makeClient().dispatchInferlet(req) {}
+      XCTFail("expected a non-2xx unary control response to throw")
+    } catch {
+      // expected
+    }
   }
 
   // MARK: - Connection-lost retry (stale keep-alive reuse)

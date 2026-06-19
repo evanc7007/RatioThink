@@ -60,5 +60,8 @@ pub(crate) fn round_params(
         exec: ExecStrategy::default(),
         // Best-of-N rounds are a conversational path — keep the shipped scorer.
         task: TotTask::Chat,
+        // Best-of-N's divergence is the per-candidate directive pair; it does
+        // not use the ToT cross-sibling token penalty (#693c).
+        sibling_penalty: 0.0,
     }
 }
