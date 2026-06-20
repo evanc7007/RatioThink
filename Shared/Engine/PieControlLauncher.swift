@@ -203,7 +203,7 @@ public enum PieControlLauncher {
   /// process-lifetime lease.
   public static let coldStartHandshakeTimeout: TimeInterval = TimeInterval(requestTimeoutCeilingSeconds)
 
-  /// #736 — how long to wait for pie's inferlet daemon to report its
+  /// — how long to wait for pie's inferlet daemon to report its
   /// OS-assigned HTTP port after `launch_daemon`. The daemon binds immediately
   /// (the model is already resident from `pie serve` boot — no weight load
   /// here), so this is a short transport lease, not a cold-boot lease. On
@@ -736,6 +736,14 @@ public enum PieControlLauncher {
       requestTimeoutSeconds: spec.requestTimeoutSeconds
     )
 
+    // reap-before-spawn BACKSTOP: before bringing up a new engine, finish
+    // reaping any prior one that a SIGKILL / crash orphaned (durable engine.pid
+    // from a dead Helper incarnation, or an .unreaped shutdown). Targeted +
+    // identity-verified against the pie binary — never a blanket pie sweep.
+    if let reaped = EngineReaper.reapStaleOwnedProcess(expectedBinaryPath: spec.pieBinary.path) {
+      DiagnosticLog.helper.event("engine.reap_stale", [("pid", String(reaped))])
+    }
+
     let proc = Process()
     proc.executableURL = spec.pieBinary
     proc.arguments = ["serve", "--config", configURL.path, "--no-auth", "--debug"]
@@ -756,9 +764,19 @@ public enum PieControlLauncher {
     } catch {
       throw LaunchError.spawnFailed(underlying: "\(error)")
     }
-    spec.pidSink?(proc.processIdentifier)
+    let pid = proc.processIdentifier
+    // OS-enforced ownership: put pie in its OWN process group so the engine
+    // subtree is reaped with killpg and can never escape its owner. Best-effort
+    // — if the child already exec'd, setpgid races to EACCES, pgid stays 0, and
+    // teardown falls back to kill(pid) (pie is single-process on the Mac
+    // portable path). Record + persist BEFORE the handshake wait so a crash
+    // mid-launch still reaps via the signal-safe slots and the next launch's
+    // backstop can find a SIGKILL-orphaned engine via the durable engine.pid.
+    let pgid: Int32 = (setpgid(pid, pid) == 0) ? pid : 0
+    EngineReaper.own(pid: pid, pgid: pgid, binaryPath: spec.pieBinary.path)
+    spec.pidSink?(pid)
     DiagnosticLog.helper.event("engine.launch", [
-      ("pid", String(proc.processIdentifier)),
+      ("pid", String(pid)),
       ("profile", spec.profileID),
       ("binary", DiagnosticLog.redactHome(spec.pieBinary.path)),
       ("config", DiagnosticLog.redactHome(configURL.path)),
@@ -776,7 +794,8 @@ public enum PieControlLauncher {
     let session = LaunchedSession(process: proc,
                                   stdout: stdout,
                                   shmemName: spec.shmemName,
-                                  pieHome: spec.pieHome)
+                                  pieHome: spec.pieHome,
+                                  pgid: pgid)
     _ = await session.residentMemoryBytes()
 
     let handshake: Handshake
@@ -824,19 +843,27 @@ public enum PieControlLauncher {
       try await client.installProgram(wasmURL: spec.wasmURL,
                                       manifestURL: spec.manifestURL,
                                       forceOverwrite: true)
-      // #736: pass port 0 so pie's inferlet daemon binds an OS-assigned free
+      // pass port 0 so pie's inferlet daemon binds an OS-assigned free
       // port at bind time, then learn the actual port from pie's own "Daemon
       // serving HTTP on …" log line. This eliminates the old
       // reserve-bind-close-reuse TOCTOU in `reserveFreePort()`: an App-chosen
       // port could be stolen in the window between our `close()` and pie's
       // later `bind()`. With the OS choosing at bind time the port cannot be
       // stolen, and nobody but pie knows it until it is already bound.
+      //
+      // build-9 fix: that line is `tracing::info!` → it lands ONLY in
+      // <pieHome>/logs/pie.log, NEVER on the captured stdout (build-8 watched
+      // stdout and hung 30s every launch). Snapshot the log cursor BEFORE
+      // launch_daemon so the post-launch scan can't pick up a stale port from
+      // an earlier same-day launch sharing the rolling daily file.
+      let logCursor = PieControlLauncher.daemonLogCursor(pieHome: spec.pieHome)
       try await client.launchDaemon(
         inferlet: spec.inferletNameAtVersion,
         port: 0,
         host: spec.daemonBindHost.daemonHost
       )
-      httpPort = try await session.awaitDaemonPort(timeout: PieControlLauncher.daemonBindTimeout)
+      httpPort = try await session.awaitDaemonPort(
+        baseline: logCursor, timeout: PieControlLauncher.daemonBindTimeout)
       await client.close()
     } catch is CancellationError {
       _ = await session.residentMemoryBytes()
@@ -901,7 +928,7 @@ public enum PieControlLauncher {
 
   // MARK: - daemon port
 
-  /// #736 — parse pie's inferlet-daemon "serving" log line to learn the
+  /// — parse pie's inferlet-daemon "serving" log line to learn the
   /// OS-assigned HTTP port. pie logs `Daemon serving HTTP on
   /// http://127.0.0.1:<port>/` right after it binds (runtime `daemon.rs`
   /// `serve`). Pure so the wire-format contract is unit-tested without a live
@@ -916,6 +943,74 @@ public enum PieControlLauncher {
           let port = UInt16(line[capture])
     else { return nil }
     return port
+  }
+
+  // MARK: - daemon log source-of-truth (build-9 fix)
+
+  // The "Daemon serving HTTP on …" line is a `tracing::info!`
+  // (Vendor/pie/runtime/src/daemon.rs), and `pie serve` ALWAYS sets
+  // `log_dir = <pie_home>/logs` (server/src/bootstrap_translate.rs) — which
+  // makes init_tracing route ALL tracing to a rolling file and DISABLE the
+  // stdout layer (`stdout_layer = if log_dir.is_none()`). So the line never
+  // reaches the engine's captured stdout/stderr (build-8's bug: it watched
+  // stdout and timed out forever). The pie.log file is therefore the SINGLE
+  // source of truth — we read it, not stdout. (The handshake markers we read
+  // off stdout are `eprintln!`, a different, always-captured path.) Because the
+  // line is logged AFTER the daemon binds, learning the port from it also
+  // proves the daemon is already listening — closing the pre-"connect
+  // before bind" race for free.
+
+  /// A position in the pie.log rolling-file stream, captured BEFORE
+  /// `launch_daemon` so the scan ignores a stale "Daemon serving" line left by
+  /// an earlier launch that shares the same daily file.
+  public struct DaemonLogCursor: Sendable, Equatable {
+    let file: URL?
+    let offset: UInt64
+    public static let zero = DaemonLogCursor(file: nil, offset: 0)
+  }
+
+  private static func daemonLogDir(pieHome: URL) -> URL {
+    pieHome.appendingPathComponent("logs")
+  }
+
+  /// Newest `pie.log*` in `<pieHome>/logs` (tracing_appender writes
+  /// `pie.log.YYYY-MM-DD`, rolling daily), by modification time.
+  static func newestDaemonLog(pieHome: URL) -> URL? {
+    let dir = daemonLogDir(pieHome: pieHome)
+    guard let entries = try? FileManager.default.contentsOfDirectory(
+      at: dir, includingPropertiesForKeys: [.contentModificationDateKey], options: [])
+    else { return nil }
+    return entries
+      .filter { $0.lastPathComponent.hasPrefix("pie.log") }
+      .max { a, b in
+        let am = (try? a.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+        let bm = (try? b.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+        return am < bm
+      }
+  }
+
+  /// Snapshot the end of the current newest pie.log so the post-launch scan
+  /// only considers bytes written from now on (this launch's daemon line).
+  static func daemonLogCursor(pieHome: URL) -> DaemonLogCursor {
+    guard let file = newestDaemonLog(pieHome: pieHome) else { return .zero }
+    let size = ((try? FileManager.default.attributesOfItem(atPath: file.path))?[.size] as? NSNumber)?.uint64Value ?? 0
+    return DaemonLogCursor(file: file, offset: size)
+  }
+
+  /// Scan the newest pie.log for THIS launch's daemon port, reading only bytes
+  /// after `baseline` (same file) or the whole file (a newer/rolled file). The
+  /// first match past the baseline is this launch's bound port. Returns nil
+  /// until the line has been written (caller polls).
+  public static func scanDaemonPort(pieHome: URL, baseline: DaemonLogCursor) -> UInt16? {
+    guard let file = newestDaemonLog(pieHome: pieHome),
+          let data = try? Data(contentsOf: file) else { return nil }
+    let start: Int = (file == baseline.file) ? min(Int(baseline.offset), data.count) : 0
+    let slice = data.subdata(in: start..<data.count)
+    guard let text = String(data: slice, encoding: .utf8) else { return nil }
+    for line in text.split(whereSeparator: \.isNewline) {
+      if let port = daemonPort(from: String(line)) { return port }
+    }
+    return nil
   }
 
   // MARK: - config + port file
@@ -1159,6 +1254,10 @@ public actor LaunchedSession {
   private let stdout: Pipe  // stderr is merged into this (see launch())
   private let shmemName: String
   private let pieHome: URL
+  /// pie's own process-group id when `setpgid` succeeded at spawn (0 =
+  /// not its own group → fall back to killing the pid). Teardown `killpg`s this
+  /// so the whole engine subtree is reaped, then clears EngineReaper ownership.
+  private let pgid: Int32
   /// Last 32 lines are enough for a timeout diagnostic.
   private static let recentLineLimit = 32
   private static let residentMemorySampleInterval: TimeInterval = 0.05
@@ -1183,11 +1282,12 @@ public actor LaunchedSession {
   private static let livenessProbeTimeout: TimeInterval = 5
 
   init(process: Process, stdout: Pipe,
-       shmemName: String, pieHome: URL) {
+       shmemName: String, pieHome: URL, pgid: Int32 = 0) {
     self.process = process
     self.stdout = stdout
     self.shmemName = shmemName
     self.pieHome = pieHome
+    self.pgid = pgid
     self.residentMemorySampler =
       Self.residentMemorySamplerOverride.get() ?? { pid in LaunchedSession.residentMemory(ofPID: pid) }
     self.outputTailerStarted = true
@@ -1419,9 +1519,25 @@ public actor LaunchedSession {
         if let killFailure = sendSignalQuiet(SIGKILL, label: "SIGKILL") {
           failures.append(killFailure)
         }
-        let killed = await waitForExit(timeout: 5)
+        var killed = await waitForExit(timeout: 5)
+        // escalate-until-reaped: a single SIGKILL+5s give-up left an
+        // orphan owned by nobody. Re-send SIGKILL on a bounded ladder before
+        // conceding, so a process briefly unkillable (mid mmap fault) is still
+        // reaped rather than declared a permanent leak.
+        var extraAttempts = 0
+        while !killed && extraAttempts < 3 {
+          extraAttempts += 1
+          DiagnosticLog.helper.event("engine.signal", [
+            ("reason", reason),
+            ("pid", String(pid)),
+            ("signal", "SIGKILL"),
+            ("attempt", String(extraAttempts + 1)),
+          ])
+          _ = sendSignalQuiet(SIGKILL, label: "SIGKILL")
+          killed = await waitForExit(timeout: 3)
+        }
         if !killed {
-          let failure = "SIGKILL + 5s waitpid window did not reap pid \(process.processIdentifier); leaking to process exit"
+          let failure = "SIGKILL ×\(extraAttempts + 1) did not reap pid \(process.processIdentifier); next launch's reap-before-spawn backstop will finish it"
           failures.append(failure)
           diagnose(failure)
         }
@@ -1451,8 +1567,13 @@ public actor LaunchedSession {
     shmUnlinkQuiet(shmemName)
 
     guard !process.isRunning else {
+      // leave the durable engine.pid + signal-safe slots intact so the
+      // next launch's reap-before-spawn backstop finishes reaping this pid.
       return .unreaped(failures.joined(separator: "; "))
     }
+    // reaped cleanly — drop ownership so neither the exit handler nor the
+    // next-launch backstop targets an already-dead (or recycled) pid.
+    EngineReaper.release()
     return .reaped
   }
 
@@ -1548,43 +1669,46 @@ public actor LaunchedSession {
     })
   }
 
-  /// #736 — after `launch_daemon` with port 0, wait for pie to report the
+  /// — after `launch_daemon` with port 0, wait for pie to report the
   /// OS-assigned inferlet-daemon HTTP port via its "Daemon serving HTTP on
   /// http://…/" log line (parsed by `PieControlLauncher.daemonPort(from:)`).
   /// `replayRecent: true` covers the line already having been emitted before
   /// we subscribe (the daemon binds immediately after `launch_daemon`). On
   /// timeout or a closed stdout this throws a transient `.clientError`, so the
   /// `PieEngineHost` launch-retry ladder re-attempts rather than going terminal.
-  func awaitDaemonPort(timeout: TimeInterval) async throws -> UInt16 {
+  /// build-9 — learn the daemon's OS-assigned HTTP port by polling pie's
+  /// rolling log file (the ONLY sink that carries the "Daemon serving" line;
+  /// see the notes on `PieControlLauncher.scanDaemonPort`). `baseline` is the
+  /// log cursor captured before `launch_daemon`, so a stale line from an
+  /// earlier same-day launch is ignored. Reading existing file content each
+  /// poll covers the race where pie wrote the line before this watcher
+  /// attached; polling covers the line arriving after. Fails fast (transient
+  /// `engineExitedEarly`) if the engine process exits before the line appears,
+  /// else throws a transient timeout — both let the host launch-retry ladder
+  /// re-attempt.
+  func awaitDaemonPort(baseline: PieControlLauncher.DaemonLogCursor,
+                       timeout: TimeInterval) async throws -> UInt16 {
     let started = Date()
-    let lines = outputTail.subscribe(replayRecent: true)
-    startOutputTailer()
-    return try await withThrowingTaskGroup(of: UInt16.self) { group in
-      group.addTask {
-        for await line in lines {
-          if let port = PieControlLauncher.daemonPort(from: line) {
-            return port
-          }
-        }
-        // stdout EOF before the daemon reported a port — the engine likely
-        // died; surface as transient so the host retries.
-        throw PieControlLauncher.LaunchError.clientError(
-          underlying: "pie closed stdout before reporting a daemon HTTP port")
+    let deadline = started.addingTimeInterval(timeout)
+    while Date() < deadline {
+      try Task.checkCancellation()
+      if let port = PieControlLauncher.scanDaemonPort(pieHome: pieHome, baseline: baseline) {
+        return port
       }
-      group.addTask { [weak self] in
-        try await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
-        let tail = (await self?.recentLines()) ?? []
-        throw PieControlLauncher.LaunchError.clientError(
-          underlying: "pie did not report a daemon HTTP port within "
-            + "\(Int(Date().timeIntervalSince(started)))s; last lines: \(tail.joined(separator: " | "))")
+      if await confirmedExit() {
+        throw PieControlLauncher.LaunchError.engineExitedEarly(
+          code: terminationStatusIfExited(),
+          reason: terminationReasonIfExited() ?? .exit,
+          stderrTail: recentLines().joined(separator: "\n"),
+          rssBytes: await observedResidentMemoryBytes())
       }
-      defer { group.cancelAll() }
-      guard let first = try await group.next() else {
-        throw PieControlLauncher.LaunchError.clientError(
-          underlying: "daemon-port wait produced no result")
-      }
-      return first
+      try await Task.sleep(nanoseconds: 100_000_000)
     }
+    let tail = recentLines()
+    throw PieControlLauncher.LaunchError.clientError(
+      underlying: "pie did not log a daemon HTTP port within "
+        + "\(Int(Date().timeIntervalSince(started)))s "
+        + "(<pieHome>/logs/pie.log); last stdout: \(tail.joined(separator: " | "))")
   }
 
   private func recentLines() -> [String] { outputTail.recentLines() }
@@ -1884,7 +2008,10 @@ public actor LaunchedSession {
   }
 
   private func sendSignalQuiet(_ sig: Int32, label: String) -> String? {
-    let rc = kill(process.processIdentifier, sig)
+    // signal pie's OWN process group when it has one, so the whole engine
+    // subtree is reaped; fall back to the pid otherwise (pgid 0 = setpgid raced
+    // at spawn, and pie is single-process on the Mac portable path anyway).
+    let rc = pgid > 0 ? killpg(pgid, sig) : kill(process.processIdentifier, sig)
     if rc != 0 {
       let e = errno
       if e == ESRCH {
