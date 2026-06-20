@@ -30,7 +30,7 @@ import os
 /// candidate snapshot stays alive until think-more / stop.
 enum BestOfNAction: Equatable {
   case pick(String)
-  case thinkMore
+  case thinkMore(String?)
   case stop
 }
 
@@ -61,6 +61,7 @@ struct MessageBubble: View {
 
   @State private var isEditing = false
   @State private var editText = ""
+  @State private var bestOfNComment = ""
 
   var body: some View {
     switch message.role {
@@ -205,21 +206,34 @@ struct MessageBubble: View {
   /// free since every candidate snapshot is alive until think-more / use-this
   /// (#708 click-to-reselect, replacing the short-lived Go back button).
   private var bestOfNControls: some View {
-    HStack(spacing: 8) {
-      Button { onBestOfN?(.thinkMore) } label: {
-        Label("Think more", systemImage: "arrow.down.circle")
+    VStack(alignment: .leading, spacing: 6) {
+      TextField("Optional guidance for the next round", text: $bestOfNComment, axis: .vertical)
+        .textFieldStyle(.roundedBorder)
+        .font(.caption)
+        .lineLimit(1...3)
+        .accessibilityIdentifier("bestofn.comment")
+      HStack(spacing: 8) {
+        Button { onBestOfN?(.thinkMore(normalizedBestOfNComment)) } label: {
+          Label("Think more", systemImage: "arrow.down.circle")
+        }
+        .buttonStyle(.bordered)
+        .controlSize(.small)
+        .accessibilityIdentifier("bestofn.thinkMore")
+        Button { onBestOfN?(.stop) } label: {
+          Label("Use this", systemImage: "checkmark.circle")
+        }
+        .buttonStyle(.borderedProminent)
+        .controlSize(.small)
+        .accessibilityIdentifier("bestofn.useThis")
       }
-      .buttonStyle(.bordered)
-      .controlSize(.small)
-      .accessibilityIdentifier("bestofn.thinkMore")
-      Button { onBestOfN?(.stop) } label: {
-        Label("Use this", systemImage: "checkmark.circle")
-      }
-      .buttonStyle(.borderedProminent)
-      .controlSize(.small)
-      .accessibilityIdentifier("bestofn.useThis")
     }
     .font(.caption)
+  }
+
+  /// Empty/whitespace guidance preserves the exact #690 think-more wire.
+  private var normalizedBestOfNComment: String? {
+    let trimmed = bestOfNComment.trimmingCharacters(in: .whitespacesAndNewlines)
+    return trimmed.isEmpty ? nil : trimmed
   }
 
   // MARK: - inline edit (#624)

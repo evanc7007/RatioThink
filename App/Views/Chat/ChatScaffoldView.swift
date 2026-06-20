@@ -975,13 +975,14 @@ struct ChatScaffoldView: View {
       message.bestOfN = try? JSONEncoder().encode(round)
       try? modelContext.save()
 
-    case .thinkMore:
+    case let .thinkMore(selectedComment):
       guard let chosen = round.chosen,
             let pickedText = bestOfNCandidateText(message: message, nodeID: chosen.id)
       else { return }
       let resume = ChatSendController.BestOfNResume(
         pickedName: chosen.snapshotName,
         pickedText: pickedText,
+        selectedComment: selectedComment,
         unpicked: round.unpickedSnapshotNames(excluding: chosen.id),
         level: round.level + 1)
       // Dispatch the next round FIRST, while THIS round is still content-empty:

@@ -38,6 +38,7 @@
 
 use futures::future::join_all;
 use futures::lock::Mutex;
+use std::borrow::Cow;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use wstd::http::server::{Finished, Responder};
@@ -48,7 +49,7 @@ use inferlet::model::Model;
 use crate::chat::completions::{self, ChatMessage};
 use crate::sse::{self, Emitter};
 use crate::tot::branch::{
-    self, emit_level, emit_tree_start, generate_branch, BranchSink, DemuxKind, Node, NodeStatus,
+    self, BranchSink, DemuxKind, Node, NodeStatus, emit_level, emit_tree_start, generate_branch,
 };
 
 mod divergence;
@@ -77,8 +78,13 @@ fn resolve_model(model: Option<&str>) -> Result<(Model, String), (u16, &'static 
             format!("Model '{model_id}' not registered with this engine"),
         ));
     }
-    let model = Model::load(&model_id)
-        .map_err(|e| (500, "model_load_failed", format!("Failed to load model: {e}")))?;
+    let model = Model::load(&model_id).map_err(|e| {
+        (
+            500,
+            "model_load_failed",
+            format!("Failed to load model: {e}"),
+        )
+    })?;
     Ok((model, model_id))
 }
 
@@ -150,7 +156,10 @@ pub async fn dispatch(
         return release::dispatch_release(&model, &names, res).await;
     }
 
-    let is_resume = input.resume_from.is_some();
+    let is_resume = input
+        .resume_from
+        .as_deref()
+        .is_some_and(|name| !name.trim().is_empty());
 
     let mut messages = match (input.messages.clone(), messages) {
         (Some(m), _) => m,
@@ -177,7 +186,8 @@ pub async fn dispatch(
             .await;
     }
     if let Some((i, _)) = messages.iter().enumerate().find(|(_, m)| {
-        m.content_str().is_none_or(|content| content.trim().is_empty())
+        m.content_str()
+            .is_none_or(|content| content.trim().is_empty())
     }) {
         return res
             .respond(sse::json_error(
@@ -210,7 +220,12 @@ pub async fn dispatch(
         Ok(p) => p,
         Err((field, msg)) => {
             return res
-                .respond(completions::json_error_param(400, "invalid_request", &msg, field))
+                .respond(completions::json_error_param(
+                    400,
+                    "invalid_request",
+                    &msg,
+                    field,
+                ))
                 .await;
         }
     };
@@ -240,8 +255,16 @@ pub async fn dispatch(
         let mut ops = InferletResumeOps { model: &model };
         let picked = input.resume_from.as_deref().unwrap_or_default();
         let picked_text = input.picked_text.as_deref().unwrap_or_default();
+        let selected_comment = input.selected_comment.as_deref();
         let unpicked = input.unpicked.clone().unwrap_or_default();
-        match resume_base_with(&mut ops, picked, picked_text, &messages, &unpicked) {
+        match resume_base_with(
+            &mut ops,
+            picked,
+            picked_text,
+            selected_comment,
+            &messages,
+            &unpicked,
+        ) {
             Ok((mut ctx, _warm)) => {
                 if let Err(e) = ctx.flush().await {
                     return res
@@ -275,7 +298,11 @@ pub async fn dispatch(
         if let Err((code, msg)) =
             completions::fill_context(&mut root_ctx, &model, &messages, None, false)
         {
-            let status = if completions::is_role_error_code(code) { 400 } else { 500 };
+            let status = if completions::is_role_error_code(code) {
+                400
+            } else {
+                500
+            };
             return res.respond(sse::json_error(status, code, &msg)).await;
         }
         if let Err(e) = root_ctx.flush().await {
@@ -413,8 +440,7 @@ async fn run_round(
         let node = match demux.kind {
             DemuxKind::Answered => {
                 let snapshot_name = format!("bon/{request_id}/{}/{}", params.level, idx);
-                let saved =
-                    save_candidate_snapshot(&base_ctx, &demux.answer, &snapshot_name).await;
+                let saved = save_candidate_snapshot(&base_ctx, &demux.answer, &snapshot_name).await;
                 if saved {
                     kept.push(node_id.clone());
                     picks.push(stream::Pick {
@@ -459,9 +485,7 @@ async fn run_round(
                 stream::NO_CANDIDATES_MESSAGE,
             ))
             .await;
-    } else if let Err(e) =
-        stream::emit_awaiting_selection(&mut em, params.level, &picks).await
-    {
+    } else if let Err(e) = stream::emit_awaiting_selection(&mut em, params.level, &picks).await {
         // #703 F5 (widened, review F2): delivery of the pick list failed. The
         // orphan condition is identical for BOTH `EmitError` variants —
         // `Disconnected` (client dropped) and `Serialize` (a host-visible
@@ -586,10 +610,13 @@ trait ResumeOps {
     fn open(&mut self, name: &str) -> Option<Self::Ctx>;
     /// Re-prefill fallback: rebuild the base from the conversation plus the
     /// picked candidate appended as an assistant turn.
-    fn reprefill(&mut self, messages: &[ChatMessage], picked_text: &str)
-        -> Result<Self::Ctx, (&'static str, String)>;
-    /// Append the deepen instruction as a user turn.
-    fn append_deepen(&mut self, ctx: &mut Self::Ctx);
+    fn reprefill(
+        &mut self,
+        messages: &[ChatMessage],
+        picked_text: &str,
+    ) -> Result<Self::Ctx, (&'static str, String)>;
+    /// Append the deepen instruction (plus optional selected-round guidance) as a user turn.
+    fn append_deepen(&mut self, ctx: &mut Self::Ctx, selected_comment: Option<&str>);
 }
 
 /// Build the think-more base: delete the unpicked siblings (deterministic
@@ -600,6 +627,7 @@ fn resume_base_with<O: ResumeOps>(
     ops: &mut O,
     picked: &str,
     picked_text: &str,
+    selected_comment: Option<&str>,
     messages: &[ChatMessage],
     unpicked: &[String],
 ) -> Result<(O::Ctx, bool), (&'static str, String)> {
@@ -617,8 +645,9 @@ fn resume_base_with<O: ResumeOps>(
         None => (ops.reprefill(messages, picked_text)?, false),
     };
 
-    // 3. Deepen instruction for the next level.
-    ops.append_deepen(&mut base);
+    // 3. Deepen instruction for the next level, with optional user guidance
+    //    appended after the picked branch prefix.
+    ops.append_deepen(&mut base, selected_comment);
 
     // 4. On the warm path the named picked snapshot is now redundant (we hold a
     //    live fork of it and will save fresh per-candidate snapshots), so free
@@ -651,7 +680,9 @@ impl ResumeOps for InferletResumeOps<'_> {
                 // snapshot regression — which would make every think-more round
                 // silently re-prefill and leave the warm-resume path dead.
                 // Log so the two are distinguishable; the fallback is unchanged.
-                eprintln!("[chat-apc] best-of-n: snapshot open miss for {name}: {e}; re-prefilling");
+                eprintln!(
+                    "[chat-apc] best-of-n: snapshot open miss for {name}: {e}; re-prefilling"
+                );
                 None
             }
         }
@@ -662,8 +693,8 @@ impl ResumeOps for InferletResumeOps<'_> {
         messages: &[ChatMessage],
         picked_text: &str,
     ) -> Result<Context, (&'static str, String)> {
-        let mut ctx = Context::new(self.model)
-            .map_err(|e| ("context_create_failed", e.to_string()))?;
+        let mut ctx =
+            Context::new(self.model).map_err(|e| ("context_create_failed", e.to_string()))?;
         // cue:false — the shared prefix stays cue-free; per-branch cues happen
         // in `generate_branch`.
         completions::fill_context(&mut ctx, self.model, messages, None, false)
@@ -674,9 +705,19 @@ impl ResumeOps for InferletResumeOps<'_> {
         Ok(ctx)
     }
 
-    fn append_deepen(&mut self, ctx: &mut Context) {
-        ctx.user(DEEPEN_DIRECTIVE);
+    fn append_deepen(&mut self, ctx: &mut Context, selected_comment: Option<&str>) {
+        let directive = deepen_directive(selected_comment);
+        ctx.user(directive.as_ref());
     }
+}
+
+fn deepen_directive(selected_comment: Option<&str>) -> Cow<'static, str> {
+    let Some(comment) = selected_comment.map(str::trim).filter(|c| !c.is_empty()) else {
+        return Cow::Borrowed(DEEPEN_DIRECTIVE);
+    };
+    Cow::Owned(format!(
+        "{DEEPEN_DIRECTIVE}\n\nUser guidance for this next round: {comment}"
+    ))
 }
 
 #[cfg(test)]
@@ -710,7 +751,9 @@ mod tests {
             if self.open_misses {
                 None
             } else {
-                Some(MockCtx { log: vec![format!("open:{name}")] })
+                Some(MockCtx {
+                    log: vec![format!("open:{name}")],
+                })
             }
         }
 
@@ -727,9 +770,14 @@ mod tests {
             })
         }
 
-        fn append_deepen(&mut self, ctx: &mut MockCtx) {
-            ctx.log.push("deepen".to_string());
-            self.calls.borrow_mut().push("deepen".to_string());
+        fn append_deepen(&mut self, ctx: &mut MockCtx, selected_comment: Option<&str>) {
+            let comment = selected_comment.map(str::trim).filter(|c| !c.is_empty());
+            let entry = match comment {
+                Some(comment) => format!("deepen:{comment}"),
+                None => "deepen".to_string(),
+            };
+            ctx.log.push(entry.clone());
+            self.calls.borrow_mut().push(entry);
         }
     }
 
@@ -744,12 +792,16 @@ mod tests {
 
     #[test]
     fn warm_start_opens_drops_unpicked_and_the_picked_snapshot() {
-        let mut ops = MockOps { open_misses: false, calls: RefCell::new(Vec::new()) };
+        let mut ops = MockOps {
+            open_misses: false,
+            calls: RefCell::new(Vec::new()),
+        };
         let messages = vec![msg("user", "2+2?")];
         let (base, warm) = resume_base_with(
             &mut ops,
             "bon/r0/1/2",
             "It is 4.",
+            None,
             &messages,
             &["bon/r0/1/0".to_string(), "bon/r0/1/1".to_string()],
         )
@@ -759,7 +811,10 @@ mod tests {
         // Warm path opened, never re-prefilled.
         assert_eq!(base.log, vec!["open:bon/r0/1/2", "deepen"]);
         let calls = ops.calls.borrow();
-        assert!(!calls.iter().any(|c| c.starts_with("reprefill")), "warm path must not re-prefill");
+        assert!(
+            !calls.iter().any(|c| c.starts_with("reprefill")),
+            "warm path must not re-prefill"
+        );
         // Unpicked siblings dropped first, then deepen, then the now-redundant
         // picked snapshot dropped too.
         assert_eq!(
@@ -775,19 +830,82 @@ mod tests {
     }
 
     #[test]
+    fn selected_comment_is_appended_after_picked_prefix_on_warm_resume() {
+        let mut ops = MockOps {
+            open_misses: false,
+            calls: RefCell::new(Vec::new()),
+        };
+        let messages = vec![msg("user", "Draft a plan")];
+        let (base, warm) = resume_base_with(
+            &mut ops,
+            "bon/r0/1/1",
+            "Use a phased launch.",
+            Some("Emphasize launch risks and mitigations."),
+            &messages,
+            &["bon/r0/1/0".to_string()],
+        )
+        .expect("warm resume with guidance");
+
+        assert!(warm);
+        assert_eq!(
+            base.log,
+            vec![
+                "open:bon/r0/1/1",
+                "deepen:Emphasize launch risks and mitigations.",
+            ],
+            "comment guidance must be appended after the picked snapshot prefix"
+        );
+    }
+
+    #[test]
+    fn selected_comment_is_appended_after_picked_text_on_reprefill_resume() {
+        let mut ops = MockOps {
+            open_misses: true,
+            calls: RefCell::new(Vec::new()),
+        };
+        let messages = vec![msg("user", "Draft a plan")];
+        let (base, warm) = resume_base_with(
+            &mut ops,
+            "bon/r0/1/1",
+            "Use a phased launch.",
+            Some("Emphasize launch risks and mitigations."),
+            &messages,
+            &["bon/r0/1/0".to_string()],
+        )
+        .expect("cold resume with guidance");
+
+        assert!(!warm);
+        assert_eq!(
+            base.log,
+            vec![
+                "reprefill:Use a phased launch.",
+                "deepen:Emphasize launch risks and mitigations.",
+            ],
+            "comment guidance must be appended after re-prefilling messages + picked text"
+        );
+    }
+
+    #[test]
     fn open_miss_falls_back_to_reprefill_from_messages_and_picked_text() {
-        let mut ops = MockOps { open_misses: true, calls: RefCell::new(Vec::new()) };
+        let mut ops = MockOps {
+            open_misses: true,
+            calls: RefCell::new(Vec::new()),
+        };
         let messages = vec![msg("user", "2+2?")];
         let (base, warm) = resume_base_with(
             &mut ops,
             "bon/r0/1/2",
             "It is 4.",
+            None,
             &messages,
             &["bon/r0/1/0".to_string()],
         )
         .expect("reprefill fallback");
 
-        assert!(!warm, "open() miss should report a cold (re-prefilled) start");
+        assert!(
+            !warm,
+            "open() miss should report a cold (re-prefilled) start"
+        );
         // The base was rebuilt from messages + picked text, then deepened.
         assert_eq!(base.log, vec!["reprefill:It is 4.", "deepen"]);
         let calls = ops.calls.borrow();
