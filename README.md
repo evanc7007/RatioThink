@@ -11,7 +11,7 @@
 ![Version](https://img.shields.io/badge/version-v0.1.5-blue)
 ![License](https://img.shields.io/badge/license-Apache--2.0-green)
 
-### [Download Rational v0.1.5](https://github.com/shsym/RatioThink/releases/download/v0.1.5/Rational-arm64.dmg)
+### [Download Rational v0.1.6](https://github.com/shsym/RatioThink/releases/download/v0.1.6/Rational-arm64.dmg)
 
 </div>
 
