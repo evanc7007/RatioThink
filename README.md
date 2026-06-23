@@ -26,6 +26,8 @@ Feel free to report any issues you find!
 
 ## Why Rational
 
+▶ **[See the animated walkthrough](https://shsym.github.io/RatioThink/landing)**
+
 **Local models, with thinking profiles.** Ollama and LM Studio hand you a model and
 a prompt box. Rational adds **thinking profiles**, named _profiles_, you switch in
 one click, each a saved preset bundling a model, sampling, a system prompt, and a
@@ -40,8 +42,6 @@ chat workflow.
   turns one question into a scored search: the engine branches, scores each branch
   1–10, and keeps the best beam — shown live in a foldable tree, then the chosen
   answer.
-
-▶ **[See the animated walkthrough](https://shsym.github.io/RatioThink/landing)**
 
 ## Install
 
