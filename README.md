@@ -8,7 +8,6 @@
 
 ![macOS 14+](https://img.shields.io/badge/macOS-14%2B-black?logo=apple)
 ![Apple Silicon](https://img.shields.io/badge/Apple%20Silicon-arm64-black)
-![Version](https://img.shields.io/badge/version-v0.1.5-blue)
 ![License](https://img.shields.io/badge/license-Apache--2.0-green)
 
 ### [Download Rational v0.1.6](https://github.com/shsym/RatioThink/releases/download/v0.1.6/Rational-arm64.dmg)
