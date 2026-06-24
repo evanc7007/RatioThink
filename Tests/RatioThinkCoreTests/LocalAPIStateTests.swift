@@ -33,6 +33,45 @@ final class LocalAPIStateTests: XCTestCase {
     XCTAssertEqual(s.statusLabel, "Starting…")
   }
 
+  func test_starting_while_helper_not_ready_shows_helper_preparation_status() {
+    let s = LocalAPIState.make(
+      status: .starting,
+      hasActiveProfile: true,
+      helperHealth: .reconnecting(consecutiveFailures: 1))
+
+    XCTAssertFalse(s.isServing)
+    XCTAssertNil(s.port)
+    XCTAssertTrue(s.toggleOn, "optimistic power toggle should stay ON while helper prep is part of start")
+    XCTAssertFalse(s.toggleEnabled, "helper prep is still a pending start, so the toggle remains disabled")
+    XCTAssertEqual(s.statusLabel, "Preparing the helper…")
+    XCTAssertEqual(s.detail, "Waiting for the background helper to connect before the engine launch continues.")
+  }
+
+  func test_starting_with_healthy_helper_keeps_engine_launch_status() {
+    let s = LocalAPIState.make(status: .starting, hasActiveProfile: true, helperHealth: .healthy)
+
+    XCTAssertTrue(s.toggleOn)
+    XCTAssertFalse(s.toggleEnabled)
+    XCTAssertEqual(s.statusLabel, "Starting…")
+    XCTAssertEqual(s.detail, "Available once the model finishes loading.")
+  }
+
+  func test_helper_health_only_changes_starting_copy() {
+    XCTAssertEqual(
+      LocalAPIState.make(
+        status: .running(EngineSessionSnapshot(port: 8123, profileID: "chat", servedModelID: "m")),
+        hasActiveProfile: true,
+        helperHealth: .reconnecting(consecutiveFailures: 1)
+      ).statusLabel,
+      "Running")
+    XCTAssertEqual(
+      LocalAPIState.make(status: .stopped, hasActiveProfile: true, helperHealth: .reconnecting(consecutiveFailures: 1)).statusLabel,
+      "Off")
+    XCTAssertEqual(
+      LocalAPIState.make(status: .failed(code: .spawnFailed, message: "boom"), hasActiveProfile: true, helperHealth: .reconnecting(consecutiveFailures: 1)).statusLabel,
+      "Engine failed")
+  }
+
   func test_stopping_is_off_and_disabled() {
     let s = LocalAPIState.make(status: .stopping, hasActiveProfile: true)
     XCTAssertFalse(s.toggleOn)
@@ -60,6 +99,60 @@ final class LocalAPIStateTests: XCTestCase {
     XCTAssertEqual(EngineHTTPBindMode.external.daemonHost, "0.0.0.0")
     XCTAssertEqual(EngineHTTPBindMode.loopback.baseURLHost, "127.0.0.1")
     XCTAssertEqual(EngineHTTPBindMode.external.baseURLHost, "0.0.0.0")
+  }
+
+  func test_power_intent_makes_binding_read_optimistic_value_before_status_changes() {
+    XCTAssertTrue(LocalAPIPowerIntent.displayToggleOn(pendingPowerOn: true, liveToggleOn: false),
+                  "tap-on should render ON immediately before status leaves stopped")
+    XCTAssertFalse(LocalAPIPowerIntent.displayToggleOn(pendingPowerOn: false, liveToggleOn: true),
+                   "confirmed tap-off should render OFF immediately before status leaves running")
+    XCTAssertTrue(LocalAPIPowerIntent.displayToggleOn(pendingPowerOn: nil, liveToggleOn: true),
+                  "without a pending intent the binding should reflect live state")
+  }
+
+  func test_power_intent_reconciles_on_terminal_status_and_rolls_back_failures() {
+    XCTAssertEqual(LocalAPIPowerIntent.reconciledPendingPowerOn(true, status: .starting), true,
+                   "pending start should stay optimistic while still starting")
+    XCTAssertNil(LocalAPIPowerIntent.reconciledPendingPowerOn(true, status: .running(EngineSessionSnapshot(port: 8123, profileID: "chat"))),
+                 "running confirms tap-on and hands control back to live status")
+    XCTAssertNil(LocalAPIPowerIntent.reconciledPendingPowerOn(true, status: .stopped),
+                 "stopped contradicts tap-on and rolls back to live OFF")
+    XCTAssertNil(LocalAPIPowerIntent.reconciledPendingPowerOn(true, status: .failed(code: .spawnFailed, message: "boom")),
+                 "failed start contradicts tap-on and rolls back to live OFF")
+
+    XCTAssertEqual(LocalAPIPowerIntent.reconciledPendingPowerOn(false, status: .stopping), false,
+                   "pending stop should stay optimistic while still stopping")
+    XCTAssertNil(LocalAPIPowerIntent.reconciledPendingPowerOn(false, status: .stopped),
+                 "stopped confirms tap-off and hands control back to live status")
+    XCTAssertNil(LocalAPIPowerIntent.reconciledPendingPowerOn(false, status: .running(EngineSessionSnapshot(port: 8123, profileID: "chat"))),
+                 "running contradicts tap-off so the switch snaps back ON")
+    XCTAssertNil(LocalAPIPowerIntent.reconciledPendingPowerOn(false, status: .failed(code: .spawnFailed, message: "boom")),
+                 "failed is terminal, so no optimistic stop intent stays stuck")
+  }
+
+  func test_power_toggle_lifecycle_sequence_is_derived_from_status() {
+    let starting = LocalAPIState.make(status: .starting, hasActiveProfile: true)
+    XCTAssertTrue(starting.toggleOn, "tap-on should render ON immediately while launch is pending")
+    XCTAssertFalse(starting.toggleEnabled, "tap-on should be disabled during pending start")
+    XCTAssertEqual(starting.statusLabel, "Starting…")
+
+    let running = LocalAPIState.make(
+      status: .running(EngineSessionSnapshot(port: 8123, profileID: "chat", servedModelID: "m")),
+      hasActiveProfile: true)
+    XCTAssertTrue(running.toggleOn)
+    XCTAssertTrue(running.toggleEnabled)
+    XCTAssertEqual(running.statusLabel, "Running")
+
+    let failed = LocalAPIState.make(status: .failed(code: .spawnFailed, message: "boom"),
+                                    hasActiveProfile: true)
+    XCTAssertFalse(failed.toggleOn, "failed launch must roll the switch back OFF")
+    XCTAssertTrue(failed.toggleEnabled, "recoverable launch failure should leave retry available")
+    XCTAssertEqual(failed.statusLabel, "Engine failed")
+
+    let stopping = LocalAPIState.make(status: .stopping, hasActiveProfile: true)
+    XCTAssertFalse(stopping.toggleOn, "tap-off should render OFF immediately while stop is pending")
+    XCTAssertFalse(stopping.toggleEnabled, "tap-off should be disabled during pending stop")
+    XCTAssertEqual(stopping.statusLabel, "Stopping…")
   }
 
   func test_stopped_without_profile_is_disabled_with_guidance() {

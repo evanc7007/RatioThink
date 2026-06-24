@@ -26,20 +26,19 @@ struct LocalAPIView: View {
   @EnvironmentObject private var profileStore: ProfileStore
   @EnvironmentObject private var engineClientStore: EngineClientStore
   @EnvironmentObject private var appPreferences: AppPreferences
+  @EnvironmentObject private var helperHealth: HelperHealthController
   /// #616: the shared engine coordinator. All engine actuation on this surface
-  /// (start / stop, plus the bind-mode change and profile-restart sequences
-  /// composed below) routes through it, so the chat scaffold and the Local API
-  /// view never open-code two separate paths to start or stop the one engine.
-  /// The Local-API-specific orchestration (external-access bind-mode change,
-  /// profile-switch restart) stays here — it composes the coordinator's
-  /// primitives rather than duplicating them.
+  /// (start / stop, plus the bind-mode change sequence composed below) routes
+  /// through it, so the chat scaffold and the Local API view never open-code two
+  /// separate paths to start or stop the one engine. Served-profile switching is
+  /// managed by the chat toolbar; this view's profile picker shapes examples only.
   @EnvironmentObject private var engineCoordinator: ChatEngineCoordinator
 
   @State private var memory: EngineMemorySample?
   @State private var health: EngineHealth.Status?
   @State private var confirmStop = false
-  @State private var selectedProfileID: String?
-  @State private var profileRestartInFlight = false
+  @State private var pendingPowerOn: Bool?
+  @State private var exampleProfileID: String?
   /// #654: drives the example/route surface only — `stream: true` (SSE) vs
   /// `stream: false` (single JSON body). The engine serves both; this toggle
   /// shapes the curl snippet and the chat-completions route summary so a user
@@ -61,16 +60,15 @@ struct LocalAPIView: View {
   private var state: LocalAPIState {
     LocalAPIState.make(
       status: engineStatusStore.status,
-      hasActiveProfile: profileStore.activeProfileID != nil
+      hasActiveProfile: profileStore.activeProfileID != nil,
+      helperHealth: helperHealth.health
     )
   }
 
   private var bindMode: EngineHTTPBindMode {
     state.isServing ? engineStatusStore.runtimeDaemonBindMode : appPreferences.localAPIBindMode
   }
-  private var profileSelectionEnabled: Bool {
-    state.profileSelectionEnabled && !profileRestartInFlight
-  }
+  private var profileSelectionEnabled: Bool { state.profileSelectionEnabled }
   private var posture: EngineHTTPPosture { EngineHTTPPosture.make(bindMode: bindMode) }
 
   private var runtimeProfileID: String? {
@@ -95,8 +93,12 @@ struct LocalAPIView: View {
       runtimeServedModelID: runtimeServedModelID)
   }
 
-  private var selectedOrActiveProfileID: String? {
-    selectedProfileID ?? runtimeProfileID ?? profileStore.activeProfileID ?? profileOptions.first?.id
+  private var startProfileID: String? {
+    profileStore.activeProfileID ?? runtimeProfileID ?? profileOptions.first?.id
+  }
+
+  private var selectedExampleProfileID: String? {
+    exampleProfileID ?? runtimeProfileID ?? profileStore.activeProfileID ?? profileOptions.first?.id
   }
 
   var body: some View {
@@ -107,13 +109,10 @@ struct LocalAPIView: View {
         if let engineActionError {
           actionErrorRow(engineActionError)
         }
-        profileExplorerSection
         if let helperBlock {
           HelperUnavailableNotice(reason: helperBlock, onDismiss: { self.helperBlock = nil })
         }
-        if state.isServing {
-          servingDetails
-        }
+        apiDetails
         configurationSection
         securitySection
       }
@@ -129,21 +128,29 @@ struct LocalAPIView: View {
       if serving { engineActionError = nil; helperBlock = nil }
     }
     .onChange(of: engineStatusStore.status) { _, newStatus in
-      if case .running(let snapshot) = newStatus {
-        selectedProfileID = snapshot.profileID
-      } else if selectedProfileID == nil {
-        selectedProfileID = profileStore.activeProfileID ?? profileOptions.first?.id
+      pendingPowerOn = LocalAPIPowerIntent.reconciledPendingPowerOn(
+        pendingPowerOn,
+        status: newStatus)
+      if exampleProfileID == nil {
+        if case .running(let snapshot) = newStatus {
+          exampleProfileID = snapshot.profileID
+        } else {
+          exampleProfileID = profileStore.activeProfileID ?? profileOptions.first?.id
+        }
       }
     }
     .onAppear {
-      selectedProfileID = selectedOrActiveProfileID
+      exampleProfileID = selectedExampleProfileID
     }
     .confirmationDialog(
       "Turn off the local API?",
       isPresented: $confirmStop,
       titleVisibility: .visible
     ) {
-      Button("Turn Off", role: .destructive) { stop() }
+      Button("Turn Off", role: .destructive) {
+        pendingPowerOn = false
+        stop()
+      }
       Button("Cancel", role: .cancel) {}
     } message: {
       Text("This stops the engine. In-app chat stops too.")
@@ -166,20 +173,26 @@ struct LocalAPIView: View {
       Toggle("Local API", isOn: powerBinding)
         .toggleStyle(.switch)
         .labelsHidden()
-        .disabled(!state.toggleEnabled)
+        .disabled(!state.toggleEnabled || pendingPowerOn != nil)
         .accessibilityIdentifier("LocalAPIToggle")
     }
   }
 
-  /// Binds the switch to real engine state. Flipping ON starts the engine on
-  /// the active profile; flipping OFF asks for confirmation first (stopping
-  /// the shared engine also stops chat). The visual reflects the live status,
-  /// so a cancelled stop snaps back and a slow start shows "Starting…".
+  /// Binds the switch to real engine state plus a short-lived optimistic
+  /// intent. Flipping ON renders on immediately, then real status takes over
+  /// when the start reaches running/stopped/failed. Flipping OFF still asks for
+  /// confirmation first; only the destructive confirmation sets the optimistic
+  /// off intent, so cancelling leaves the live on state untouched.
   private var powerBinding: Binding<Bool> {
     Binding(
-      get: { state.toggleOn },
+      get: {
+        LocalAPIPowerIntent.displayToggleOn(
+          pendingPowerOn: pendingPowerOn,
+          liveToggleOn: state.toggleOn)
+      },
       set: { newOn in
         if newOn {
+          pendingPowerOn = true
           start()
         } else {
           confirmStop = true
@@ -241,10 +254,10 @@ struct LocalAPIView: View {
     }
   }
 
-  // MARK: - serving details (only while running)
+  // MARK: - API details
 
   @ViewBuilder
-  private var servingDetails: some View {
+  private var apiDetails: some View {
     if let baseURL = visibleBaseURL {
       labeledCopyRow(
         title: "Base URL",
@@ -272,11 +285,11 @@ struct LocalAPIView: View {
           identifier: "LocalAPIHealth"
         )
       }
+    }
 
-      endpointsSection(profile: selectedProfile)
-      if let model = state.servedModelID {
-        curlSection(baseURL: baseURL, model: model, profile: selectedProfile)
-      }
+    endpointsSection(profile: selectedProfile)
+    if let model = exampleModelID {
+      curlSection(baseURL: exampleBaseURL, model: model, profile: selectedProfile)
     }
   }
 
@@ -294,57 +307,23 @@ struct LocalAPIView: View {
     }
   }
 
-  private var profileExplorerSection: some View {
-    VStack(alignment: .leading, spacing: 8) {
-      sectionHeader("Profiles")
-      if profileOptions.isEmpty {
-        Text("No valid profiles are available yet.")
-          .font(.callout)
-          .foregroundStyle(.secondary)
-      } else {
-        Picker("Profile", selection: profileSelectionBinding) {
-          ForEach(profileOptions) { option in
-            Text(option.title).tag(option.id)
-          }
-        }
-        .pickerStyle(.segmented)
-        .disabled(!profileSelectionEnabled)
-        .accessibilityIdentifier("LocalAPIProfileTabs")
-
-        if let selected = selectedProfileOption {
-          HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Text("Model")
-              .foregroundStyle(.secondary)
-            Spacer()
-            Text(selected.modelDisplayName)
-              .font(.system(.body, design: .monospaced))
-              .lineLimit(1)
-            if selected.isServedLive {
-              Text("Running")
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.green)
-            }
-          }
-          .accessibilityIdentifier("LocalAPISelectedProfile")
-        }
-      }
-    }
-  }
-
-  private var selectedProfileOption: LocalAPIProfileOption? {
-    guard let selectedOrActiveProfileID else { return nil }
-    return profileOptions.first { $0.id == selectedOrActiveProfileID }
-  }
-
   private var selectedProfile: Profile? {
-    guard let selectedOrActiveProfileID else { return nil }
-    return profileStore.entries.compactMap(\.profile).first { $0.id == selectedOrActiveProfileID }
+    guard let selectedExampleProfileID else { return nil }
+    return profileStore.entries.compactMap(\.profile).first { $0.id == selectedExampleProfileID }
   }
 
-  private var profileSelectionBinding: Binding<String> {
+  private var exampleModelID: String? {
+    state.servedModelID ?? selectedProfile?.model ?? profileStore.activeProfile?.model
+  }
+
+  private var exampleBaseURL: String {
+    visibleBaseURL ?? "http://127.0.0.1:<port>"
+  }
+
+  private var exampleProfileSelectionBinding: Binding<String> {
     Binding(
-      get: { selectedOrActiveProfileID ?? "" },
-      set: { selectProfile($0) }
+      get: { selectedExampleProfileID ?? "" },
+      set: { exampleProfileID = $0 }
     )
   }
 
@@ -387,19 +366,14 @@ struct LocalAPIView: View {
         }
         .controlSize(.small)
       }
-      Toggle(isOn: $streamingEnabled) {
-        VStack(alignment: .leading, spacing: 2) {
-          Text("Streaming responses")
-          Text(streamingEnabled
-               ? "stream: true — tokens arrive as Server-Sent Events."
-               : "stream: false — one complete JSON response per request.")
-            .font(.caption)
-            .foregroundStyle(.secondary)
-            .fixedSize(horizontal: false, vertical: true)
-        }
-      }
-      .toggleStyle(.switch)
-      .accessibilityIdentifier("LocalAPIStreamingToggle")
+      profileSelectorRow
+      trailingSwitchRow(
+        title: "Streaming responses",
+        caption: streamingEnabled
+          ? "stream: true — tokens arrive as Server-Sent Events."
+          : "stream: false — one complete JSON response per request.",
+        isOn: $streamingEnabled,
+        identifier: "LocalAPIStreamingToggle")
       Text(snippet)
         .font(.system(.body, design: .monospaced))
         .textSelection(.enabled)
@@ -410,22 +384,40 @@ struct LocalAPIView: View {
     }
   }
 
+  @ViewBuilder
+  private var profileSelectorRow: some View {
+    if profileOptions.isEmpty {
+      Text("No valid profiles are available yet.")
+        .font(.callout)
+        .foregroundStyle(.secondary)
+    } else {
+      HStack(alignment: .firstTextBaseline, spacing: 12) {
+        Text("Profile")
+          .foregroundStyle(.secondary)
+        Picker("Profile", selection: exampleProfileSelectionBinding) {
+          ForEach(profileOptions) { option in
+            Text(option.title).tag(option.id)
+          }
+        }
+        .pickerStyle(.segmented)
+        .labelsHidden()
+        .disabled(!profileSelectionEnabled)
+        .accessibilityLabel("Profile")
+        .accessibilityIdentifier("LocalAPIProfileTabs")
+      }
+    }
+  }
+
   // MARK: - security posture (always visible, read-only)
 
   private var configurationSection: some View {
     VStack(alignment: .leading, spacing: 10) {
       sectionHeader("Configuration")
-      Toggle(isOn: autoStartBinding) {
-        VStack(alignment: .leading, spacing: 2) {
-          Text("Start Local API when RatioThink opens")
-          Text("When enabled, the engine starts after launch; API and chat both come online.")
-            .font(.caption)
-            .foregroundStyle(.secondary)
-            .fixedSize(horizontal: false, vertical: true)
-        }
-      }
-      .toggleStyle(.switch)
-      .accessibilityIdentifier("LocalAPIAutoStartToggle")
+      trailingSwitchRow(
+        title: "Start Local API when RatioThink opens",
+        caption: "When enabled, the engine starts after launch; API and chat both come online.",
+        isOn: autoStartBinding,
+        identifier: "LocalAPIAutoStartToggle")
 
       postureRow(title: "Profile", value: profileStore.activeProfileID ?? "Choose a profile in the chat toolbar.")
       Text("Port and authentication are fixed and can’t be configured. Use the switch at the top for on/off.")
@@ -446,10 +438,11 @@ struct LocalAPIView: View {
   private var securitySection: some View {
     VStack(alignment: .leading, spacing: 8) {
       sectionHeader("Security")
-      Toggle("Allow access from other devices", isOn: externalAccessBinding)
-        .toggleStyle(.switch)
-        .disabled(!state.externalAccessToggleEnabled)
-        .accessibilityIdentifier("LocalAPIExternalAccessToggle")
+      trailingSwitchRow(
+        title: "Allow access from other devices",
+        isOn: externalAccessBinding,
+        isDisabled: !state.externalAccessToggleEnabled,
+        identifier: "LocalAPIExternalAccessToggle")
       if let warningTitle = posture.warningTitle,
          let warningDetail = posture.warningDetail {
         HStack(alignment: .top, spacing: 8) {
@@ -485,6 +478,33 @@ struct LocalAPIView: View {
       get: { appPreferences.localAPIExternalAccessEnabled },
       set: { setExternalAccess($0) }
     )
+  }
+
+  private func trailingSwitchRow(
+    title: String,
+    caption: String? = nil,
+    isOn: Binding<Bool>,
+    isDisabled: Bool = false,
+    identifier: String
+  ) -> some View {
+    HStack(alignment: .firstTextBaseline, spacing: 12) {
+      VStack(alignment: .leading, spacing: 2) {
+        Text(title)
+        if let caption {
+          Text(caption)
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+        }
+      }
+      Spacer(minLength: 16)
+      Toggle(title, isOn: isOn)
+        .toggleStyle(.switch)
+        .labelsHidden()
+        .disabled(isDisabled)
+        .accessibilityLabel(title)
+        .accessibilityIdentifier(identifier)
+    }
   }
 
   private func postureRow(title: String, value: String) -> some View {
@@ -554,15 +574,20 @@ struct LocalAPIView: View {
   /// `.alreadyRunning` that reaches the app is an incompatible-start
   /// conflict and surfaces to the caller.
   private func start() {
-    guard let profileID = selectedOrActiveProfileID, !profileID.isEmpty else { return }
+    guard let profileID = startProfileID, !profileID.isEmpty else {
+      pendingPowerOn = nil
+      return
+    }
     Task { @MainActor in
       engineActionError = nil
       helperBlock = nil
       do {
         try await engineCoordinator.startEngine(profileID: profileID, daemonBindHost: bindMode)
       } catch let block as HelperUnavailable {
+        pendingPowerOn = nil
         helperBlock = block
       } catch {
+        pendingPowerOn = nil
         engineActionError = ChatScaffoldView.engineErrorMessage(error, verb: "start")
       }
     }
@@ -578,42 +603,17 @@ struct LocalAPIView: View {
       do {
         try await engineCoordinator.stopEngine()
       } catch let block as HelperUnavailable {
+        pendingPowerOn = nil
         helperBlock = block
       } catch {
+        pendingPowerOn = nil
         engineActionError = ChatScaffoldView.engineErrorMessage(error, verb: "stop")
       }
     }
   }
 
-  private func selectProfile(_ profileID: String) {
-    // #654: only a switch that changes the SERVED MODEL relaunches the engine.
-    // A same-model switch (e.g. Chat → Repeat Boost, both Qwen3-0.6B) keeps the
-    // engine up — the new profile's sampling / speculation / constraint /
-    // tree-of-thought params apply per request, not at boot.
-    let outcome = LocalAPIProfileSwitchGate.decide(
-      selectedProfileID: profileID,
-      selectedModelID: profileOptions.first { $0.id == profileID }?.modelID,
-      runtimeProfileID: runtimeProfileID,
-      runtimeModelID: runtimeServedModelID,
-      state: state,
-      restartInFlight: &profileRestartInFlight
-    )
-    guard outcome != .reject else { return }
-    selectedProfileID = profileID
-    do {
-      try profileStore.setActiveProfileID(profileID)
-    } catch {
-      profileRestartInFlight = false
-      engineActionError = "Couldn't select profile: \(error)"
-      return
-    }
-    if outcome == .restart {
-      restartEngine(profileID: profileID)
-    }
-  }
-
   private func setExternalAccess(_ enabled: Bool) {
-    let profileID = runtimeProfileID ?? selectedOrActiveProfileID
+    let profileID = runtimeProfileID ?? startProfileID
     Task { @MainActor in
       engineActionError = nil
       do {
@@ -627,22 +627,6 @@ struct LocalAPIView: View {
             guard let profileID, !profileID.isEmpty else { return }
             try await engineCoordinator.startEngine(profileID: profileID, daemonBindHost: requestedMode)
           }
-        )
-      } catch {
-        engineActionError = ChatScaffoldView.engineErrorMessage(error, verb: "switch")
-      }
-    }
-  }
-
-  private func restartEngine(profileID: String) {
-    Task { @MainActor in
-      engineActionError = nil
-      defer { profileRestartInFlight = false }
-      do {
-        try await engineCoordinator.stopEngine()
-        try await engineCoordinator.startEngine(
-          profileID: profileID,
-          daemonBindHost: bindMode
         )
       } catch {
         engineActionError = ChatScaffoldView.engineErrorMessage(error, verb: "switch")

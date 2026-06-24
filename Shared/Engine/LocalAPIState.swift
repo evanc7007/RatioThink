@@ -120,7 +120,15 @@ public struct LocalAPIState: Equatable {
   ///     When false the API can't be turned on (nothing to serve), so the
   ///     control is disabled with guidance rather than offering a start that
   ///     would immediately fail `profileMissing`.
-  public static func make(status: EngineStatus, hasActiveProfile: Bool) -> LocalAPIState {
+  ///   - helperHealth: the app's helper reachability axis. While the engine
+  ///     reports `.starting`, a non-healthy helper means the start is still in
+  ///     the helper-preparation/XPC-connection phase rather than the model-load
+  ///     phase. Other engine states ignore this input.
+  public static func make(
+    status: EngineStatus,
+    hasActiveProfile: Bool,
+    helperHealth: HelperHealth = .healthy
+  ) -> LocalAPIState {
     switch status {
     case .running(let snapshot):
       return LocalAPIState(
@@ -134,14 +142,23 @@ public struct LocalAPIState: Equatable {
         servedModelID: snapshot.servedModelID.isEmpty ? nil : snapshot.servedModelID
       )
     case .starting:
+      let helperIsReady: Bool
+      switch helperHealth {
+      case .healthy:
+        helperIsReady = true
+      case .reconnecting, .repairing, .repairCoolingDown, .unreachable:
+        helperIsReady = false
+      }
       return LocalAPIState(
         phase: .starting,
         toggleOn: true,
         toggleEnabled: false,
         externalAccessToggleEnabled: false,
         profileSelectionEnabled: false,
-        statusLabel: "Starting…",
-        detail: "Available once the model finishes loading.",
+        statusLabel: helperIsReady ? "Starting…" : "Preparing the helper…",
+        detail: helperIsReady
+          ? "Available once the model finishes loading."
+          : "Waiting for the background helper to connect before the engine launch continues.",
         servedModelID: nil
       )
     case .stopping:
@@ -254,6 +271,31 @@ public enum LocalAPIBindModeChange {
     } else {
       try await startEngine(.loopback)
       try setPreference(false)
+    }
+  }
+}
+
+/// Small pure helper for LocalAPIView's optimistic power-switch intent.
+///
+/// The live reducer still owns the real lifecycle state. This helper only
+/// answers two UI questions: what should the binding read while an intent is
+/// pending, and when has the polled engine status reached a state that should
+/// hand control back to the reducer.
+public enum LocalAPIPowerIntent {
+  public static func displayToggleOn(pendingPowerOn: Bool?, liveToggleOn: Bool) -> Bool {
+    pendingPowerOn ?? liveToggleOn
+  }
+
+  public static func reconciledPendingPowerOn(_ pendingPowerOn: Bool?,
+                                              status: EngineStatus) -> Bool? {
+    guard let pendingPowerOn else { return nil }
+    switch status {
+    case .starting:
+      return pendingPowerOn ? pendingPowerOn : nil
+    case .stopping:
+      return pendingPowerOn ? nil : pendingPowerOn
+    case .running, .stopped, .failed:
+      return nil
     }
   }
 }
