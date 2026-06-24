@@ -83,6 +83,25 @@ public enum HelperRingState {
 /// Folds the helper-health axis and the engine axis into the toolbar pip's two
 /// elements: the outer ring (helper) and the inner dot (engine). Pure.
 public enum HelperEngineIndicator {
+  /// Helper-owned inline label while the engine fold is still `.starting`.
+  /// The view supplies the elapsed engine-start label for the healthy-helper
+  /// path; this reducer only decides when helper reachability, not model boot,
+  /// owns the visible starting context.
+  public static func startingLabelOverride(
+    helper: HelperHealth,
+    engine: EngineIndicatorState
+  ) -> String? {
+    guard case .starting = engine else { return nil }
+    switch helper {
+    case .healthy:
+      return nil
+    case .reconnecting, .repairing, .repairCoolingDown:
+      return "Helper starting…"
+    case .unreachable:
+      return "Helper unavailable"
+    }
+  }
+
   public static func make(
     helper: HelperHealth,
     engine: EngineIndicatorState

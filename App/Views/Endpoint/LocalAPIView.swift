@@ -68,7 +68,7 @@ struct LocalAPIView: View {
   private var bindMode: EngineHTTPBindMode {
     state.isServing ? engineStatusStore.runtimeDaemonBindMode : appPreferences.localAPIBindMode
   }
-  private var profileSelectionEnabled: Bool { state.profileSelectionEnabled }
+  private var endpointSurfaceEnabled: Bool { state.endpointSurfaceEnabled }
   private var posture: EngineHTTPPosture { EngineHTTPPosture.make(bindMode: bindMode) }
 
   private var runtimeProfileID: String? {
@@ -401,7 +401,7 @@ struct LocalAPIView: View {
         }
         .pickerStyle(.segmented)
         .labelsHidden()
-        .disabled(!profileSelectionEnabled)
+        .disabled(!endpointSurfaceEnabled)
         .accessibilityLabel("Profile")
         .accessibilityIdentifier("LocalAPIProfileTabs")
       }

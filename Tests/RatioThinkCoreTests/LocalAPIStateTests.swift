@@ -29,7 +29,9 @@ final class LocalAPIStateTests: XCTestCase {
     XCTAssertFalse(s.externalAccessToggleEnabled,
                    "security posture changes must not persist while an external-bound daemon may still be starting")
     XCTAssertFalse(s.profileSelectionEnabled,
-                   "profile picker must be disabled during in-flight restarts so a selection is not silently lost")
+                   "profile switch gate remains disabled during in-flight restarts")
+    XCTAssertTrue(s.endpointSurfaceEnabled,
+                  "powered-on helper/engine start must not block Local API endpoint examples")
     XCTAssertEqual(s.statusLabel, "Starting…")
   }
 
@@ -45,6 +47,21 @@ final class LocalAPIStateTests: XCTestCase {
     XCTAssertFalse(s.toggleEnabled, "helper prep is still a pending start, so the toggle remains disabled")
     XCTAssertEqual(s.statusLabel, "Preparing the helper…")
     XCTAssertEqual(s.detail, "Waiting for the background helper to connect before the engine launch continues.")
+  }
+
+
+  func test_starting_with_helper_reconnect_keeps_endpoint_surface_unblocked() {
+    let s = LocalAPIState.make(
+      status: .starting,
+      hasActiveProfile: true,
+      helperHealth: .reconnecting(consecutiveFailures: 2))
+
+    XCTAssertTrue(s.toggleOn)
+    XCTAssertFalse(s.profileSelectionEnabled,
+                   "helper start/connect is still an in-flight restart for profile switching")
+    XCTAssertTrue(s.endpointSurfaceEnabled,
+                  "powered-on helper start/connect must not block Local API endpoint examples")
+    XCTAssertEqual(s.statusLabel, "Preparing the helper…")
   }
 
   func test_starting_with_healthy_helper_keeps_engine_launch_status() {
@@ -80,6 +97,8 @@ final class LocalAPIStateTests: XCTestCase {
                    "security posture changes must not persist while an exposed daemon may still be stopping")
     XCTAssertFalse(s.profileSelectionEnabled,
                    "profile picker must be disabled during in-flight restarts so a selection is not silently lost")
+    XCTAssertFalse(s.endpointSurfaceEnabled,
+                   "Local API examples are blocked while powered off/stopping")
     XCTAssertEqual(s.statusLabel, "Stopping…")
   }
 
@@ -89,9 +108,39 @@ final class LocalAPIStateTests: XCTestCase {
     XCTAssertFalse(s.toggleOn)
     XCTAssertTrue(s.toggleEnabled, "a selected model means we can start the engine")
     XCTAssertTrue(s.externalAccessToggleEnabled)
-    XCTAssertTrue(s.profileSelectionEnabled)
+    XCTAssertTrue(s.profileSelectionEnabled,
+                  "stopped profile switches are marker-only and must stay actionable for chat-toolbar reuse")
+    XCTAssertFalse(s.endpointSurfaceEnabled,
+                   "Local API endpoint examples are blocked while powered off")
     XCTAssertEqual(s.statusLabel, "Off")
     XCTAssertEqual(s.detail, "Turn on to start the engine and serve requests on 127.0.0.1.")
+  }
+
+
+  func test_endpoint_surface_predicate_follows_power_state_without_changing_profile_switch_gate() {
+    let starting = LocalAPIState.make(status: .starting, hasActiveProfile: true, helperHealth: .reconnecting(consecutiveFailures: 2))
+    XCTAssertTrue(starting.endpointSurfaceEnabled,
+                  "powered-on helper start/connect keeps endpoint examples available")
+    XCTAssertFalse(starting.profileSelectionEnabled,
+                   "profile switch gate still rejects mid-transition selections")
+
+    let running = LocalAPIState.make(
+      status: .running(EngineSessionSnapshot(port: 8123, profileID: "chat", servedModelID: "model")),
+      hasActiveProfile: true)
+    XCTAssertTrue(running.endpointSurfaceEnabled)
+    XCTAssertTrue(running.profileSelectionEnabled)
+
+    let stopped = LocalAPIState.make(status: .stopped, hasActiveProfile: true)
+    XCTAssertFalse(stopped.endpointSurfaceEnabled,
+                   "powered-off endpoint examples are blocked")
+    XCTAssertTrue(stopped.profileSelectionEnabled,
+                  "stopped profile swaps remain marker-only for the chat toolbar")
+
+    let failed = LocalAPIState.make(status: .failed(code: .spawnFailed, message: "boom"), hasActiveProfile: true)
+    XCTAssertFalse(failed.endpointSurfaceEnabled,
+                   "failed/off endpoint examples are blocked")
+    XCTAssertTrue(failed.profileSelectionEnabled,
+                  "failed profile marker changes should not be coupled to endpoint examples")
   }
 
   func test_bind_modes_carry_explicit_daemon_hosts() {
