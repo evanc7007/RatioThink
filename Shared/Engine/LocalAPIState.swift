@@ -80,9 +80,16 @@ public struct LocalAPIState: Equatable {
   /// report the listener that is about to appear or is still shutting down.
   public let externalAccessToggleEnabled: Bool
 
-  /// Whether profile tabs are actionable. Disabled mid-transition so a
-  /// profile selection cannot be accepted while an already-captured restart
-  /// is moving through `.stopping`/`.starting`.
+  /// Whether endpoint example controls are actionable. This is a Local API
+  /// surface predicate only: examples stay usable while the API is powered on
+  /// or starting, and are blocked once the API is powered off / failed.
+  public let endpointSurfaceEnabled: Bool
+
+  /// Whether served-profile tabs are actionable for profile-switch semantics.
+  /// Disabled mid-transition so a profile selection cannot be accepted while an
+  /// already-captured restart is moving through `.stopping`/`.starting`; remains
+  /// enabled while stopped so chat-toolbar profile swaps can persist the marker
+  /// without starting the engine.
   public let profileSelectionEnabled: Bool
 
   /// One-word status for the header ("Running", "Starting…", …).
@@ -136,6 +143,7 @@ public struct LocalAPIState: Equatable {
         toggleOn: true,
         toggleEnabled: true,
         externalAccessToggleEnabled: true,
+        endpointSurfaceEnabled: true,
         profileSelectionEnabled: true,
         statusLabel: "Running",
         detail: nil,
@@ -154,7 +162,8 @@ public struct LocalAPIState: Equatable {
         toggleOn: true,
         toggleEnabled: false,
         externalAccessToggleEnabled: false,
-        profileSelectionEnabled: true,
+        endpointSurfaceEnabled: true,
+        profileSelectionEnabled: false,
         statusLabel: helperIsReady ? "Starting…" : "Preparing the helper…",
         detail: helperIsReady
           ? "Available once the model finishes loading."
@@ -167,6 +176,7 @@ public struct LocalAPIState: Equatable {
         toggleOn: false,
         toggleEnabled: false,
         externalAccessToggleEnabled: false,
+        endpointSurfaceEnabled: false,
         profileSelectionEnabled: false,
         statusLabel: "Stopping…",
         detail: nil,
@@ -178,7 +188,8 @@ public struct LocalAPIState: Equatable {
         toggleOn: false,
         toggleEnabled: hasActiveProfile,
         externalAccessToggleEnabled: true,
-        profileSelectionEnabled: false,
+        endpointSurfaceEnabled: false,
+        profileSelectionEnabled: true,
         statusLabel: "Off",
         detail: hasActiveProfile
           ? "Turn on to start the engine and serve requests on 127.0.0.1."
@@ -195,7 +206,8 @@ public struct LocalAPIState: Equatable {
         toggleOn: false,
         toggleEnabled: canRetry,
         externalAccessToggleEnabled: true,
-        profileSelectionEnabled: false,
+        endpointSurfaceEnabled: false,
+        profileSelectionEnabled: true,
         statusLabel: "Engine failed",
         detail: failureReason(code: code, message: message),
         servedModelID: nil
