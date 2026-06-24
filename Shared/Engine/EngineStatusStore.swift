@@ -134,18 +134,24 @@ public final class EngineStatusStore: ObservableObject {
   /// fixed 1 Hz loop so macOS App Nap can engage (#587).
   private let steadyPollInterval: TimeInterval
   private var task: Task<Void, Never>?
-  /// how long a start/restart convergence keeps polling through the
+  /// How long a start/restart convergence keeps polling through the
   /// `.stopped → .starting → .running` transition before handing back to the
   /// liveness loop. Dominates the helper's worst-case cold-boot start lease
   /// (mirrors `HelperXPCClient.defaultStartReplyTimeout`) so a slow large-model
   /// boot still converges rather than the wait expiring early.
   static let startConvergenceBudget: TimeInterval =
     HelperExportedAPI.startReplyDeadline + HelperExportedAPI.replyTimeoutSlack
-  /// the lifecycle-intent convergence task. A start/restart request OWNS
-  /// driving the published `status` to its terminal outcome, INDEPENDENT of the
-  /// background `task` cadence loop (which may pause on an idle `.stopped`).
-  /// Correctness of an app-initiated start must never depend on the perf-tuned
-  /// cadence, so convergence runs on its own task that never pauses mid-start.
+  /// Stop convergence only needs to bridge process teardown, but reuse the same
+  /// bounded lease shape so an app-initiated power-off owns the transient
+  /// `.stopping` state until the helper reports `.stopped`/`.failed` or the
+  /// lease hands back to normal polling.
+  static let stopConvergenceBudget: TimeInterval = 30
+  /// The lifecycle-intent convergence task. A start/restart/stop request OWNS
+  /// driving the published `status` through its transient outcome, INDEPENDENT
+  /// of the background `task` cadence loop (which may pause on an idle
+  /// `.stopped`). Correctness of an app-initiated lifecycle transition must
+  /// never depend on the perf-tuned cadence, so convergence runs on its own task
+  /// that never pauses mid-transition.
   private var convergenceTask: Task<Void, Never>?
   private nonisolated static let log = Logger(subsystem: "com.ratiothink.app", category: "engine-status")
 
@@ -337,50 +343,69 @@ public final class EngineStatusStore: ObservableObject {
     }
   }
 
-  /// lifecycle-intent convergence. A start/restart request OWNS driving
-  /// the published `status` to its terminal outcome (`.running` or a surfaced
-  /// `.failed`), polling on its OWN task that — unlike the background cadence
-  /// loop — never pauses on the pre-start `.stopped` it must poll THROUGH.
-  ///
-  /// This is the design fix for the class "an app-initiated start is missed
-  /// because the cadence loop paused": cadence stays a pure liveness/perf
-  /// optimization, and correctness of the start is owned by the intent, not by
-  /// the loop's timing. It feeds every poll through `apply` (so the #2 transient
-  /// hold + the helper-health ladder still see each tick) and, on a terminal
-  /// state or the start lease `deadline`, hands off to the liveness loop via the
-  /// idempotent `start()`. Re-entrant: a newer start cancels the prior wait.
+  /// Lifecycle-intent convergence. A start/restart request owns the visible
+  /// `.starting` state; stale pre-start `.stopped` polls are ignored until the
+  /// helper commits `.starting`, `.running`, or `.failed`. This makes
+  /// `EngineStatusStore.status` the durable source of truth views observe, not a
+  /// view-scoped optimistic flag that disappears on remount.
   func beginStartConvergence(deadline: Date) {
     convergenceTask?.cancel()
-    // Not nilled on completion: a completed Task handle is harmless, and a
-    // `defer` reset would race a re-entrant start that already replaced it.
-    // `stop()` and the next `beginStartConvergence` both cancel+replace.
+    setStatusAndTrackStarting(.starting)
     convergenceTask = Task { [weak self] in
       while !Task.isCancelled {
         guard let self, self.now() < deadline else { break }
         if let next = try? await self.client.engineStatus() {
           if Task.isCancelled { return }
-          self.apply(next: next, error: nil)
-          switch self.status {
-          case .running:
-            // Engine up — arm the liveness loop and stop converging.
+          switch next {
+          case .stopped:
+            // The helper has not committed the requested start yet. Keep the
+            // app-initiated transient state as the single UI truth.
+            break
+          case .starting:
+            self.apply(next: next, error: nil)
+          case .running, .failed:
+            self.apply(next: next, error: nil)
             self.start()
             return
-          case .failed:
-            // A SURFACED failure is terminal (apply() already applied the #2
-            // first-load grace, so a held-transient failure still reads as
-            // `.starting` here and keeps converging). Hand off to liveness.
-            self.start()
-            return
-          case .starting, .stopping, .stopped:
-            break  // keep polling through the start transition
+          case .stopping:
+            // A competing teardown is authoritative; surface it and keep polling.
+            self.apply(next: next, error: nil)
           }
         }
         await self.sleepFor(self.pollInterval)
       }
-      // Deadline: hand the published status back to the background liveness
-      // loop (which pauses again if still idle). On CANCELLATION (stop() or a
-      // re-entrant start) skip the hand-off — stop() must not be re-armed, and
-      // a re-entrant start owns its own loop.
+      if !Task.isCancelled { self?.start() }
+    }
+  }
+
+  /// Stop convergence mirrors start convergence: the stop command owns the
+  /// visible `.stopping` state immediately, and stale `.running` polls are held
+  /// until the helper reports `.stopping`, `.stopped`, or `.failed`. That keeps
+  /// API and chat views consistent across api→chat→api remounts while power-off
+  /// is in flight.
+  func beginStopConvergence(deadline: Date) {
+    convergenceTask?.cancel()
+    setStatusAndTrackStarting(.stopping)
+    convergenceTask = Task { [weak self] in
+      while !Task.isCancelled {
+        guard let self, self.now() < deadline else { break }
+        if let next = try? await self.client.engineStatus() {
+          if Task.isCancelled { return }
+          switch next {
+          case .running, .starting:
+            // The helper has not committed the requested stop yet. Keep the
+            // app-initiated transient state as the single UI truth.
+            break
+          case .stopping:
+            self.apply(next: next, error: nil)
+          case .stopped, .failed:
+            self.apply(next: next, error: nil)
+            self.start()
+            return
+          }
+        }
+        await self.sleepFor(self.pollInterval)
+      }
       if !Task.isCancelled { self?.start() }
     }
   }
@@ -471,7 +496,15 @@ public final class EngineStatusStore: ObservableObject {
   public func stopEngine() async throws {
     try requireHelperAvailable()
     onExplicitStop()
-    try await client.stopEngine()
+    let priorStatus = status
+    beginStopConvergence(deadline: now().addingTimeInterval(Self.stopConvergenceBudget))
+    do {
+      try await client.stopEngine()
+    } catch {
+      convergenceTask?.cancel()
+      setStatusAndTrackStarting(priorStatus)
+      throw error
+    }
   }
 
   /// Intentionally rebuild the helper engine for `profileID`.
@@ -619,13 +652,12 @@ public final class EngineStatusStore: ObservableObject {
                           modelOverride: String? = nil,
                           daemonBindHost: EngineHTTPBindMode? = nil) async throws {
     // convergence: a start request OWNS driving `status` to its terminal
-    // outcome, independent of the cadence loop. The prior `start()` re-arm
-    // raced the helper committing `.starting`: a re-armed poll that read the
-    // pre-start `.stopped` re-paused the loop permanently, so the app never
-    // observed `.running`. Convergence polls THROUGH that transition on its own
-    // task. Begin BEFORE the XPC call so `.starting` shows promptly.
-    beginStartConvergence(deadline: now().addingTimeInterval(Self.startConvergenceBudget))
+    // outcome, independent of the cadence loop and any view lifetime. Begin
+    // after helper-gating but BEFORE the XPC call so `.starting` is the shared
+    // status all views observe while the helper commits the launch.
     try requireHelperAvailable()
+    let priorStatus = status
+    beginStartConvergence(deadline: now().addingTimeInterval(Self.startConvergenceBudget))
     let requestedBindMode = daemonBindHost ?? daemonBindModeProvider()
     do {
       if let modelOverride {
@@ -647,6 +679,12 @@ public final class EngineStatusStore: ObservableObject {
         runtimeDaemonBindModeIsConfirmed = true
         return
       }
+      convergenceTask?.cancel()
+      setStatusAndTrackStarting(priorStatus)
+      throw error
+    } catch {
+      convergenceTask?.cancel()
+      setStatusAndTrackStarting(priorStatus)
       throw error
     }
   }

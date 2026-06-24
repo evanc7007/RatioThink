@@ -68,13 +68,39 @@ final class EngineStatusStoreTests: XCTestCase {
     //  Unload: capture stopEngine calls + let tests inject a result.
     private(set) var stopCalls = 0
     private var stopResult: Result<Void, Error> = .success(())
+    private var stopShouldBlock = false
+    private var stopContinuation: CheckedContinuation<Void, Never>?
     func setStopResult(_ result: Result<Void, Error>) {
       lock.withLock { stopResult = result }
     }
+    func blockStopUntilReleased() {
+      lock.withLock { stopShouldBlock = true }
+    }
+    func releaseBlockedStop() {
+      let continuation = lock.withLock { () -> CheckedContinuation<Void, Never>? in
+        let continuation = stopContinuation
+        stopContinuation = nil
+        stopShouldBlock = false
+        return continuation
+      }
+      continuation?.resume()
+    }
     func stopEngine() async throws {
-      let result: Result<Void, Error> = lock.withLock {
+      let (result, shouldBlock): (Result<Void, Error>, Bool) = lock.withLock {
         stopCalls += 1
-        return stopResult
+        return (stopResult, stopShouldBlock)
+      }
+      if shouldBlock {
+        await withCheckedContinuation { continuation in
+          let resumeImmediately = lock.withLock { () -> Bool in
+            if stopShouldBlock {
+              stopContinuation = continuation
+              return false
+            }
+            return true
+          }
+          if resumeImmediately { continuation.resume() }
+        }
       }
       try result.get()
     }
@@ -434,6 +460,26 @@ final class EngineStatusStoreTests: XCTestCase {
     }
     XCTAssertEqual(store.status, .stopped,
                    "start rejection must NOT change status — proves the poll channel can't surface it")
+  }
+
+
+  func test_stopEngine_publishes_stopping_from_shared_store_while_xpc_stop_is_in_flight() async throws {
+    let client = StubXPCClient()
+    client.blockStopUntilReleased()
+    let running = EngineSessionSnapshot(port: 8123, profileID: "chat")
+    let store = EngineStatusStore(client: client, initialStatus: .running(running))
+
+    let stopTask = Task { try await store.stopEngine() }
+    try await waitUntil("stop XPC call is in flight") { client.stopCalls == 1 }
+
+    XCTAssertEqual(store.status, .stopping,
+                   "the shared EngineStatusStore must own the transient stopping status so API→chat→API remounts do not fall back to .running")
+    XCTAssertEqual(LocalAPIState.make(status: store.status, hasActiveProfile: true).statusLabel, "Stopping…")
+    XCTAssertEqual(LocalAPIState.make(status: store.status, hasActiveProfile: true).statusLabel, "Stopping…",
+                   "re-deriving LocalAPIState after a view switch must preserve the shared transient status")
+
+    client.releaseBlockedStop()
+    try await stopTask.value
   }
 
   /// #422 F1: a rejected stop (e.g. `.killRejected`) re-throws AND leaves the
