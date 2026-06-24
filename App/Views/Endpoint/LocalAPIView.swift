@@ -37,7 +37,6 @@ struct LocalAPIView: View {
   @State private var memory: EngineMemorySample?
   @State private var health: EngineHealth.Status?
   @State private var confirmStop = false
-  @State private var pendingPowerOn: Bool?
   @State private var exampleProfileID: String?
   /// #654: drives the example/route surface only — `stream: true` (SSE) vs
   /// `stream: false` (single JSON body). The engine serves both; this toggle
@@ -128,9 +127,6 @@ struct LocalAPIView: View {
       if serving { engineActionError = nil; helperBlock = nil }
     }
     .onChange(of: engineStatusStore.status) { _, newStatus in
-      pendingPowerOn = LocalAPIPowerIntent.reconciledPendingPowerOn(
-        pendingPowerOn,
-        status: newStatus)
       if exampleProfileID == nil {
         if case .running(let snapshot) = newStatus {
           exampleProfileID = snapshot.profileID
@@ -148,7 +144,6 @@ struct LocalAPIView: View {
       titleVisibility: .visible
     ) {
       Button("Turn Off", role: .destructive) {
-        pendingPowerOn = false
         stop()
       }
       Button("Cancel", role: .cancel) {}
@@ -173,26 +168,21 @@ struct LocalAPIView: View {
       Toggle("Local API", isOn: powerBinding)
         .toggleStyle(.switch)
         .labelsHidden()
-        .disabled(!state.toggleEnabled || pendingPowerOn != nil)
+        .disabled(!state.toggleEnabled)
         .accessibilityIdentifier("LocalAPIToggle")
     }
   }
 
-  /// Binds the switch to real engine state plus a short-lived optimistic
-  /// intent. Flipping ON renders on immediately, then real status takes over
-  /// when the start reaches running/stopped/failed. Flipping OFF still asks for
-  /// confirmation first; only the destructive confirmation sets the optimistic
-  /// off intent, so cancelling leaves the live on state untouched.
+  /// Binds the switch to the store-derived Local API state. Flipping ON renders
+  /// on immediately because `EngineStatusStore.startEngine` publishes
+  /// `.starting` before its first await; flipping OFF still asks for
+  /// confirmation first, and the destructive action renders off from the
+  /// store's immediate `.stopping`.
   private var powerBinding: Binding<Bool> {
     Binding(
-      get: {
-        LocalAPIPowerIntent.displayToggleOn(
-          pendingPowerOn: pendingPowerOn,
-          liveToggleOn: state.toggleOn)
-      },
+      get: { state.toggleOn },
       set: { newOn in
         if newOn {
-          pendingPowerOn = true
           start()
         } else {
           confirmStop = true
@@ -574,20 +564,15 @@ struct LocalAPIView: View {
   /// `.alreadyRunning` that reaches the app is an incompatible-start
   /// conflict and surfaces to the caller.
   private func start() {
-    guard let profileID = startProfileID, !profileID.isEmpty else {
-      pendingPowerOn = nil
-      return
-    }
+    guard let profileID = startProfileID, !profileID.isEmpty else { return }
     Task { @MainActor in
       engineActionError = nil
       helperBlock = nil
       do {
         try await engineCoordinator.startEngine(profileID: profileID, daemonBindHost: bindMode)
       } catch let block as HelperUnavailable {
-        pendingPowerOn = nil
         helperBlock = block
       } catch {
-        pendingPowerOn = nil
         engineActionError = ChatScaffoldView.engineErrorMessage(error, verb: "start")
       }
     }
@@ -603,10 +588,8 @@ struct LocalAPIView: View {
       do {
         try await engineCoordinator.stopEngine()
       } catch let block as HelperUnavailable {
-        pendingPowerOn = nil
         helperBlock = block
       } catch {
-        pendingPowerOn = nil
         engineActionError = ChatScaffoldView.engineErrorMessage(error, verb: "stop")
       }
     }
