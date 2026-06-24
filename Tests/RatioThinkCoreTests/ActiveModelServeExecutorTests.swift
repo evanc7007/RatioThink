@@ -374,9 +374,14 @@ final class ActiveModelServeExecutorTests: XCTestCase {
       rig.client.startCalls == 1
     }
 
-    // Newer direct pick while A is suspended mid-start.
+    // Newer direct pick while A is suspended mid-start. Because the shared
+    // status store now owns app-initiated transients, A's in-flight start is
+    // visible as `.starting`; B should become the queued latest intent rather
+    // than pretending it can synchronously launch over A.
     try await rig.executor.serve(modelID: "m-B.gguf", profileID: "chat")
-    XCTAssertEqual(rig.client.lastStartModelOverride, "m-B.gguf")
+    XCTAssertEqual(rig.executor.deferredPick,
+                   ActiveModelServeExecutor.Pick(modelID: "m-B.gguf", profileID: "chat"))
+    XCTAssertEqual(rig.client.lastStartModelOverride, "m-A.gguf")
 
     // Review v2 F1: the nil-assertion is meaningful only AFTER the gated
     // start actually resolved (threw) and the revival's catch had the actor
@@ -385,6 +390,9 @@ final class ActiveModelServeExecutorTests: XCTestCase {
     rig.client.releaseGate()
     await waitUntil("the gated start must resolve after release") {
       rig.client.gateResolved
+    }
+    await waitUntil("B's queued pick must own the next start after A settles") {
+      rig.client.lastStartModelOverride == "m-B.gguf"
     }
     await settle()
     XCTAssertNil(reported,
