@@ -41,6 +41,26 @@ final class HelperEngineIndicatorTests: XCTestCase {
                    StatusLED(tint: .red, blink: true))
   }
 
+
+  // MARK: - helper-owned starting label
+
+  func test_starting_label_override_attributes_helper_reconnect() {
+    XCTAssertEqual(
+      HelperEngineIndicator.startingLabelOverride(
+        helper: .reconnecting(consecutiveFailures: 1),
+        engine: .starting(detail: "Engine starting…")
+      ),
+      "Helper starting…")
+  }
+
+  func test_starting_label_override_leaves_healthy_engine_starting_alone() {
+    XCTAssertNil(
+      HelperEngineIndicator.startingLabelOverride(
+        helper: .healthy,
+        engine: .starting(detail: "Engine starting…")
+      ))
+  }
+
   // MARK: - combined fold
 
   func test_healthy_running_quietRing_greenDot() {

@@ -61,17 +61,28 @@ struct ModelLoadIndicator: View {
     } label: {
       HStack(spacing: 5) {
         if case .starting = state {
-          // #1: a starting engine reads honestly as "Starting… (Ns)" with
-          // a live elapsed counter — never a fault, even on a slow boot.
-          // The amber dot stays; this replaces the previously-bare
-          // starting pip so a long start is visibly progressing, not
-          // stuck. Driven by a view-local TimelineView off the store's
-          // `startingSince`, so it never adds a per-second @Published
-          // churn source (the #327 popover-stability rule). #421: no
-          // width-cap frame here — the short label sizes to content so it
-          // sits snug against the dot, aligned with the neighbouring
-          // toolbar icons instead of right-pushed inside a reserved slot.
-          StartingElapsedLabel(since: engineStatus.startingSince)
+          if let helperLabel = HelperEngineIndicator.startingLabelOverride(
+            helper: helperHealth.health,
+            engine: state
+          ) {
+            Text(helperLabel)
+              .monospacedDigit()
+              .lineLimit(1)
+              .font(.callout)
+              .foregroundStyle(.secondary)
+          } else {
+            // #1: a starting engine reads honestly as "Starting… (Ns)" with
+            // a live elapsed counter — never a fault, even on a slow boot.
+            // The amber dot stays; this replaces the previously-bare
+            // starting pip so a long start is visibly progressing, not
+            // stuck. Driven by a view-local TimelineView off the store's
+            // `startingSince`, so it never adds a per-second @Published
+            // churn source (the #327 popover-stability rule). #421: no
+            // width-cap frame here — the short label sizes to content so it
+            // sits snug against the dot, aligned with the neighbouring
+            // toolbar icons instead of right-pushed inside a reserved slot.
+            StartingElapsedLabel(since: engineStatus.startingSince)
+          }
         } else if let prefix = Self.pipLabel(for: state) {
           Text(prefix)
             .monospacedDigit()
@@ -141,6 +152,19 @@ struct ModelLoadIndicator: View {
   ///     or "Loading <leaf>" (indeterminate — the ellipsis is appended
   ///     separately as an animated view).
   ///   · `.error(err)` → the error title.
+
+  static func visibleLabel(
+    helper: HelperHealth,
+    engine: EngineIndicatorState,
+    startingElapsedText: String
+  ) -> String? {
+    if case .starting = engine {
+      return HelperEngineIndicator.startingLabelOverride(helper: helper, engine: engine)
+        ?? startingElapsedText
+    }
+    return pipLabel(for: engine)
+  }
+
   static func pipLabel(for state: EngineIndicatorState) -> String? {
     switch state {
     case let .error(error):

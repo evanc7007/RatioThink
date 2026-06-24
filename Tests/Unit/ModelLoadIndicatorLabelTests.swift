@@ -28,6 +28,23 @@ final class ModelLoadIndicatorLabelTests: XCTestCase {
     XCTAssertNil(ModelLoadIndicator.pipLabel(for: .starting(detail: "Engine starting…")))
   }
 
+
+  func test_visible_label_attributes_helper_reconnect_during_starting() {
+    XCTAssertEqual(
+      ModelLoadIndicator.visibleLabel(helper: .reconnecting(consecutiveFailures: 1),
+                                      engine: .starting(detail: "Engine starting…"),
+                                      startingElapsedText: "Starting… (3s)"),
+      "Helper starting…")
+  }
+
+  func test_visible_label_keeps_engine_starting_when_helper_is_healthy() {
+    XCTAssertEqual(
+      ModelLoadIndicator.visibleLabel(helper: .healthy,
+                                      engine: .starting(detail: "Engine starting…"),
+                                      startingElapsedText: "Starting… (3s)"),
+      "Starting… (3s)")
+  }
+
   // MARK: - error label = the error title
 
   func test_error_shows_error_title() {

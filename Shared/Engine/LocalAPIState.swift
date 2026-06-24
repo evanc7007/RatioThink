@@ -154,7 +154,7 @@ public struct LocalAPIState: Equatable {
         toggleOn: true,
         toggleEnabled: false,
         externalAccessToggleEnabled: false,
-        profileSelectionEnabled: false,
+        profileSelectionEnabled: true,
         statusLabel: helperIsReady ? "Starting…" : "Preparing the helper…",
         detail: helperIsReady
           ? "Available once the model finishes loading."
@@ -178,7 +178,7 @@ public struct LocalAPIState: Equatable {
         toggleOn: false,
         toggleEnabled: hasActiveProfile,
         externalAccessToggleEnabled: true,
-        profileSelectionEnabled: true,
+        profileSelectionEnabled: false,
         statusLabel: "Off",
         detail: hasActiveProfile
           ? "Turn on to start the engine and serve requests on 127.0.0.1."
@@ -195,7 +195,7 @@ public struct LocalAPIState: Equatable {
         toggleOn: false,
         toggleEnabled: canRetry,
         externalAccessToggleEnabled: true,
-        profileSelectionEnabled: true,
+        profileSelectionEnabled: false,
         statusLabel: "Engine failed",
         detail: failureReason(code: code, message: message),
         servedModelID: nil
