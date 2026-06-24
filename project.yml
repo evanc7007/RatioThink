@@ -20,7 +20,7 @@ settings:
     # CFBundleVersion from these build settings; without them the version
     # keys in each target's info.properties are dropped from the built bundle.
     MARKETING_VERSION: "0.1.7"
-    CURRENT_PROJECT_VERSION: "12"
+    CURRENT_PROJECT_VERSION: "13"
     ENABLE_HARDENED_RUNTIME: NO
     DEAD_CODE_STRIPPING: YES
   configs:
@@ -173,8 +173,8 @@ targets:
         CFBundleIconFile: AppIcon
         CFBundleName: Rational
         CFBundleDisplayName: Rational
-        CFBundleShortVersionString: "0.1.6"
-        CFBundleVersion: "11"
+        CFBundleShortVersionString: "0.1.7"
+        CFBundleVersion: "13"
         NSHumanReadableCopyright: "© 2026 Rational"
         NSSupportsAutomaticTermination: false
         NSSupportsSuddenTermination: false
@@ -230,8 +230,8 @@ targets:
         CFBundleIdentifier: com.ratiothink.app.helper
         CFBundleName: RationalHelper
         CFBundleDisplayName: Rational Helper
-        CFBundleShortVersionString: "0.1.6"
-        CFBundleVersion: "11"
+        CFBundleShortVersionString: "0.1.7"
+        CFBundleVersion: "13"
     settings:
       base:
         # Shipped helper bundle is `RationalHelper.app` (#445). Target name
