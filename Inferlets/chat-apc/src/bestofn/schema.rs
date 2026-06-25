@@ -62,6 +62,12 @@ pub struct BestOfNInput {
     /// snapshots. Think-more frees its prior round through the resume path
     /// instead, so this is only for the no-next-round terminals.
     pub release: Option<Vec<String>>,
+
+    /// Tool schemas (OpenAI function shape). When present they are equipped into
+    /// the model's native chat template (same path as chat/ToT), so each
+    /// candidate may emit a native tool call. Used for headless tool-calling
+    /// benchmarks (self-consistency over the N candidates, picked downstream).
+    pub tools: Option<Vec<crate::chat::completions::ToolSchema>>,
 }
 
 /// Validated, defaulted best-of-n parameters for one round.
@@ -74,6 +80,9 @@ pub struct BestOfNParams {
     pub top_p: f32,
     pub thinking: bool,
     pub level: usize,
+    /// True when the request supplied a non-empty `tools` list — switches each
+    /// candidate to a tool-aware directive (emit a native tool call).
+    pub has_tools: bool,
 }
 
 /// Apply defaults + bounds. `Err((field, message))` is an OpenAI-shape 400.
@@ -150,6 +159,7 @@ pub fn resolve(input: &BestOfNInput) -> Result<BestOfNParams, (&'static str, Str
     };
     let thinking = input.thinking.unwrap_or(false);
     let level = input.level.unwrap_or(1).max(1);
+    let has_tools = input.tools.as_ref().is_some_and(|t| !t.is_empty());
     Ok(BestOfNParams {
         n,
         max_tokens_per_candidate,
@@ -158,6 +168,7 @@ pub fn resolve(input: &BestOfNInput) -> Result<BestOfNParams, (&'static str, Str
         top_p,
         thinking,
         level,
+        has_tools,
     })
 }
 

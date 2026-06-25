@@ -295,9 +295,13 @@ pub async fn dispatch(
         // cue:false — the assistant turn is opened per branch in
         // `generate_branch`, so the shared prefix stays cue-free and its KV
         // pages are shared across the forked candidates.
-        if let Err((code, msg)) =
-            completions::fill_context(&mut root_ctx, &model, &messages, None, false)
-        {
+        if let Err((code, msg)) = completions::fill_context(
+            &mut root_ctx,
+            &model,
+            &messages,
+            input.tools.as_deref(),
+            false,
+        ) {
             let status = if completions::is_role_error_code(code) {
                 400
             } else {
@@ -390,10 +394,19 @@ async fn run_round(
     let directives: Vec<(String, String)> = metas
         .iter()
         .map(|(_, idx)| {
-            (
-                divergence::candidate_directive(*idx, params.thinking),
-                divergence::candidate_retry_directive(*idx),
-            )
+            if params.has_tools {
+                // Tool mode: each candidate emits a native tool call (schemas are
+                // equipped in the template). The prose divergence directive would
+                // fight that, so swap in a tool-aware one; downstream self-
+                // consistency voting picks among the N candidate calls.
+                let d = tool_candidate_directive(*idx, params.thinking);
+                (d.clone(), d)
+            } else {
+                (
+                    divergence::candidate_directive(*idx, params.thinking),
+                    divergence::candidate_retry_directive(*idx),
+                )
+            }
         })
         .collect();
 
@@ -438,6 +451,15 @@ async fn run_round(
     let mut kept: Vec<String> = Vec::new();
     for ((_gen_ctx, demux), (node_id, idx)) in gens.into_iter().zip(metas.iter()) {
         let node = match demux.kind {
+            // Headless tool mode never runs a think-more round, so a candidate's
+            // KV snapshot is never resumed. Skip the snapshot entirely and keep
+            // the answered candidate on its content alone — otherwise a snapshot-
+            // save failure (common under the larger tool-equipped prompt) would
+            // discard a perfectly good tool-call candidate.
+            DemuxKind::Answered if params.has_tools => {
+                kept.push(node_id.clone());
+                candidate_node(node_id, *idx, params.level, demux.answer, demux.reasoning)
+            }
             DemuxKind::Answered => {
                 let snapshot_name = format!("bon/{request_id}/{}/{}", params.level, idx);
                 let saved = save_candidate_snapshot(&base_ctx, &demux.answer, &snapshot_name).await;
@@ -506,6 +528,28 @@ async fn run_round(
     }
     sse::emit_done_logged(&mut em, "bon_terminal").await;
     em.finish()
+}
+
+/// Tool-aware candidate directive (used when `tools` were equipped). Each
+/// candidate is asked to commit to a single best tool call; a light per-index
+/// focus keeps the N samples from collapsing so self-consistency voting has
+/// signal. Mirrors `tot::search::tool_branch_directive`. `/no_think` is appended
+/// when thinking is off.
+fn tool_candidate_directive(idx: usize, thinking: bool) -> String {
+    let focus = match idx % 4 {
+        0 => "Prefer the most direct tool for the request.",
+        1 => "Prefer verifying or looking up details first if needed.",
+        2 => "Prefer checking the arguments are exact (ids, names, counts).",
+        _ => "Prefer the action that most directly satisfies the user.",
+    };
+    let body = format!(
+        "Decide the single best NEXT action for the user's latest request. If it requires a tool, CALL THAT TOOL NOW by emitting the tool call — do NOT describe the action in words or claim it is done in prose. If and only if no tool is needed yet (you must ask for missing info, or give info needing no tool), reply in one concise sentence. Use exact ids, names, and values from the conversation; do not invent them. {focus}"
+    );
+    if thinking {
+        body
+    } else {
+        format!("{body} /no_think")
+    }
 }
 
 /// A pickable (answered + saved) candidate as a tree-of-thought node. No

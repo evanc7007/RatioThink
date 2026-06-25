@@ -306,8 +306,9 @@ pub async fn dispatch(
     // cue:false — the assistant turn is opened per branch in `search`
     // (each fork re-cues), so the shared prefix stays cue-free and KV
     // pages are shared across branches.
+    let req_tools = input.tools;
     if let Err((code, msg)) =
-        completions::fill_context(&mut root_ctx, &model, &messages, None, false)
+        completions::fill_context(&mut root_ctx, &model, &messages, req_tools.as_deref(), false)
     {
         // #468: an unknown role is a client error (400, same envelope as
         // the completions path); other fill_context failures (e.g.
@@ -364,6 +365,9 @@ pub async fn dispatch(
         root: outcome.root,
         selected_node_id: outcome.selected_node_id,
         final_answer: outcome.final_answer,
+        tool_calls: outcome
+            .tool_call
+            .map(|(name, arguments)| vec![tree::ToolCallOut { name, arguments }]),
         synthesized: outcome.synthesized,
         generation_metrics: tree::GenerationMetrics::build(
             outcome.total_generated_tokens,

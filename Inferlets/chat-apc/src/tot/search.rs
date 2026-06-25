@@ -155,6 +155,39 @@ fn branch_uses_thinking(_level: usize, _max_depth: usize, thinking: bool) -> boo
     thinking
 }
 
+/// Tool-aware per-branch directive (used when the request supplied `tools`).
+/// Fix #2 (de-bias over-action): this is NEUTRAL on act-vs-restraint. Rather
+/// than forcing a tool call, it asks the branch to take the single best step
+/// PER POLICY — which may be acting (emit a native tool call, since the schemas
+/// are equipped via `inferlet::tools::equip_prefix`) OR holding back (ask for
+/// missing info, confirm before a change, refuse an unsupported request, or
+/// transfer to a human). It explicitly discourages extra/unauthorized actions,
+/// since on tau2 the deliberation methods over-act (~2x the write actions of
+/// plain chat) and unauthorized writes fail. The "emit the call directly, not a
+/// prose description" instruction is kept so detection still works WHEN the
+/// branch acts. The sibling `focus` is rebalanced to include restraint options
+/// so the search explores "should I hold back?" not only "which tool". Pure.
+fn tool_branch_directive(
+    level: usize,
+    max_depth: usize,
+    branch_index: usize,
+    breadth: usize,
+    thinking: bool,
+) -> String {
+    let n = branch_index + 1;
+    let focus = match branch_index % 4 {
+        0 => "Consider the most direct correct step.",
+        1 => "Consider whether confirmation or missing information is needed first.",
+        2 => "Consider whether the arguments must be exact (ids, names, counts).",
+        _ => "Consider whether the policy requires restraint here (refuse, or transfer to a human).",
+    };
+    let body = format!(
+        "Decide the single best NEXT step for the user's latest request, following the policy in this conversation exactly. If the policy calls for an ACTION, perform it by emitting the tool call directly (not a prose description, and never claim an action is done without calling the tool). If the policy instead calls for RESTRAINT — ask for missing information, confirm before making a change, refuse an unsupported request, or transfer to a human — then do that in one concise sentence and do NOT call a tool. Take the minimal correct step; never take extra or unauthorized actions. Use exact ids, names, and values from the conversation; never invent them. Option {n} of {breadth}: {focus}"
+    );
+    let _ = (level, max_depth);
+    with_thinking(&body, thinking)
+}
+
 /// Value-evaluator prompts (independent per-node scoring). The scorer is a
 /// value HEAD, but a small model rating its own fluency is unreliable — it
 /// over-ranks confident-but-wrong arithmetic and trap answers (#555: discount
@@ -1213,6 +1246,11 @@ pub struct SearchOutcome {
     /// failed search (node reasoning/answers, scorer generations, synthesis
     /// attempt if any), excluding prompt/input tokens (#542).
     pub total_generated_tokens: usize,
+    /// The tool call parsed from the selected leaf when the search ran with
+    /// `tools` equipped: `(name, arguments_json)`. `None` for a non-tool search
+    /// or when the selected leaf carried no parseable native tool call (it then
+    /// fell back to a prose `final_answer`).
+    pub tool_call: Option<(String, String)>,
 }
 
 /// Run the beam search. `root_ctx` must already be filled (system +
@@ -1433,6 +1471,28 @@ pub async fn run(
     };
     let synth_ctx = choose_synthesis_context(synth_base, None::<Context>);
     let mut outcome = finalize_for_task(flat, &last_level, params.depth, params.task);
+    // Tool mode: the selected leaf is a native tool call, not a prose answer.
+    // Parse it off the leaf content and surface it structurally; skip the prose
+    // synthesis entirely (it would rewrite the call into a sentence). The raw
+    // leaf content is left on `final_answer` as an inspection fallback.
+    if params.has_tools {
+        // The math value-scorer mis-ranks tool calls (it rewards reasoning-shaped
+        // prose over terse actions — measured ~8.3 vs ~4.4 on airline), so its
+        // selected leaf is unreliable. Instead decide by SELF-CONSISTENCY over the
+        // FULL per-branch decision: each leaf votes for its specific tool call OR
+        // for "do not act" (a prose/restraint answer). The plurality wins (ties →
+        // the greedy-anchor branch). Counting restraint as a first-class vote
+        // (fix #2) stops a lone exploratory call from overriding a majority that
+        // chose to hold back — the deliberation methods otherwise OVER-ACT (~2x
+        // the write actions of plain chat, which fail tau2's policy checks). When
+        // "do not act" wins, `tool_call` stays None and the caller surfaces the
+        // selected prose leaf.
+        let mut decisions: Vec<Option<(String, String)>> = Vec::new();
+        collect_leaf_decisions(&outcome.root, &mut decisions);
+        outcome.tool_call = majority_decision(&decisions);
+        outcome.total_generated_tokens = total_generated_tokens;
+        return outcome;
+    }
     if params.task == TotTask::Reasoning {
         outcome.total_generated_tokens = total_generated_tokens;
         return outcome;
@@ -1677,6 +1737,145 @@ fn selected_synthesis_content(flat: &[Node], selected_id: &str) -> Option<String
 /// full failure, synthesis may still replace it later; without synthesis the
 /// terminal `final_answer` stays null rather than presenting an intermediate
 /// step as a direct answer. Pure → unit-tested.
+/// Parse a native tool call out of a leaf's visible content (tool mode). The
+/// model emits `<tool_call>\n{"name":...,"arguments":{...}}\n</tool_call>`; that
+/// text lands in the answer channel verbatim. We parse the JSON directly rather
+/// than re-feeding `inferlet::tools::Decoder` (round-tripping the literal tag
+/// text through the tokenizer yields different ids than the model's native
+/// control tokens, so the decoder misses it). Returns `(name, arguments_json)`
+/// where `arguments_json` is the args object re-serialized to a JSON string
+/// (the OpenAI `tool_calls[].function.arguments` shape). Pure → unit-tested.
+fn parse_tool_call_from_content(content: &str) -> Option<(String, String)> {
+    // Prefer the span inside <tool_call>...</tool_call> when the tags are present.
+    let inner = match content.find("<tool_call>") {
+        Some(i) => {
+            let after = &content[i + "<tool_call>".len()..];
+            match after.find("</tool_call>") {
+                Some(j) => &after[..j],
+                None => after,
+            }
+        }
+        None => content,
+    };
+    // Extract the first balanced {...} JSON object (string-aware).
+    let start = inner.find('{')?;
+    let bytes = inner.as_bytes();
+    let mut depth = 0usize;
+    let mut in_str = false;
+    let mut esc = false;
+    let mut end = None;
+    for (k, &b) in bytes[start..].iter().enumerate() {
+        if in_str {
+            match b {
+                _ if esc => esc = false,
+                b'\\' => esc = true,
+                b'"' => in_str = false,
+                _ => {}
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_str = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = Some(start + k + 1);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let obj = &inner[start..end?];
+    let v: serde_json::Value = serde_json::from_str(obj).ok()?;
+    let name = v.get("name")?.as_str()?.to_string();
+    if name.is_empty() {
+        return None;
+    }
+    let arguments = match v.get("arguments") {
+        Some(a) if a.is_string() => a.as_str().unwrap().to_string(),
+        Some(a) => serde_json::to_string(a).ok()?,
+        None => "{}".to_string(),
+    };
+    Some((name, arguments))
+}
+
+/// Collect the per-branch DECISION from every LEAF node (no children): `Some(call)`
+/// if the leaf emitted a parseable tool call, `None` if it produced a non-empty
+/// prose answer (a vote to NOT act / restraint). Empty/failed leaves are skipped.
+/// Tool-mode self-consistency votes over these. Pure → unit-tested.
+fn collect_leaf_decisions(node: &Node, out: &mut Vec<Option<(String, String)>>) {
+    if node.children.is_empty() {
+        if let Some(call) = parse_tool_call_from_content(&node.content) {
+            out.push(Some(call));
+        } else if !node.content.trim().is_empty() {
+            out.push(None);
+        }
+        return;
+    }
+    for child in &node.children {
+        collect_leaf_decisions(child, out);
+    }
+}
+
+/// Canonicalize a tool-call arguments JSON string for vote-equality (key order /
+/// whitespace insensitive; serde_json `Value`'s map is a sorted `BTreeMap`). Pure.
+fn canon_args(args: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(args)
+        .map(|v| v.to_string())
+        .unwrap_or_else(|_| args.trim().to_string())
+}
+
+/// Self-consistency vote over per-branch decisions, ANCHORED ON THE GREEDY BRANCH
+/// (fix #3). `decisions[0]` is branch 0 — the greedy argmax anchor, which the
+/// oracle-leaf analysis found is almost never wrong (0 wrong write tools) and wins
+/// 88% of acting selections. So the act/restraint GATE trusts it: ACT if the
+/// greedy anchor proposes a call OR calls are not a minority; abstain ONLY when
+/// even the greedy mode held back AND abstentions strictly outnumber calls. This
+/// sits between fix #1 (over-acted) and fix #2 (over-abstained ~29-39% of turns
+/// that needed action). When acting, WHICH call is still chosen by majority vote
+/// among the call leaves (ties → earliest = greedy), preserving the in-tree
+/// selection win. Returns the winning call, or `None` for genuine restraint / no
+/// decisions. Pure → unit-tested.
+fn majority_decision(decisions: &[Option<(String, String)>]) -> Option<(String, String)> {
+    if decisions.is_empty() {
+        return None;
+    }
+    let calls: Vec<(usize, (String, String))> = decisions
+        .iter()
+        .enumerate()
+        .filter_map(|(i, d)| d.clone().map(|c| (i, c)))
+        .collect();
+    let n_calls = calls.len();
+    let n_abstain = decisions.len() - n_calls;
+    let greedy_acts = decisions[0].is_some();
+    // Gate: act unless even the greedy anchor abstained AND restraint is a strict
+    // majority of the branches that produced an answer.
+    let act = greedy_acts || n_calls >= n_abstain;
+    if !act || n_calls == 0 {
+        return None;
+    }
+    // Pick which call by majority vote among the call leaves; ties → earliest.
+    let mut tally: Vec<(String, usize, usize, (String, String))> = Vec::new();
+    for (i, c) in &calls {
+        let key = format!("{}\u{1}{}", c.0, canon_args(&c.1));
+        if let Some(entry) = tally.iter_mut().find(|e| e.0 == key) {
+            entry.1 += 1;
+        } else {
+            tally.push((key, 1, *i, c.clone()));
+        }
+    }
+    let mut best: Option<&(String, usize, usize, (String, String))> = None;
+    for e in &tally {
+        best = match best {
+            Some(b) if b.1 > e.1 || (b.1 == e.1 && b.2 <= e.2) => best,
+            _ => Some(e),
+        };
+    }
+    best.map(|b| b.3.clone())
+}
+
 #[cfg(test)]
 fn finalize(flat: Vec<Node>, last_level: &[Candidate], final_answer_depth: usize) -> SearchOutcome {
     finalize_for_task(flat, last_level, final_answer_depth, TotTask::Chat)
@@ -1707,6 +1906,8 @@ fn finalize_for_task(
         synthesized: false,
         // Filled by `run`, which owns the engine-bound token accounting.
         total_generated_tokens: 0,
+        // Filled by `run` when the search ran with tools equipped.
+        tool_call: None,
     }
 }
 
@@ -2283,6 +2484,19 @@ async fn generate_tot_branch(
     // levels and the final answer only at the leaf. Only this production call
     // site branches — `branch_directive`/`retry_branch_directive` and their
     // tests are untouched, so the conversational path cannot regress.
+    // Tool mode takes precedence over task mode: when tools are equipped, every
+    // branch deliberates over which action (tool call) to take, so it uses the
+    // tool-aware directive regardless of chat/reasoning task. The retry reuses
+    // the same directive (there is no answer-first reframing for a tool call).
+    if params.has_tools {
+        let directive =
+            tool_branch_directive(level, params.depth, branch_index, params.breadth, params.thinking);
+        return generate_branch(
+            ctx, model, params, sink, node_id, parent_id, level, branch_index, sibling_bias,
+            &directive, &directive,
+        )
+        .await;
+    }
     let (first_directive, retry_directive) = match params.task {
         TotTask::Reasoning => (
             reasoning_branch_directive(
@@ -4069,6 +4283,7 @@ mod tests {
             exec: super::super::schema::ExecStrategy::CoupledSequential,
             task: super::super::schema::TotTask::Chat,
             sibling_penalty: 0.0,
+            has_tools: false,
         }
     }
 
@@ -5015,5 +5230,88 @@ mod tests {
         // single-judge branch (no extra forks, no median) = shipped behaviour.
         assert_eq!(TotTask::Chat.score_samples(), 1);
         assert_eq!(TotTask::Reasoning.score_samples(), 3);
+    }
+
+    #[test]
+    fn parses_native_tool_call_from_tagged_content() {
+        let c = "<tool_call>\n{\"name\": \"cancel_reservation\", \"arguments\": {\"reservation_id\": \"EHGLP3\"}}\n</tool_call>";
+        let (name, args) = parse_tool_call_from_content(c).expect("should parse");
+        assert_eq!(name, "cancel_reservation");
+        let v: serde_json::Value = serde_json::from_str(&args).unwrap();
+        assert_eq!(v["reservation_id"], "EHGLP3");
+    }
+
+    #[test]
+    fn parses_tool_call_without_tags() {
+        // The args object contains a brace-bearing string — the string-aware
+        // scan must not end the object early on the nested `}`.
+        let c = "{\"name\":\"book\",\"arguments\":{\"note\":\"a } brace\",\"n\":2}}";
+        let (name, args) = parse_tool_call_from_content(c).expect("should parse");
+        assert_eq!(name, "book");
+        let v: serde_json::Value = serde_json::from_str(&args).unwrap();
+        assert_eq!(v["note"], "a } brace");
+        assert_eq!(v["n"], 2);
+    }
+
+    #[test]
+    fn prose_answer_yields_no_tool_call() {
+        assert!(parse_tool_call_from_content("Your reservation has been canceled.").is_none());
+        // An object with no `name` is not a call.
+        assert!(parse_tool_call_from_content("{\"foo\":1}").is_none());
+    }
+
+    fn call(name: &str, args: &str) -> Option<(String, String)> {
+        Some((name.into(), args.into()))
+    }
+
+    #[test]
+    fn majority_decision_picks_most_common_call() {
+        let d = vec![call("cancel", "{\"id\":\"A\"}"), call("cancel", "{\"id\":\"A\"}"), call("lookup", "{\"id\":\"A\"}")];
+        assert_eq!(majority_decision(&d).unwrap().0, "cancel");
+    }
+
+    #[test]
+    fn majority_decision_args_canonicalized() {
+        // Same call, different key order / whitespace → counted as one (wins 2-1).
+        let d = vec![
+            call("book", "{\"a\":1,\"b\":2}"),
+            call("book", "{ \"b\":2, \"a\":1 }"),
+            call("book", "{\"a\":9}"),
+        ];
+        let w = majority_decision(&d).unwrap();
+        assert_eq!(w.0, "book");
+        assert_eq!(canon_args(&w.1), canon_args("{\"a\":1,\"b\":2}"));
+    }
+
+    #[test]
+    fn majority_decision_restraint_needs_real_majority() {
+        // Fix #3: restraint wins only when the greedy anchor abstains AND
+        // abstentions strictly outnumber calls — a clear 2/3 hold-back.
+        let d = vec![None, None, call("get_x", "{}")]; // greedy abstains, 2>1 abstain
+        assert!(majority_decision(&d).is_none());
+        // A 2-1 call majority acts.
+        let d2 = vec![call("act", "{}"), call("act", "{}"), None];
+        assert_eq!(majority_decision(&d2).unwrap().0, "act");
+    }
+
+    #[test]
+    fn majority_decision_greedy_anchor_acts_over_minority_restraint() {
+        // Fix #3 core: greedy anchor proposes a call but 2 branches abstain →
+        // still ACT (trust the greedy anchor; this kills the over-abstention).
+        let d = vec![call("go", "{}"), None, None];
+        assert_eq!(majority_decision(&d).unwrap().0, "go");
+        // Greedy abstains, a single call ties the abstentions → act (calls >= abstain).
+        let d2 = vec![None, call("x", "{}")];
+        assert_eq!(majority_decision(&d2).unwrap().0, "x");
+    }
+
+    #[test]
+    fn majority_decision_ties_break_to_first() {
+        // 1-1-1 tie among distinct calls → first occurrence (greedy anchor) wins.
+        let d = vec![call("first", "{}"), call("second", "{}"), call("third", "{}")];
+        assert_eq!(majority_decision(&d).unwrap().0, "first");
+        assert!(majority_decision(&[]).is_none());
+        // All abstain → no action.
+        assert!(majority_decision(&[None, None, None]).is_none());
     }
 }

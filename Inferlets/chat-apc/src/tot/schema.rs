@@ -236,6 +236,12 @@ pub struct TotInput {
     pub task: Option<TotTask>,
     /// Cross-sibling logit penalty (#693c). `0.0` (default) disables it.
     pub sibling_penalty: Option<f32>,
+    /// Tool schemas (OpenAI `function` shape). When present, they are rendered
+    /// into the model's native chat template via `inferlet::tools::equip_prefix`
+    /// (same path the chat-completions endpoint uses), so each branch may emit
+    /// a native tool call; the call is detected and surfaced on the selected
+    /// node / response instead of being synthesized into prose.
+    pub tools: Option<Vec<crate::chat::completions::ToolSchema>>,
 }
 
 /// Validated, defaulted search parameters.
@@ -270,6 +276,11 @@ pub struct TotParams {
     /// sequential within-group generation so each explorer down-biases the
     /// tokens earlier siblings emitted.
     pub sibling_penalty: f32,
+    /// True when the request supplied a non-empty `tools` list. Switches each
+    /// branch to a tool-aware directive (emit a native tool call for actions
+    /// instead of prose) and makes the search surface the selected node's tool
+    /// call instead of synthesizing a prose final answer.
+    pub has_tools: bool,
 }
 
 /// Total candidate nodes generated across all levels:
@@ -299,6 +310,7 @@ pub fn resolve(input: &TotInput) -> Result<TotParams, (&'static str, String)> {
     let exec = input.exec.unwrap_or_default();
     let task = input.task.unwrap_or_default();
     let sibling_penalty = input.sibling_penalty.unwrap_or(DEFAULT_SIBLING_PENALTY);
+    let has_tools = input.tools.as_ref().is_some_and(|t| !t.is_empty());
     // #465 gate: production builds (feature off) support the two *coupled*
     // strategies — `coupled_concurrent` (the re-measured default) and
     // `coupled_sequential` (the low-residency escape hatch) — and REJECT the
@@ -381,6 +393,7 @@ pub fn resolve(input: &TotInput) -> Result<TotParams, (&'static str, String)> {
         exec,
         task,
         sibling_penalty,
+        has_tools,
     })
 }
 

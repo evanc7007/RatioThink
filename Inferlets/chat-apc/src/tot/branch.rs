@@ -63,5 +63,7 @@ pub(crate) fn round_params(
         // Best-of-N's divergence is the per-candidate directive pair; it does
         // not use the ToT cross-sibling token penalty (#693c).
         sibling_penalty: 0.0,
+        // Best-of-N does not equip tools; it is a plain candidate-generation path.
+        has_tools: false,
     }
 }

@@ -86,6 +86,16 @@ impl Node {
     }
 }
 
+/// A tool call surfaced from the selected leaf when the search ran with
+/// `tools` equipped. `arguments` is the JSON-encoded args object as the model
+/// emitted it (an OpenAI client re-parses it). The caller/proxy wraps this into
+/// the OpenAI `tool_calls` shape (adding an id + `type:"function"`).
+#[derive(Serialize)]
+pub struct ToolCallOut {
+    pub name: String,
+    pub arguments: String,
+}
+
 /// Top-level tree-of-thought response envelope.
 #[derive(Serialize)]
 pub struct TreeResponse {
@@ -98,6 +108,10 @@ pub struct TreeResponse {
     pub root: Node,
     pub selected_node_id: Option<String>,
     pub final_answer: Option<String>,
+    /// Tool calls parsed from the selected leaf when `tools` were equipped.
+    /// Omitted entirely for a non-tool search (preserves the legacy wire).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCallOut>>,
     /// `true` when `final_answer` is the post-search synthesis, `false` when
     /// the raw best-leaf content stood (#523 Part A F1) — lets a non-streaming
     /// caller (e.g. the gated smoke) assert the synthesizer actually ran.
@@ -617,6 +631,7 @@ mod tests {
             root: Node::root(),
             selected_node_id: None,
             final_answer: None,
+            tool_calls: None,
             synthesized: false,
             generation_metrics: None,
         };

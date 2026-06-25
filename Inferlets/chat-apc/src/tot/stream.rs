@@ -666,6 +666,7 @@ mod tests {
             exec: crate::tot::schema::ExecStrategy::default(),
             task: crate::tot::schema::TotTask::Chat,
             sibling_penalty: 0.0,
+            has_tools: false,
         };
         let v = serde_json::to_value(TreeStartFrame {
             event: "tree_start",
