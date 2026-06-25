@@ -363,10 +363,19 @@ public final class EngineStatusStore: ObservableObject {
             break
           case .starting:
             self.apply(next: next, error: nil)
-          case .running, .failed:
+          case .running:
             self.apply(next: next, error: nil)
             self.start()
             return
+          case .failed:
+            self.apply(next: next, error: nil)
+            // `apply` may hold a first-load transient failure as `.starting`
+            // for the grace window. Only treat a surfaced failure as terminal;
+            // otherwise keep converging through the start transition.
+            if case .failed = self.status {
+              self.start()
+              return
+            }
           case .stopping:
             // A competing teardown is authoritative; surface it and keep polling.
             self.apply(next: next, error: nil)
