@@ -7,6 +7,20 @@ import AppKit
 /// App/RatioThink.entitlements), so spawning `/bin/bash` + `log show`/`spctl`
 /// is permitted.
 enum DiagnosticsCollector {
+  static let runningMessage = "Collecting diagnostics…"
+
+  static func successMessage(_ zip: URL) -> String {
+    "Diagnostics bundle created: \(zip.lastPathComponent)"
+  }
+
+  #if DEBUG
+  private static func debugDelayNanoseconds(environmentKey: String, defaultMilliseconds: UInt64) -> UInt64 {
+    let raw = ProcessInfo.processInfo.environment[environmentKey]
+    let milliseconds = raw.flatMap(UInt64.init) ?? defaultMilliseconds
+    return milliseconds * 1_000_000
+  }
+  #endif
+
   enum CollectError: LocalizedError {
     case scriptMissing
     case launchFailed(String)
@@ -30,6 +44,25 @@ enum DiagnosticsCollector {
   /// Spawn the bundled script and parse its `Bundle: <path>` line. Runs the
   /// blocking `Process` work off the main actor; call from a `Task`.
   static func collect() async throws -> URL {
+    #if DEBUG
+    if let fakeZip = ProcessInfo.processInfo.environment["PIE_TEST_DIAGNOSTICS_FAKE_ZIP"],
+       !fakeZip.isEmpty {
+      let url = URL(fileURLWithPath: fakeZip)
+      try FileManager.default.createDirectory(
+        at: url.deletingLastPathComponent(),
+        withIntermediateDirectories: true
+      )
+      if !FileManager.default.fileExists(atPath: url.path) {
+        try Data().write(to: url)
+      }
+      try? await Task.sleep(nanoseconds: debugDelayNanoseconds(
+        environmentKey: "PIE_TEST_DIAGNOSTICS_DELAY_MS",
+        defaultMilliseconds: 150
+      ))
+      return url
+    }
+    #endif
+
     guard let script = Bundle.main.url(forResource: "collect-diagnostics",
                                        withExtension: "sh") else {
       throw CollectError.scriptMissing
@@ -67,19 +100,18 @@ enum DiagnosticsCollector {
     return URL(fileURLWithPath: path)
   }
 
-  /// Collect, then reveal the `.zip` in Finder (or present an alert on failure).
-  /// Main-actor entry point for the menu command.
+  /// Collect, then reveal the `.zip` in Finder. Callers own failure feedback so
+  /// the user sees one surface (banner/overlay), not a modal plus inline error.
   @MainActor
-  static func collectAndReveal() async {
+  @discardableResult
+  static func collectAndReveal() async -> URL? {
     do {
       let zip = try await collect()
       NSWorkspace.shared.activateFileViewerSelecting([zip])
+      return zip
     } catch {
-      let alert = NSAlert()
-      alert.messageText = "Couldn't collect diagnostics"
-      alert.informativeText = error.localizedDescription
-      alert.alertStyle = .warning
-      alert.runModal()
+      NSLog("Couldn't collect diagnostics: \(error.localizedDescription)")
+      return nil
     }
   }
 }

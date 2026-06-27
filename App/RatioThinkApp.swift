@@ -93,6 +93,7 @@ struct RatioThinkApp: App {
   /// `PIE_TEST_STALL_WATCHDOG=1`.
   @StateObject private var stallWatchdog = MainThreadStallWatchdog()
   #endif
+  @State private var commandActionFeedback: ActionFeedback?
 
   /// #587 resume trigger: re-arm the (possibly paused) engine-status poll
   /// loop when the app returns to the foreground, so the user always sees a
@@ -372,7 +373,8 @@ struct RatioThinkApp: App {
     #endif
     let controller = HelperHealthController(
       repair: helperRepair,
-      pinnedHealth: pinnedHelperHealth
+      pinnedHealth: pinnedHelperHealth,
+      pinnedManualRestartSucceeds: Self.pinnedHelperRestartSucceedsForTesting()
     )
     // Set BEFORE statusStore.start() so the first ticks count.
     statusStore.onPollOutcome = { [weak controller] succeeded in
@@ -397,6 +399,14 @@ struct RatioThinkApp: App {
     case "healthy":     return .healthy
     default:            return nil
     }
+  }
+
+  private static func pinnedHelperRestartSucceedsForTesting() -> Bool {
+    #if DEBUG
+    return ProcessInfo.processInfo.environment["PIE_TEST_PIN_HELPER_RESTART"] != "fail"
+    #else
+    return true
+    #endif
   }
   #endif
 
@@ -552,10 +562,12 @@ struct RatioThinkApp: App {
   @MainActor
   private func restartEngine() {
     Task {
+      commandActionFeedback = .running("Restarting engine…")
       await Self.performHelperRegistrationReconcile()
       guard let profileID = profileStore.activeProfileID,
             !profileID.isEmpty else {
         NSLog("Restart Engine: no active profile to start")
+        commandActionFeedback = .failed("No active profile is available to restart.")
         return
       }
       do {
@@ -568,10 +580,17 @@ struct RatioThinkApp: App {
           lastServedModelID: profileStore.activeModelID)
         try await engineStatusStore.startEngine(profileID: profileID,
                                                 modelOverride: modelOverride)
+        commandActionFeedback = .succeeded("Engine restart requested.")
       } catch {
         NSLog("Restart Engine: startEngine(\(profileID)) failed: \(error)")
+        commandActionFeedback = .failed(ChatScaffoldView.engineErrorMessage(error, verb: "restart"))
       }
     }
+  }
+
+  @MainActor
+  private func collectDiagnosticsFromCommand() {
+    collectDiagnosticsWithActionFeedback { commandActionFeedback = $0 }
   }
 
   /// Durable launch breadcrumb: proves the app process started, and records the
@@ -654,6 +673,20 @@ struct RatioThinkApp: App {
         // #420: route the menu-bar Helper's `ratiothink://settings` deep
         // link straight to the Settings scene (not just app-foreground).
         .handlesSettingsDeepLink(settingsNavigation: settingsNavigation)
+        .overlay(alignment: .top) {
+          if let commandActionFeedback {
+            ActionFeedbackView(
+              feedback: commandActionFeedback,
+              accessibilityPrefix: "app.command.action",
+              style: .commandOverlay
+            )
+              .padding(.top, 8)
+              .padding(.horizontal, 12)
+          }
+        }
+        .autoDismissActionFeedback(commandActionFeedback) {
+          commandActionFeedback = nil
+        }
         // #587: re-arm the adaptive poll loop on foreground. `start()` is
         // idempotent, so this is free when the loop is already running and
         // wakes it from a paused (stopped/idle) state to refresh status.
@@ -707,7 +740,7 @@ struct RatioThinkApp: App {
         // #358: user-reachable diagnostics. Runs the bundled
         // collect-diagnostics.sh and reveals the redacted .zip in Finder.
         Button("Collect Diagnostics…") {
-          Task { await DiagnosticsCollector.collectAndReveal() }
+          collectDiagnosticsFromCommand()
         }
       }
       #if DEBUG
