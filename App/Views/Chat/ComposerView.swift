@@ -2,6 +2,7 @@ import SwiftUI
 import SwiftData
 import AppKit
 import os
+import UniformTypeIdentifiers
 
 /// Bottom-of-detail input row. Single `TextEditor` that auto-grows from
 /// 1 line up to a hard 8-line ceiling, then internally scrolls.
@@ -36,6 +37,8 @@ struct ComposerView: View {
   /// `ChatSendController.cancel` keeps a non-empty partial bubble as a
   /// cancelled turn (excluded from future request history).
   let onStop: () -> Void
+  let attachmentEngineTokenLimit: Int?
+  let attachmentModelContextLength: Int?
   /// #516: a fired pending auto-send. The composer re-runs its normal
   /// `submit()` path — same persistence, same gate, same in-flight
   /// lifecycle as a manual send — but ONLY while the live draft still
@@ -45,6 +48,8 @@ struct ComposerView: View {
   @Environment(\.modelContext) private var modelContext
   @EnvironmentObject private var persistenceStatus: PersistenceStatus
   @State private var draft: String = ""
+  @State private var pendingAttachments: [PendingChatAttachment] = []
+  @State private var attachmentNotice: String?
   /// The editor's live laid-out width, captured from SwiftUI via a
   /// background `GeometryReader`. The box height is derived from `draft` +
   /// this width (see `editorHeight`), so it is computed where both inputs
@@ -122,6 +127,8 @@ struct ComposerView: View {
     onSendBlocked: @escaping (String) -> Void = { _ in },
     onUserMessageSaved: @escaping (Message) -> Void = { _ in },
     onStop: @escaping () -> Void = {},
+    attachmentEngineTokenLimit: Int? = nil,
+    attachmentModelContextLength: Int? = nil,
     autoSubmit: ComposerAutoSubmit? = nil
   ) {
     self.chat = chat
@@ -131,62 +138,100 @@ struct ComposerView: View {
     self.onSendBlocked = onSendBlocked
     self.onUserMessageSaved = onUserMessageSaved
     self.onStop = onStop
+    self.attachmentEngineTokenLimit = attachmentEngineTokenLimit
+    self.attachmentModelContextLength = attachmentModelContextLength
     self.autoSubmit = autoSubmit
   }
 
   var body: some View {
-    HStack(alignment: .bottom, spacing: 8) {
-      ComposerTextEditor(
-        text: $draft,
-        onSubmit: submit
-      )
-      .frame(height: editorHeight)
-      // Capture the editor's live width so `editorHeight` can wrap-measure
-      // the draft at the real width (#446). Width is set by the HStack and is
-      // independent of height, so this never feeds back into a layout loop.
-      .background(
-        GeometryReader { geo in
-          Color.clear.preference(key: ComposerEditorWidthKey.self, value: geo.size.width)
+    VStack(alignment: .leading, spacing: 6) {
+      if !pendingAttachments.isEmpty {
+        ScrollView(.horizontal, showsIndicators: false) {
+          HStack(spacing: 6) {
+            ForEach(pendingAttachments) { attachment in
+              attachmentChip(attachment)
+            }
+          }
         }
-      )
-      .onPreferenceChange(ComposerEditorWidthKey.self) { editorWidth = $0 }
-      .padding(.horizontal, 10)
-      .padding(.vertical, Self.verticalPadding)
-      .background(
-        RoundedRectangle(cornerRadius: 10, style: .continuous)
-          .strokeBorder(Color.secondary.opacity(0.35), lineWidth: 1)
-          .background(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-              .fill(Color(nsColor: .textBackgroundColor))
-          )
-      )
-      .focused($isFocused)
-      .accessibilityIdentifier("composer.text")
+        .accessibilityIdentifier("composer.attachments")
+      }
+      if let attachmentNotice {
+        Text(attachmentNotice)
+          .font(.caption)
+          .foregroundStyle(.secondary)
+          .accessibilityIdentifier("composer.attachmentNotice")
+      }
+      HStack(alignment: .bottom, spacing: 8) {
+        Button(action: openAttachmentPanel) {
+          Image(systemName: "paperclip.circle")
+            .font(.system(size: 24, weight: .regular))
+        }
+        .buttonStyle(.plain)
+        .disabled(isSending)
+        .help("Attach text or PDF files")
+        .accessibilityIdentifier("composer.attach")
 
-      if isSending {
-        // #507: while this chat's turn streams, the trailing control is a
-        // stop button — the user-reachable cancel (the navigate-away cancel
-        // is gone; switching chats no longer touches the stream).
-        Button(action: onStop) {
-          Image(systemName: "stop.circle.fill")
-            .font(.system(size: 26, weight: .regular))
+        ComposerTextEditor(
+          text: $draft,
+          onSubmit: submit
+        )
+        .frame(height: editorHeight)
+        // Capture the editor's live width so `editorHeight` can wrap-measure
+        // the draft at the real width (#446). Width is set by the HStack and is
+        // independent of height, so this never feeds back into a layout loop.
+        .background(
+          GeometryReader { geo in
+            Color.clear.preference(key: ComposerEditorWidthKey.self, value: geo.size.width)
+          }
+        )
+        .onPreferenceChange(ComposerEditorWidthKey.self) { editorWidth = $0 }
+        .padding(.horizontal, 10)
+        .padding(.vertical, Self.verticalPadding)
+        .background(
+          RoundedRectangle(cornerRadius: 10, style: .continuous)
+            .strokeBorder(Color.secondary.opacity(0.35), lineWidth: 1)
+            .background(
+              RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(Color(nsColor: .textBackgroundColor))
+            )
+        )
+        .focused($isFocused)
+        .accessibilityIdentifier("composer.text")
+
+        if isSending {
+          // #507: while this chat's turn streams, the trailing control is a
+          // stop button — the user-reachable cancel (the navigate-away cancel
+          // is gone; switching chats no longer touches the stream).
+          Button(action: onStop) {
+            Image(systemName: "stop.circle.fill")
+              .font(.system(size: 26, weight: .regular))
+          }
+          .buttonStyle(.plain)
+          .help("Stop generating")
+          .accessibilityIdentifier("composer.stop")
+        } else {
+          Button(action: submit) {
+            Image(systemName: "arrow.up.circle.fill")
+              .font(.system(size: 26, weight: .regular))
+          }
+          .buttonStyle(.plain)
+          .disabled(trimmedDraft.isEmpty && pendingAttachments.isEmpty)
+          .help("Send (Return). Shift+Return inserts a newline.")
+          .accessibilityIdentifier("composer.send")
         }
-        .buttonStyle(.plain)
-        .help("Stop generating")
-        .accessibilityIdentifier("composer.stop")
-      } else {
-        Button(action: submit) {
-          Image(systemName: "arrow.up.circle.fill")
-            .font(.system(size: 26, weight: .regular))
-        }
-        .buttonStyle(.plain)
-        .disabled(trimmedDraft.isEmpty)
-        .help("Send (Return). Shift+Return inserts a newline.")
-        .accessibilityIdentifier("composer.send")
       }
     }
     .padding(.horizontal, 16)
     .padding(.vertical, 10)
+    .onDrop(of: [UTType.fileURL], isTargeted: nil) { providers in
+      DroppedURLs.resolve(providers) { resolution in
+        addAttachments(from: resolution.urls)
+        if let firstError = resolution.errors.first {
+          attachmentNotice = firstError
+        }
+      }
+      return true
+    }
     .onAppear {
       isFocused = true
     }
@@ -205,7 +250,17 @@ struct ComposerView: View {
 
   private func submit() {
     let payload = trimmedDraft
-    guard !payload.isEmpty, !isSending else { return }
+    guard (!payload.isEmpty || !pendingAttachments.isEmpty), !isSending else { return }
+    let attachmentContext = Self.preparedAttachmentContext(
+      attachments: pendingAttachments,
+      engineProvidedMaxTokens: attachmentEngineTokenLimit,
+      modelConfiguredContextLength: attachmentModelContextLength
+    ) { message in
+      composerLog.error("\(message, privacy: .public)")
+    }
+    if let notice = attachmentContext.notice {
+      attachmentNotice = notice
+    }
     // : block before persisting if no model is resolvable. Keep the
     // draft so the user can send it once they load/choose a model.
     guard shouldAllowSend() else {
@@ -224,6 +279,7 @@ struct ComposerView: View {
     let message = Message(
       role: ChatMessage.Role.user.rawValue,
       content: payload,
+      extractedAttachmentText: attachmentContext.text.nilIfEmpty,
       ts: Date()
     )
     let previousUpdatedAt = chat.updatedAt
@@ -242,6 +298,8 @@ struct ComposerView: View {
     do {
       try modelContext.save()
       draft = ""
+      pendingAttachments = []
+      attachmentNotice = attachmentContext.notice
       onUserMessageSaved(message)
     } catch {
       // UI / store divergence repair ( F8): peel the in-memory
@@ -254,6 +312,69 @@ struct ComposerView: View {
       persistenceStatus.report(error, context: "ComposerView.submit")
     }
   }
+
+  @ViewBuilder
+  private func attachmentChip(_ attachment: PendingChatAttachment) -> some View {
+    HStack(spacing: 4) {
+      Image(systemName: attachment.iconSystemName)
+      Text(attachment.filename)
+      Button {
+        pendingAttachments.removeAll { $0.id == attachment.id }
+      } label: {
+        Image(systemName: "xmark.circle.fill")
+      }
+      .buttonStyle(.plain)
+      .accessibilityLabel("Remove \(attachment.filename)")
+    }
+    .font(.caption)
+    .padding(.horizontal, 8)
+    .padding(.vertical, 4)
+    .background(Capsule().fill(Color.secondary.opacity(0.12)))
+    .accessibilityIdentifier("composer.attachmentChip")
+  }
+
+  private func openAttachmentPanel() {
+    let panel = NSOpenPanel()
+    panel.canChooseFiles = true
+    panel.canChooseDirectories = false
+    panel.allowsMultipleSelection = true
+    if panel.runModal() == .OK {
+      addAttachments(from: panel.urls)
+    }
+  }
+
+  private func addAttachments(from urls: [URL]) {
+    guard !urls.isEmpty else { return }
+    var notices: [String] = []
+    for url in urls {
+      do {
+        pendingAttachments.append(try ChatAttachmentExtractor.extract(url: url))
+      } catch let error as ChatAttachmentExtractionError {
+        notices.append(error.userMessage)
+      } catch {
+        notices.append("Could not attach \(url.lastPathComponent).")
+      }
+    }
+    attachmentNotice = notices.first
+  }
+
+  static func preparedAttachmentContext(
+    attachments: [PendingChatAttachment],
+    engineProvidedMaxTokens: Int?,
+    modelConfiguredContextLength: Int?,
+    logUnavailable: (String) -> Void = { _ in }
+  ) -> ChatAttachmentContextLimiter.Result {
+    ChatAttachmentContextLimiter.limitedContext(
+      attachments: attachments,
+      engineProvidedMaxTokens: engineProvidedMaxTokens,
+      modelConfiguredContextLength: modelConfiguredContextLength,
+      logUnavailable: logUnavailable
+    )
+  }
+}
+
+private extension String {
+  var nilIfEmpty: String? { isEmpty ? nil : self }
 }
 
 /// #516: one fired pending auto-send. `tick` increments per fire so equal
