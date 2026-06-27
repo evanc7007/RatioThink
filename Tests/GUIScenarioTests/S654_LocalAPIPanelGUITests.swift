@@ -18,7 +18,7 @@ import XCTest
 /// Engine-free + deterministic: `PIE_TEST_PIN_ENGINE_RUNNING` pins a running
 /// engine whose served model equals the seeded profiles' default model, so
 /// example-profile changes can be asserted without a real helper. The non-sandboxed app
-/// auto-seeds the chat / repeat-boost / json-think / tree-of-thought profiles
+/// ships the chat / json-think / tree-of-thought profiles
 /// into the isolated `PIE_HOME`.
 final class S654_LocalAPIPanelGUITests: XCTestCase {
   private var tempHomes: [String] = []
@@ -54,8 +54,10 @@ final class S654_LocalAPIPanelGUITests: XCTestCase {
                    "the profile picker must use the bare 'Profile' label, not 'Example profile'")
     XCTAssertTrue(profileSegment("Chat", in: app).waitForExistence(timeout: 5),
                   "the plain 'Chat' profile must be selectable in the curl example; app tree: \(app.debugDescription)")
-    XCTAssertTrue(profileSegment("Repeat Boost", in: app).exists,
-                  "seeded profiles must all be listed for examples; 'Repeat Boost' missing; app tree: \(app.debugDescription)")
+    XCTAssertTrue(profileSegment("JSON Think", in: app).exists,
+                  "shipped profiles must include JSON Think for examples; app tree: \(app.debugDescription)")
+    XCTAssertFalse(profileSegment("Repeat Boost", in: app).exists,
+                   "retired Repeat Boost must not be listed as a shipped example profile")
 
     // #3: the curl example defaults to streaming, and the toggle flips it to a
     // single (non-streaming) JSON request.
@@ -93,10 +95,10 @@ final class S654_LocalAPIPanelGUITests: XCTestCase {
 
     // Switch the example profile. The panel must stay "Running" — no served
     // engine profile change, teardown, or "Starting…"/"Off".
-    let repeatBoost = profileSegment("Repeat Boost", in: app)
-    XCTAssertTrue(repeatBoost.waitForExistence(timeout: 10),
-                  "Repeat Boost tab missing; app tree: \(app.debugDescription)")
-    repeatBoost.click()
+    let jsonThink = profileSegment("JSON Think", in: app)
+    XCTAssertTrue(jsonThink.waitForExistence(timeout: 10),
+                  "JSON Think tab missing; app tree: \(app.debugDescription)")
+    jsonThink.click()
 
     let runningLabel = app.staticTexts["Running"].firstMatch
     XCTAssertTrue(runningLabel.waitForExistence(timeout: 5),
@@ -129,18 +131,20 @@ final class S654_LocalAPIPanelGUITests: XCTestCase {
     XCTAssertTrue(curl.waitForExistence(timeout: 10),
                   "curl example missing while serving; app tree: \(app.debugDescription)")
 
-    let repeatBoost = profileSegment("Repeat Boost", in: app)
-    XCTAssertTrue(repeatBoost.waitForExistence(timeout: 10),
-                  "Repeat Boost example profile tab missing; app tree: \(app.debugDescription)")
-    repeatBoost.click()
+    let jsonThink = profileSegment("JSON Think", in: app)
+    XCTAssertTrue(jsonThink.waitForExistence(timeout: 10),
+                  "JSON Think example profile tab missing; app tree: \(app.debugDescription)")
+    jsonThink.click()
 
-    let repeatBoostProfileID = NSPredicate(format: "value CONTAINS %@ OR label CONTAINS %@",
-                                           "\"profile_id\": \"repeat-boost\"",
-                                           "\"profile_id\": \"repeat-boost\"")
-    expectation(for: repeatBoostProfileID, evaluatedWith: curl)
+    let jsonThinkResponseFormat = NSPredicate(format: "value CONTAINS %@ OR label CONTAINS %@",
+                                             "\"response_format\"",
+                                             "\"response_format\"")
+    expectation(for: jsonThinkResponseFormat, evaluatedWith: curl)
     waitForExpectations(timeout: 5) { error in
-      XCTAssertNil(error, "switching example profile must rewrite the curl body; curl=\(self.curlText(curl).debugDescription)")
+      XCTAssertNil(error, "switching example profile must rewrite the curl body for JSON mode; curl=\(self.curlText(curl).debugDescription)")
     }
+    XCTAssertTrue(curlText(curl).contains("\"type\": \"json_object\""),
+                  "JSON Think curl should request json_object response format; curl=\(curlText(curl).debugDescription)")
   }
 
   @MainActor
@@ -151,23 +155,25 @@ final class S654_LocalAPIPanelGUITests: XCTestCase {
 
     XCTAssertTrue(app.staticTexts["chat"].waitForExistence(timeout: 10),
                   "configuration Profile row should start on the active chat profile; app tree: \(app.debugDescription)")
-    let repeatBoost = profileSegment("Repeat Boost", in: app)
-    XCTAssertTrue(repeatBoost.waitForExistence(timeout: 10),
-                  "Repeat Boost profile tab missing; app tree: \(app.debugDescription)")
-    repeatBoost.click()
+    let jsonThink = profileSegment("JSON Think", in: app)
+    XCTAssertTrue(jsonThink.waitForExistence(timeout: 10),
+                  "JSON Think profile tab missing; app tree: \(app.debugDescription)")
+    jsonThink.click()
 
     let curl = app.descendants(matching: .any).matching(identifier: "LocalAPICurl").firstMatch
-    let repeatBoostProfileID = NSPredicate(format: "value CONTAINS %@ OR label CONTAINS %@",
-                                           "\"profile_id\": \"repeat-boost\"",
-                                           "\"profile_id\": \"repeat-boost\"")
-    expectation(for: repeatBoostProfileID, evaluatedWith: curl)
+    let jsonThinkResponseFormat = NSPredicate(format: "value CONTAINS %@ OR label CONTAINS %@",
+                                             "\"response_format\"",
+                                             "\"response_format\"")
+    expectation(for: jsonThinkResponseFormat, evaluatedWith: curl)
     waitForExpectations(timeout: 5) { error in
-      XCTAssertNil(error, "example profile switch must still rewrite the curl body; curl=\(self.curlText(curl).debugDescription)")
+      XCTAssertNil(error, "example profile switch must still rewrite the curl body for JSON mode; curl=\(self.curlText(curl).debugDescription)")
     }
+    XCTAssertTrue(curlText(curl).contains("\"type\": \"json_object\""),
+                  "JSON Think curl should request json_object response format; curl=\(curlText(curl).debugDescription)")
 
     XCTAssertTrue(app.staticTexts["chat"].exists,
                   "example profile selection must not change the real configured/served profile row")
-    XCTAssertFalse(app.staticTexts["repeat-boost"].exists,
+    XCTAssertFalse(app.staticTexts["json-think"].exists,
                    "example profile selection must not persist as the real Local API Profile setting")
     XCTAssertFalse(app.staticTexts["Starting…"].exists,
                    "example profile selection must not relaunch the engine")
