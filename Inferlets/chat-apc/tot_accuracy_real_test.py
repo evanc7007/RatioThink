@@ -14,10 +14,21 @@ Run::
 """
 from __future__ import annotations
 
+import json
 import os
+import sys
+import tempfile
+from pathlib import Path
 import unittest
+from unittest import mock
 
 import grade as g
+
+BENCHMARK_DIR = Path(__file__).resolve().parents[2] / "Scripts" / "benchmark"
+if str(BENCHMARK_DIR) not in sys.path:
+    sys.path.insert(0, str(BENCHMARK_DIR))
+import prep_datasets as prep  # noqa: E402
+import tot_accuracy_real as real  # noqa: E402
 
 _HAS_SANDBOX = os.path.exists(g._SANDBOX_EXEC)
 
@@ -111,6 +122,67 @@ class GSM8KGrader(unittest.TestCase):
         self.assertIsNone(g.gsm8k_numeric("", self.REF).passed)
 
 
+class MMLUPrep(unittest.TestCase):
+    def test_prompt_maps_letter_choices_to_numeric_answer_contract(self):
+        rec = {
+            "subject": "abstract_algebra",
+            "question": "Which structure has an identity element?",
+            "choices": ["Magma", "Monoid", "Graph", "Field extension"],
+            "answer": 1,
+        }
+
+        prompt = prep._mmlu_prompt(rec)
+        ref = prep._mmlu_reference(rec)
+
+        self.assertIn("1. Magma", prompt)
+        self.assertIn("2. Monoid", prompt)
+        self.assertIn("Answer with only the number", prompt)
+        self.assertEqual(ref, {"final_answer": "2", "choice_count": 4})
+
+    def test_mmlu_registry_is_graded_and_locked_allowlist_visible(self):
+        self.assertEqual(prep.REGISTRY["mmlu"]["grader"], "mcq_numeric")
+        self.assertEqual(prep.REGISTRY["mmlu"]["ref_builder"], prep._mmlu_reference)
+
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.object(real, "LOCK_PATH", Path(tmp) / "datasets.lock"), \
+             mock.patch.dict(os.environ, {"DATASETS": "mmlu"}, clear=False):
+            real.LOCK_PATH.write_text(json.dumps({
+                "datasets": {
+                    "gsm8k": {"grader": "gsm8k_numeric"},
+                    "mmlu": {"grader": "mcq_numeric"},
+                    "mtbench": {},
+                }
+            }))
+            self.assertEqual(real._which_datasets(), ["mmlu"])
+
+
+class ConfigToml(unittest.TestCase):
+    def test_gguf_model_slug_resolves_to_cached_file_path(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.dict(os.environ, {"HF_HOME": tmp}, clear=False):
+            gguf = (
+                Path(tmp)
+                / "hub"
+                / "models--Qwen--Qwen3-14B-GGUF"
+                / "snapshots"
+                / "abc123"
+                / "Qwen3-14B-Q4_K_M.gguf"
+            )
+            gguf.parent.mkdir(parents=True)
+            gguf.write_text("fake gguf bytes")
+
+            cfg = real.config_toml("Qwen/Qwen3-14B-GGUF")
+
+        self.assertIn('name = "Qwen/Qwen3-14B-GGUF"', cfg)
+        self.assertIn(f'hf_repo = "{gguf}"', cfg)
+
+    def test_non_gguf_model_slug_stays_as_repo_id(self):
+        cfg = real.config_toml("Qwen/Qwen3-8B")
+
+        self.assertIn('name = "Qwen/Qwen3-8B"', cfg)
+        self.assertIn('hf_repo = "Qwen/Qwen3-8B"', cfg)
+
+
 class HumanEvalGrader(unittest.TestCase):
     REF = {
         "canonical_prompt": 'from typing import List\n\n\ndef add(a, b):\n    """add"""\n',
@@ -157,6 +229,32 @@ class MBPPGrader(unittest.TestCase):
         self.assertIsNone(g.mbpp_exec("", self.REF).passed)
 
 
+class MCQNumericGrader(unittest.TestCase):
+    REF = {"final_answer": "2", "choice_count": 4}
+
+    def test_correct_numeric_choice(self):
+        self.assertTrue(g.mcq_numeric("The answer is 2.", self.REF).passed)
+
+    def test_verbose_reasoning_tail_can_still_end_in_correct_choice(self):
+        out = "I compared 4 options and eliminated choices 1 and 3. Final answer: 2"
+        self.assertTrue(g.mcq_numeric(out, self.REF).passed)
+
+    def test_out_of_range_reasoning_number_is_ungradable(self):
+        out = "I considered option 2, but there are 7 fields in the distractor."
+        result = g.mcq_numeric(out, self.REF)
+        self.assertIsNone(result.passed)
+        self.assertIn("outside", result.detail)
+
+    def test_wrong_numeric_choice(self):
+        self.assertIs(g.mcq_numeric("I choose 3", self.REF).passed, False)
+
+    def test_no_numeric_choice_is_ungradable(self):
+        self.assertIsNone(g.mcq_numeric("I choose B", self.REF).passed)
+
+    def test_dispatch_registry_includes_mmlu_grader(self):
+        self.assertTrue(g.grade("mcq_numeric", "2", self.REF).passed)
+
+
 class JSONSchemaGrader(unittest.TestCase):
     REF = {"json_schema": '{"type":"object","required":["x"],'
                           '"properties":{"x":{"type":"integer"}}}'}
@@ -185,7 +283,13 @@ class GraderDispatch(unittest.TestCase):
     def test_registry_names_match_lock_graders(self):
         self.assertEqual(
             sorted(g.GRADERS),
-            ["gsm8k_numeric", "humaneval_exec", "jsonschema_validate", "mbpp_exec"],
+            [
+                "gsm8k_numeric",
+                "humaneval_exec",
+                "jsonschema_validate",
+                "mbpp_exec",
+                "mcq_numeric",
+            ],
         )
 
 

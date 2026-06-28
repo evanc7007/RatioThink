@@ -43,6 +43,13 @@ DATA_DIR = HERE / "data"
 LOCK_PATH = HERE / "datasets.lock"
 
 
+def _locked_revision(key: str) -> str:
+    # Keep high-entropy public dataset pins in datasets.lock (the provenance
+    # source) rather than in executable source, so the secret scanner only sees
+    # them in the lockfile where hashes are expected.
+    return json.loads(LOCK_PATH.read_text())["datasets"][key]["revision"]
+
+
 # --- prompt builders -------------------------------------------------------
 # Each builder maps one raw dataset record to a single greedy-decodable user
 # prompt string (or None to skip a malformed row — never used to subsample).
@@ -96,6 +103,21 @@ def _gsm8k_prompt(rec: dict) -> str:
     return rec["question"].strip()
 
 
+def _mmlu_prompt(rec: dict) -> str:
+    # MMLU is A/B/C/D in the source; render as 1/2/3/4 so shipped ToT's
+    # reasoning task can use numeric-majority leaf selection and the grader can
+    # reuse the numeric extraction convention.
+    choices = _as_list(rec["choices"])
+    numbered = "\n".join(f"{i}. {choice}" for i, choice in enumerate(choices, 1))
+    subject = str(rec.get("subject") or "general_knowledge").replace("_", " ")
+    return (
+        f"Answer this multiple-choice question about {subject}.\n\n"
+        f"Question: {rec['question'].strip()}\n\n"
+        f"Choices:\n{numbered}\n\n"
+        "Answer with only the number of the correct choice (1, 2, 3, or 4)."
+    )
+
+
 def _cnndm_prompt(rec: dict) -> str:
     # Abstractive summarization — copies spans from the source, so n-gram
     # drafting is expected to do relatively well (RAG/summarize row).
@@ -137,6 +159,15 @@ def _gsm8k_reference(rec: dict) -> dict:
     return {"final_answer": gold}
 
 
+def _mmlu_reference(rec: dict) -> dict:
+    # Source answer is zero-based A/B/C/D. Store 1/2/3/4 for numeric ToT leaves.
+    answer = int(rec["answer"])
+    choices = _as_list(rec["choices"])
+    if answer < 0 or answer >= len(choices):
+        raise ValueError(f"mmlu answer index {answer} outside {len(choices)} choices")
+    return {"final_answer": str(answer + 1), "choice_count": len(choices)}
+
+
 def _humaneval_reference(rec: dict) -> dict:
     # pass@1 by executing the shipped `check(entry_point)`. The canonical prompt
     # (signature + docstring + imports) is needed to assemble a runnable program
@@ -169,7 +200,7 @@ def _jsonschema_reference(rec: dict) -> dict:
 REGISTRY: dict[str, dict] = {
     "mtbench": {
         "hf_repo": "HuggingFaceH4/mt_bench_prompts",
-        "revision": "e3a795c5e9a82ee40611c416b8a7786c73198991",
+        "revision": _locked_revision("mtbench"),
         "config": None,
         "splits": ["train"],
         "category": "chat",
@@ -183,7 +214,7 @@ REGISTRY: dict[str, dict] = {
     },
     "humaneval": {
         "hf_repo": "openai/openai_humaneval",
-        "revision": "7dce6050a7d6d172f3cc5c32aa97f52fa1a2e544",
+        "revision": _locked_revision("humaneval"),
         "config": None,
         "splits": ["test"],
         "category": "code",
@@ -199,7 +230,7 @@ REGISTRY: dict[str, dict] = {
     },
     "mbpp": {
         "hf_repo": "google-research-datasets/mbpp",
-        "revision": "4bb6404fdc6cacfda99d4ac4205087b89d32030c",
+        "revision": _locked_revision("mbpp"),
         "config": "full",
         "splits": ["train", "test", "validation", "prompt"],
         "category": "code",
@@ -218,7 +249,7 @@ REGISTRY: dict[str, dict] = {
     },
     "gsm8k": {
         "hf_repo": "openai/gsm8k",
-        "revision": "740312add88f781978c0658806c59bc2815b9866",
+        "revision": _locked_revision("gsm8k"),
         "config": "main",
         "splits": ["test"],
         "category": "reasoning",
@@ -232,9 +263,28 @@ REGISTRY: dict[str, dict] = {
         "grader": "gsm8k_numeric",
         "ref_builder": _gsm8k_reference,
     },
+    "mmlu": {
+        "hf_repo": "cais/mmlu",
+        "revision": _locked_revision("mmlu"),
+        "config": "all",
+        "splits": ["test"],
+        "category": "knowledge",
+        "license": "mit",
+        "citation": "Hendrycks et al., Measuring Massive Multitask Language Understanding (ICLR 2021).",
+        "bound": "full",
+        "bound_rationale": (
+            "Full `all` config test split = 14042 multiple-choice questions; "
+            "A/B/C/D choices are rendered and graded as 1/2/3/4 for ToT numeric-majority scoring."
+        ),
+        "think": True,
+        "id_field": None,
+        "builder": _mmlu_prompt,
+        "grader": "mcq_numeric",
+        "ref_builder": _mmlu_reference,
+    },
     "cnndm": {
         "hf_repo": "abisee/cnn_dailymail",
-        "revision": "96df5e686bee6baa90b8bee7c28b81fa3fa6223d",
+        "revision": _locked_revision("cnndm"),
         "config": "3.0.0",
         "splits": ["test"],
         "category": "summarize",
@@ -253,7 +303,7 @@ REGISTRY: dict[str, dict] = {
     },
     "jsonschema": {
         "hf_repo": "epfl-dlab/JSONSchemaBench",
-        "revision": "5bd0f4640badc6f3f02df796421d21cb0ca0b141",
+        "revision": _locked_revision("jsonschema"),
         "config": "default",
         "splits": ["test"],
         "category": "structured",

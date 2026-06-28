@@ -45,7 +45,7 @@ DEFAULT_MODELS = (
     "Qwen/Qwen3-8B",
     "Qwen/Qwen3-14B-GGUF",
 )
-DATASET = os.environ.get("DATASETS", "gsm8k").split(",")[0].strip() or "gsm8k"
+DEFAULT_DATASETS = ("gsm8k", "humaneval", "mbpp", "mmlu")
 MAX_PROMPTS = int(os.environ.get("MAX_PROMPTS", "6"))
 MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "512"))
 TOT_BREADTH = int(os.environ.get("TOT_BREADTH", os.environ.get("TOT_WIDTH", "2")))
@@ -180,6 +180,7 @@ def _cell(items: list[ItemResult], arm_name: str, grader: str) -> dict:
     n_correct = n_wrong = n_ungradable = n_error = 0
     tokens: list[int] = []
     latencies: list[float] = []
+    tokens_per_second: list[float] = []
     first_error: str | None = None
     node_error_count = 0
     for item in items:
@@ -195,6 +196,8 @@ def _cell(items: list[ItemResult], arm_name: str, grader: str) -> dict:
             continue
         tokens.append(arm.tokens)
         latencies.append(arm.latency_s)
+        if arm.latency_s > 0:
+            tokens_per_second.append(arm.tokens / arm.latency_s)
         if passed is True:
             n_correct += 1
         else:
@@ -210,6 +213,9 @@ def _cell(items: list[ItemResult], arm_name: str, grader: str) -> dict:
         "accuracy": accuracy,
         "mean_tokens": statistics.mean(tokens) if tokens else None,
         "mean_latency_s": statistics.mean(latencies) if latencies else None,
+        "mean_tokens_per_second": (
+            statistics.mean(tokens_per_second) if tokens_per_second else None
+        ),
         "first_error": first_error,
         "node_error_count": node_error_count,
     }
@@ -226,7 +232,25 @@ def _mean_paired_delta(items: list[ItemResult], attr: str) -> float | None:
     return statistics.mean(deltas) if deltas else None
 
 
-def summarize_model(model: str, items: list[ItemResult], grader: str) -> dict:
+def _mean_paired_tokens_per_second_delta(items: list[ItemResult]) -> float | None:
+    deltas: list[float] = []
+    for item in items:
+        if item.single.error or item.tot.error:
+            continue
+        if item.single.answer is None or item.tot.answer is None:
+            continue
+        if item.single.latency_s <= 0 or item.tot.latency_s <= 0:
+            continue
+        deltas.append(
+            (item.tot.tokens / item.tot.latency_s)
+            - (item.single.tokens / item.single.latency_s)
+        )
+    return statistics.mean(deltas) if deltas else None
+
+
+def summarize_model(model: str, items: list[ItemResult], grader: str,
+                    dataset: str | None = None) -> dict:
+    dataset = dataset or (items[0].dataset if items else None)
     single = _cell(items, "single", grader)
     tot = _cell(items, "tot", grader)
     acc_delta = None
@@ -234,12 +258,15 @@ def summarize_model(model: str, items: list[ItemResult], grader: str) -> dict:
         acc_delta = tot["accuracy"] - single["accuracy"]
     return {
         "model": model,
-        "dataset": DATASET,
+        "dataset": dataset,
         "single": single,
         "tot": tot,
         "accuracy_delta_tot_minus_single": acc_delta,
         "mean_token_delta_tot_minus_single": _mean_paired_delta(items, "tokens"),
         "mean_latency_delta_s_tot_minus_single": _mean_paired_delta(items, "latency_s"),
+        "mean_tokens_per_second_delta_tot_minus_single": (
+            _mean_paired_tokens_per_second_delta(items)
+        ),
         "items": [_item_to_json(item, grader) for item in items],
     }
 
@@ -248,7 +275,7 @@ def build_artifact(models: list[dict], settings: dict) -> dict:
     return {
         "framing": (
             "Shipped tree-of-thought profile vs ordinary single-pass "
-            "/v1/chat/completions on identical GSM8K prompts. This does not run "
+            "/v1/chat/completions on identical prompts. This does not run "
             "the academic host-side BFS harness."
         ),
         "settings": settings,
@@ -271,35 +298,51 @@ def _empty_cell(first_error: str | None = None) -> dict:
     }
 
 
-def model_boot_error_row(model: str, exc: ModelBootError) -> dict:
+def model_boot_error_row(model: str, exc: ModelBootError, dataset: str | None = None) -> dict:
     original = exc.original
     err = f"{type(original).__name__}: {original}"
     return {
         "model": model,
-        "dataset": DATASET,
+        "dataset": dataset or "unknown",
         "boot_error": err,
         "single": _empty_cell(err),
         "tot": _empty_cell(err),
         "accuracy_delta_tot_minus_single": None,
         "mean_token_delta_tot_minus_single": None,
         "mean_latency_delta_s_tot_minus_single": None,
+        "mean_tokens_per_second_delta_tot_minus_single": None,
         "items": [],
         "coverage": {"measured": 0, "total": None},
     }
 
 
-async def collect_model_rows(models: list[str], run_one, write_partial=None) -> list[dict]:
+async def collect_model_rows(
+    models: list[str], datasets: list[str], run_one, write_partial=None
+) -> list[dict]:
     rows: list[dict] = []
     for index, model in enumerate(models, 1):
         try:
-            row = await run_one(index, model)
+            model_rows = await run_one(index, model)
         except ModelBootError as exc:
-            row = model_boot_error_row(model, exc)
-            print(f"[profile-accuracy] model boot failed for {model}: {row['boot_error']}",
-                  file=sys.stderr, flush=True)
-        rows.append(row)
+            model_rows = [model_boot_error_row(model, exc, dataset) for dataset in datasets]
+            print(f"[profile-accuracy] model boot failed for {model}: "
+                  f"{model_rows[0]['boot_error']}", file=sys.stderr, flush=True)
+        rows.extend(model_rows)
         if write_partial is not None:
             write_partial(rows)
+    return rows
+
+
+def _datasets_from_env() -> list[str]:
+    if os.environ.get("DATASETS"):
+        return base._which_datasets()
+    return list(DEFAULT_DATASETS)
+
+
+async def collect_dataset_rows(model: str, datasets: list[str], run_one_dataset) -> list[dict]:
+    rows: list[dict] = []
+    for dataset in datasets:
+        rows.append(await run_one_dataset(model, dataset))
     return rows
 
 
@@ -403,39 +446,46 @@ async def _tot_once(http_c: httpx.AsyncClient, base_url: str, model: str,
                          error=f"{type(e).__name__}: {e}")
 
 
-async def _run_model(base_url: str, model: str, count, grader: str) -> dict:
-    records, total = base._load_prompts(DATASET)
+async def _run_model_dataset(base_url: str, model: str, dataset: str, count) -> dict:
+    grader = base._grader_for(dataset)
+    records, total = base._load_prompts(dataset)
     if MAX_PROMPTS > 0:
         records = records[:MAX_PROMPTS]
     items: list[ItemResult] = []
     async with httpx.AsyncClient(timeout=900) as http_c:
         for i, rec in enumerate(records, 1):
-            prompt_id = str(rec.get("id") or f"{DATASET}:{i}")
+            prompt_id = str(rec.get("id") or f"{dataset}:{i}")
             single = await _single_once(http_c, base_url, model, rec["prompt"], count)
             tot = await _tot_once(http_c, base_url, model, rec["prompt"], count)
-            item = ItemResult(DATASET, i, prompt_id, rec["reference"], single, tot)
+            item = ItemResult(dataset, i, prompt_id, rec["reference"], single, tot)
             items.append(item)
             single_bucket, _ = _score_arm(single, grader, rec["reference"])
             tot_bucket, _ = _score_arm(tot, grader, rec["reference"])
             print(
-                f"[profile-accuracy] {model} {DATASET} {i}/{len(records)} "
+                f"[profile-accuracy] {model} {dataset} {i}/{len(records)} "
                 f"single={single_bucket} tot={tot_bucket} "
                 f"tot_node_errors={len(tot.node_errors)}",
                 flush=True,
             )
-    row = summarize_model(model, items, grader)
+    row = summarize_model(model, items, grader, dataset=dataset)
     row["coverage"] = {"measured": len(records), "total": total}
     return row
 
 
+async def _run_model(base_url: str, model: str, datasets: list[str], count) -> list[dict]:
+    async def run_one_dataset(_model: str, dataset: str) -> dict:
+        return await _run_model_dataset(base_url, _model, dataset, count)
+
+    return await collect_dataset_rows(model, datasets, run_one_dataset)
+
+
 async def _run() -> dict:
-    if DATASET != "gsm8k":
-        raise SystemExit("profile slice-1 is intentionally scoped to DATASETS=gsm8k")
     models = _models_from_env()
+    datasets = _datasets_from_env()
     count, unit = base._load_tokenizer()
-    grader = base._grader_for(DATASET)
     settings = {
-        "dataset": DATASET,
+        "dataset": datasets[0] if len(datasets) == 1 else None,
+        "datasets": datasets,
         "max_prompts": MAX_PROMPTS,
         "max_tokens": MAX_TOKENS,
         "models": models,
@@ -452,7 +502,7 @@ async def _run() -> dict:
     def write_partial(rows: list[dict]) -> None:
         atomic_write_json(OUT, build_artifact(rows, settings))
 
-    async def run_one(index: int, model: str) -> dict:
+    async def run_one(index: int, model: str) -> list[dict]:
         print(f"\n[profile-accuracy] booting model={model}", flush=True)
         with tempfile.TemporaryDirectory(prefix="tpa-", dir="/tmp") as tmp:
             tmp_path = Path(tmp)
@@ -498,13 +548,13 @@ async def _run() -> dict:
                             raise RuntimeError(f"daemon never bound port {port}")
                     except Exception as exc:  # noqa: BLE001 - daemon setup is a model boot failure.
                         raise ModelBootError(exc) from exc
-                    return await _run_model(base_url, model, count, grader)
+                    return await _run_model(base_url, model, datasets, count)
                 finally:
                     drain.cancel()
             finally:
                 h._terminate_subprocess(proc, "engine")
 
-    rows = await collect_model_rows(models, run_one, write_partial)
+    rows = await collect_model_rows(models, datasets, run_one, write_partial)
     return build_artifact(rows, settings)
 
 
@@ -512,7 +562,7 @@ def _print(artifact: dict) -> None:
     print("\n" + "=" * 96)
     print("SHIPPED ToT profile vs single-pass accuracy/cost")
     print("=" * 96)
-    print(f"{'model':28} {'single':>8} {'ToT':>8} {'Δacc':>8} {'Δtok':>9} {'Δlat(s)':>9} {'nodeErr':>8}")
+    print(f"{'model':28} {'dataset':12} {'single':>8} {'ToT':>8} {'Δacc':>8} {'Δtok':>9} {'Δlat(s)':>9} {'ToT t/s':>9} {'nodeErr':>8}")
     print("-" * 96)
     for row in artifact["models"]:
         single = row["single"]
@@ -522,10 +572,12 @@ def _print(artifact: dict) -> None:
             return fmt.format(x) if isinstance(x, (int, float)) else "--"
         print(
             f"{row['model'][:28]:28} "
+            f"{str(row.get('dataset') or '--')[:12]:12} "
             f"{f(single.get('accuracy')):>8} {f(tot.get('accuracy')):>8} "
             f"{f(row.get('accuracy_delta_tot_minus_single'), '{:+.3f}'):>8} "
             f"{f(row.get('mean_token_delta_tot_minus_single'), '{:+.1f}'):>9} "
             f"{f(row.get('mean_latency_delta_s_tot_minus_single'), '{:+.2f}'):>9} "
+            f"{f(tot.get('mean_tokens_per_second'), '{:.1f}'):>9} "
             f"{node_err:>8}"
         )
         if single.get("first_error"):
