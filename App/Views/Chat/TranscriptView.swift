@@ -26,19 +26,18 @@ struct TranscriptView: View {
   /// edit affordance — the scaffold passes nil while a stream is in flight,
   /// so an edit can't race the active turn.
   var onEditUserTurn: ((UUID, String) -> Void)? = nil
-  /// #690: invoked with a Best-of-N round message + the user's action (pick /
-  /// think-more / stop). Nil hides the affordance; the scaffold passes it only
-  /// when no stream is in flight, and only the latest uncommitted round gets a
-  /// live callback (see `bestOfNLiveID`).
+  /// #690: invoked with a Best-of-N round message + the user's action
+  /// (pick/re-pick or level-1 refine). Nil hides the affordance; the scaffold
+  /// passes it only when no stream is in flight, and only the latest
+  /// uncommitted round gets a live callback (see `bestOfNLiveID`).
   var onBestOfN: ((UUID, BestOfNAction) -> Void)? = nil
   /// The id of the one Best-of-N round that is currently interactive (the last
   /// uncommitted round, set by the scaffold while idle). Only that row shows the
-  /// pick + think-more/stop controls; older rounds render read-only.
+  /// pick/refine controls; older rounds render read-only.
   var bestOfNLiveID: UUID? = nil
-  /// #736: Best-of-N think-more guidance drafts, keyed by round message id and
-  /// owned by the stable scaffold so a typed comment survives the LazyVStack
-  /// row teardown that was wiping the bubble's local `@State`. Default
-  /// `.constant([:])` keeps previews/tests on the per-row fallback.
+  /// #736: Best-of-N refinement drafts, keyed by round message id and owned by
+  /// the stable scaffold so a typed comment survives LazyVStack row teardown.
+  /// Default `.constant([:])` keeps previews/tests on the per-row fallback.
   var bestOfNCommentDrafts: Binding<[UUID: String]> = .constant([:])
 
   /// #521/#530: THE render-path projection seam. The body builds the transcript
@@ -52,6 +51,8 @@ struct TranscriptView: View {
 
   var body: some View {
     let snapshot = Self.projectedSnapshot(chat.messages)
+    let primaryBestOfNID = bestOfNLiveID
+      ?? snapshot.items.last(where: { $0.bestOfN != nil })?.id
     // #513 review v1 F2: retry-anchor validity in ONE pass over the
     // already-sorted snapshot rows — a per-row `ChatRetryPlan.plan` call
     // re-sorted the transcript for every row (O(n² log n) on the render
@@ -84,7 +85,8 @@ struct TranscriptView: View {
                             ? nil
                             : Binding(
                                 get: { bestOfNCommentDrafts.wrappedValue[item.id] ?? "" },
-                                set: { bestOfNCommentDrafts.wrappedValue[item.id] = $0 }))
+                                set: { bestOfNCommentDrafts.wrappedValue[item.id] = $0 }),
+                          bestOfNUsesPrimaryAccessibilityIDs: item.id == primaryBestOfNID)
               .id(item.id)
           }
           // Sentinel row so `scrollTo(.bottomSentinel)` lands at the

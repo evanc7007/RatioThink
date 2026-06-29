@@ -24,14 +24,13 @@ import os
 /// view re-checks at click time. Markdown images never fetch from the
 /// network (`NSAttributedString(markdown:)` does not load remote bytes; the
 /// builder renders a text placeholder). Review v1 F3.
-/// A user interaction with a Best-of-N round (#690): pick (or re-pick) a
-/// candidate, then either expand from it (think-more) or commit it (stop).
-/// Re-selection is just another `.pick` with a different id (#708) — every
-/// candidate snapshot stays alive until think-more / stop.
+/// A user interaction with the two-round Best-of-N flow (#690): pick (or
+/// re-pick) a candidate, optionally submit a refinement for round 2, then pick
+/// the level-2 final answer. Re-selection is just another `.pick` with a
+/// different id (#708); snapshots stay alive until refine or final pick.
 enum BestOfNAction: Equatable {
   case pick(String)
   case thinkMore(String?)
-  case stop
 }
 
 struct MessageBubble: View {
@@ -54,18 +53,22 @@ struct MessageBubble: View {
   var maxBubbleWidth: CGFloat = 480
   /// Best-of-N (#690) interaction sink, set only for the latest, not-yet-
   /// committed interactive round (`TranscriptView` passes nil for ToT/chat
-  /// turns, reloaded history, and superseded rounds — which hides the pick +
-  /// think-more/stop controls there). `.pick` records the choice; `.thinkMore`
-  /// starts the next round; `.stop` commits the chosen candidate.
+  /// turns, reloaded history, and superseded rounds). `.pick` records or
+  /// re-records the current choice; `.thinkMore` submits the level-1 refinement
+  /// comment that seeds round 2.
   var onBestOfN: ((BestOfNAction) -> Void)? = nil
-  /// #736: the Best-of-N think-more guidance draft, hoisted to a stable
-  /// ancestor (`ChatScaffoldView`) and keyed by message id. The draft MUST NOT
-  /// live in this row's `@State`: the bubble renders inside a `LazyVStack`
-  /// whose rows SwiftUI can tear down and rebuild on relayout (a sibling round
-  /// committing, a 1 Hz status poll), discarding row `@State` mid-typing — so
-  /// the typed comment vanished before the user clicked "Think more". When nil
+  /// #736: the Best-of-N refinement draft, hoisted to a stable ancestor
+  /// (`ChatScaffoldView`) and keyed by message id. The draft MUST NOT live in
+  /// this row's `@State`: the bubble renders inside a `LazyVStack` whose rows
+  /// SwiftUI can tear down and rebuild on relayout (a sibling round committing,
+  /// a 1 Hz status poll), discarding row `@State` mid-typing. When nil
   /// (previews / non-live rows) the local `@State` fallback below is used.
   var bestOfNCommentDraft: Binding<String>? = nil
+  /// True for the live Best-of-N round, or when no live round exists, the latest
+  /// finalized round. Older read-only rounds still render and highlight their
+  /// chosen candidate, but use scoped accessibility identifiers so generic
+  /// Best-of-N actions target the current round instead of stale history.
+  var bestOfNUsesPrimaryAccessibilityIDs = true
 
   @State private var isEditing = false
   @State private var editText = ""
@@ -122,9 +125,9 @@ struct MessageBubble: View {
               // `onBestOfN` for it (the live, uncommitted round). Historical and
               // finalized rounds render read-only: the chosen candidate stays
               // highlighted, but no pick affordance, no "pick one" state, and no
-              // think-more / use-this controls (#708 read-only history).
+              // refinement controls (#708 read-only history).
               let isLive = onBestOfN != nil
-              // #736 Bug C: the think-more guidance that spawned THIS round,
+              // #736 Bug C: the refinement comment that spawned THIS round is
               // carried in the durable round model so it survives the transition
               // and is shown on the round it produced (live or historical).
               if let guidance = round.inboundComment,
@@ -137,14 +140,12 @@ struct MessageBubble: View {
                 selection: BestOfNSelectionContext(
                   pickableIDs: isLive ? Set(round.candidates.map(\.id)) : [],
                   chosenID: round.chosenID,
+                  roundLevel: round.level,
                   isInteractive: isLive,
-                  onPick: { id in onBestOfN?(.pick(id)) }))
-              // Think-more / Use-this appear once a candidate is chosen, before
-              // the round commits an answer, on the live round only. Re-picking
-              // a different candidate keeps the controls (the choice persists).
-              if round.hasChoice, message.content.isEmpty, isLive {
-                bestOfNControls
-              }
+                  usesPrimaryAccessibilityIDs: bestOfNUsesPrimaryAccessibilityIDs,
+                  refinementDraft: round.level == 1 ? bestOfNComment : nil,
+                  onPick: { id in onBestOfN?(.pick(id)) },
+                  onRefine: { comment in onBestOfN?(.thinkMore(comment)) }))
             } else {
               TreeSearchSection(tree: tot, answerStarted: !message.content.isEmpty)
             }
@@ -218,43 +219,6 @@ struct MessageBubble: View {
         Spacer()
       }
     }
-  }
-
-  /// Think-more / Use-this controls under a chosen Best-of-N candidate (#690).
-  /// "Think more" starts the next round expanding from the pick; "Use this"
-  /// commits the chosen candidate as the final answer (not editable in v1). To
-  /// change the pick, tap a different candidate row directly — re-selection is
-  /// free since every candidate snapshot is alive until think-more / use-this
-  /// (#708 click-to-reselect, replacing the short-lived Go back button).
-  private var bestOfNControls: some View {
-    VStack(alignment: .leading, spacing: 6) {
-      TextField("Optional guidance for the next round", text: bestOfNComment, axis: .vertical)
-        .textFieldStyle(.roundedBorder)
-        .font(.caption)
-        .lineLimit(1...3)
-        .accessibilityIdentifier("bestofn.comment")
-      HStack(spacing: 8) {
-        Button { onBestOfN?(.thinkMore(normalizedBestOfNComment)) } label: {
-          Label("Think more", systemImage: "arrow.down.circle")
-        }
-        .buttonStyle(.bordered)
-        .controlSize(.small)
-        .accessibilityIdentifier("bestofn.thinkMore")
-        Button { onBestOfN?(.stop) } label: {
-          Label("Use this", systemImage: "checkmark.circle")
-        }
-        .buttonStyle(.borderedProminent)
-        .controlSize(.small)
-        .accessibilityIdentifier("bestofn.useThis")
-      }
-    }
-    .font(.caption)
-  }
-
-  /// Empty/whitespace guidance preserves the exact #690 think-more wire.
-  private var normalizedBestOfNComment: String? {
-    let trimmed = bestOfNComment.wrappedValue.trimmingCharacters(in: .whitespacesAndNewlines)
-    return trimmed.isEmpty ? nil : trimmed
   }
 
   // MARK: - inline edit (#624)
@@ -461,9 +425,9 @@ enum SafeLinkOpenURLAction {
   }
 }
 
-/// #736 Bug C — read-only header showing the think-more guidance the user typed
+/// #736 Bug C — read-only header showing the refinement comment the user typed
 /// on the previous round that produced THIS round. Reads `BestOfNRound.inboundComment`
-/// (durable, persisted), so the guidance survives the think-more transition and a
+/// (durable, persisted), so the guidance survives the round transition and a
 /// reload — replacing the prior transient `@State` that vanished on commit.
 struct BestOfNGuidanceHeader: View {
   let text: String
