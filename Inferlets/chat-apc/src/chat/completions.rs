@@ -5254,7 +5254,7 @@ pub(crate) fn build_prompt_tokens(
         match msg.role.as_str() {
             "system" => out.extend(chat::system(model, msg.content_str().unwrap_or(""))),
             "assistant" => {
-                let content = assistant_replay_content(msg);
+                let content = assistant_replay_content(model, msg);
                 out.extend(chat::assistant(model, &content));
                 if let Some(calls) = tool_calls_array(msg) {
                     for call in calls {
@@ -5327,11 +5327,11 @@ pub(crate) fn build_prompt_tokens(
     Ok(out)
 }
 
-fn assistant_replay_content(msg: &ChatMessage) -> String {
+fn assistant_replay_content(model: &Model, msg: &ChatMessage) -> String {
     let content = msg.content_str().unwrap_or("");
     match tool_calls_array(msg) {
         Some(calls) if !calls.is_empty() => {
-            let rendered = render_assistant_tool_calls(calls);
+            let rendered = render_assistant_tool_calls(model, calls);
             if content.is_empty() {
                 rendered
             } else {
@@ -5342,35 +5342,37 @@ fn assistant_replay_content(msg: &ChatMessage) -> String {
     }
 }
 
-fn render_assistant_tool_calls(calls: &[RequestToolCall]) -> String {
-    calls
+// Delegates to the model's native tool-call replay format via
+// `inferlet::tools::render_tool_calls` instead of hardcoding one
+// architecture's wire format — some models (e.g. OLMo 3) group a whole
+// turn's calls under one wrapper rather than tagging each call
+// independently (the Hermes/Qwen style this used to hardcode), so the
+// full call list is handed to the host in one shot rather than rendered
+// and joined per-call here.
+fn render_assistant_tool_calls(model: &Model, calls: &[RequestToolCall]) -> String {
+    let pairs: Vec<(String, String)> = calls
         .iter()
-        .map(render_assistant_tool_call)
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn render_assistant_tool_call(call: &RequestToolCall) -> String {
-    let name = tool_call_function_name(call).expect("validated tool call function name");
-    let raw_arguments = tool_call_function_arguments(call)
-        .and_then(serde_json::Value::as_str)
-        .expect("validated tool call arguments");
-    let arguments = serde_json::from_str::<serde_json::Value>(raw_arguments)
-        .unwrap_or_else(|_| serde_json::Value::String(raw_arguments.to_string()));
-    format!(
-        "<tool_call>\n{}\n</tool_call>",
-        serde_json::json!({
-            "name": name,
-            "arguments": arguments,
+        .map(|call| {
+            let name = tool_call_function_name(call)
+                .expect("validated tool call function name")
+                .to_string();
+            let arguments = tool_call_function_arguments(call)
+                .and_then(serde_json::Value::as_str)
+                .expect("validated tool call arguments")
+                .to_string();
+            (name, arguments)
         })
-    )
+        .collect();
+    inferlet::tools::render_tool_calls(model, &pairs)
 }
 
-fn validate_tool_replay_with<F>(
+fn validate_tool_replay_with<R, F>(
     messages: &[ChatMessage],
+    render: R,
     parse_rendered: F,
 ) -> Result<(), MessageValidationError>
 where
+    R: Fn(&str, &str) -> String,
     F: Fn(&str) -> Option<(String, String)>,
 {
     for (i, msg) in messages.iter().enumerate() {
@@ -5378,7 +5380,11 @@ where
             continue;
         };
         for call in calls {
-            let rendered = render_assistant_tool_call(call);
+            let name = tool_call_function_name(call).expect("validated tool call function name");
+            let raw_arguments = tool_call_function_arguments(call)
+                .and_then(serde_json::Value::as_str)
+                .expect("validated tool call arguments");
+            let rendered = render(name, raw_arguments);
             let Some((parsed_name, parsed_args)) = parse_rendered(&rendered) else {
                 return Err(MessageValidationError::new(
                     "tool_call_replay_unsupported",
@@ -5386,12 +5392,7 @@ where
                     format!("messages[{i}].tool_calls"),
                 ));
             };
-            let expected_name =
-                tool_call_function_name(call).expect("validated tool call function name");
-            let expected_args = tool_call_function_arguments(call)
-                .and_then(serde_json::Value::as_str)
-                .expect("validated tool call arguments");
-            if parsed_name != expected_name || !same_json_arguments(&parsed_args, expected_args) {
+            if parsed_name != name || !same_json_arguments(&parsed_args, raw_arguments) {
                 return Err(MessageValidationError::new(
                     "tool_call_replay_unsupported",
                     "assistant tool_calls do not round-trip through this model's native tool-call parser",
@@ -5407,9 +5408,13 @@ fn validate_tool_replay_for_model(
     messages: &[ChatMessage],
     model: &Model,
 ) -> Result<(), MessageValidationError> {
-    validate_tool_replay_with(messages, |rendered| {
-        parse_rendered_tool_call(model, rendered)
-    })
+    validate_tool_replay_with(
+        messages,
+        |name, args| {
+            inferlet::tools::render_tool_calls(model, &[(name.to_string(), args.to_string())])
+        },
+        |rendered| parse_rendered_tool_call(model, rendered),
+    )
 }
 
 fn same_json_arguments(left: &str, right: &str) -> bool {
@@ -6363,38 +6368,27 @@ mod tests {
             }"#,
         );
 
-        let err = validate_tool_replay_with(&messages, |_rendered| None)
+        let err = validate_tool_replay_with(&messages, |_name, _args| String::new(), |_rendered| None)
             .expect_err("unsupported native replay should fail closed");
         assert_eq!(err.code, "tool_call_replay_unsupported");
         assert_eq!(err.param, "messages[0].tool_calls");
     }
 
-    #[test]
-    fn assistant_tool_calls_replay_as_native_tool_call_payload() {
-        let messages = parsed_messages(
-            r#"{
-                "model":"m",
-                "messages":[{
-                    "role":"assistant",
-                    "content":null,
-                    "tool_calls":[{
-                        "id":"call_calc",
-                        "type":"function",
-                        "function":{"name":"calculator","arguments":"{\"expr\":\"2+2\"}"}
-                    }]
-                }]
-            }"#,
-        );
-        let rendered = render_assistant_tool_calls(tool_calls_array(&messages[0]).unwrap());
-
-        assert!(rendered.contains("<tool_call>"), "{rendered}");
-        assert!(rendered.contains("</tool_call>"), "{rendered}");
-        assert!(rendered.contains("\"name\":\"calculator\""), "{rendered}");
-        assert!(
-            rendered.contains("\"arguments\":{\"expr\":\"2+2\"}"),
-            "{rendered}"
-        );
-    }
+    // `assistant_tool_calls_replay_as_native_tool_call_payload` used to live
+    // here, calling `render_assistant_tool_calls` directly with no model
+    // and asserting on the hardcoded Hermes/Qwen `<tool_call>` wire format.
+    // Rendering now delegates to `inferlet::tools::render_tool_calls`, which
+    // requires a live `&Model` (host-backed, architecture-aware) — and
+    // `Model::load` only resolves inside a real wasmtime component, so a
+    // native `cargo test --lib` can't construct one. That coverage moved to:
+    // the pie-olmo-side unit test on the `Instruct::render_tool_calls`
+    // trait default (`runtime/src/model/instruct.rs`,
+    // `render_tool_calls_default_matches_hermes_format`), which exercises
+    // the exact same Hermes-format assertions against the actual owner of
+    // that logic without needing a component instance; plus the live HTTP
+    // e2e tool-call contract suite (`e2e_test.py`/`stress_e2e_test.py`) and
+    // the OLMo-specific smoke test, which both exercise the full
+    // render+parse round trip against a real `Model`.
 
     #[test]
     fn spec_dims_out_of_range_rejected() {
